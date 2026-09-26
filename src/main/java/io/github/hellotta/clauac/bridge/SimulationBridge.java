@@ -7,10 +7,9 @@ import com.github.retrooper.packetevents.event.PacketSendEvent;
 import com.github.retrooper.packetevents.event.ProtocolPacketEvent;
 import com.github.retrooper.packetevents.event.UserDisconnectEvent;
 import com.github.retrooper.packetevents.netty.buffer.ByteBufHelper;
-import com.github.retrooper.packetevents.netty.channel.ChannelHelper;
 import com.github.retrooper.packetevents.protocol.ConnectionState;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
 import com.github.retrooper.packetevents.protocol.player.User;
-import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPing;
 import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
@@ -29,9 +28,9 @@ import org.bukkit.entity.Player;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
-// - Hands every relevant packet of a connection to its simulation, exactly as it travels on the wire, and marks -
-// - the end of every server tick with a ping. The client answers pings in order, which tells the simulation how -
-// - far the client has processed the server's packets when it simulates the client's next tick -
+// - Hands every relevant packet of a connection to its simulation, exactly as it travels on the wire, and follows -
+// - every relevant play packet with a ping. The client answers pings in order, which tells the simulation how far -
+// - the client has processed the server's packets when it simulates the client's next tick -
 public final class SimulationBridge implements PacketListener {
 
     private static final DateTimeFormatter REPORT_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.ROOT);
@@ -74,12 +73,18 @@ public final class SimulationBridge implements PacketListener {
         if (simulation == null || currentRuntime == null || !currentRuntime.isRelevant(phase, direction, event.getPacketId())) {
             return;
         }
+        // - The simulation's own pings are relevant too, but must not be followed by another one -
+        boolean needsPing = direction == PacketDirection.CLIENTBOUND && phase == ProtocolPhase.PLAY
+                && event.getPacketType() != PacketType.Play.Server.PING;
         // - Post tasks run once the packet is final: after every listener, with the whole packet (id and payload) -
         // - readable, or nothing readable when it was cancelled and therefore never sent or processed -
         event.getPostTasks().add(() -> {
             Object buffer = event.getByteBuf();
             if (ByteBufHelper.isReadable(buffer)) {
                 simulation.handlePacket(phase, direction, ByteBufHelper.copyBytes(buffer));
+                if (needsPing) {
+                    connection.schedulePing();
+                }
             }
         });
     }
@@ -159,25 +164,12 @@ public final class SimulationBridge implements PacketListener {
             TickReporter reporter = connection != null ? connection.reporter() : null;
             if (reporter != null) {
                 reporter.setEntityNearby(!player.getNearbyEntities(NEARBY_ENTITY_DISTANCE, NEARBY_ENTITY_DISTANCE, NEARBY_ENTITY_DISTANCE).isEmpty());
+                if (reporter.takeInventoryResyncRequest()) {
+                    this.logger.info("Resending the inventory of {}: the simulated items differ from the client's", player.getName());
+                    player.updateInventory();
+                }
             }
         }
-        for (ConnectionSimulation connection : this.connections.values()) {
-            if (connection.simulation() != null) {
-                sendPing(connection);
-            }
-        }
-    }
-
-    // - Queued behind everything the server sent during this tick; the phase is checked on the event loop, where -
-    // - it changes, because a ping is only valid while the connection plays -
-    private static void sendPing(ConnectionSimulation connection) {
-        User user = connection.user();
-        Object channel = user.getChannel();
-        ChannelHelper.runInEventLoop(channel, () -> {
-            if (ChannelHelper.isOpen(channel) && user.getEncoderState() == ConnectionState.PLAY) {
-                user.sendPacket(new WrapperPlayServerPing(connection.nextPingId()));
-            }
-        });
     }
 
     public @Nullable Boolean toggleActionBar(Player player) {

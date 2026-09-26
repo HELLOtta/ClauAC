@@ -49,9 +49,9 @@ the Minecraft EULA in `run/eula.txt`.
 ## How the simulation works
 
 Instead of re-implementing movement rules, ClauAC runs the vanilla game code itself: for every player it keeps a
-client-side copy of the world and of the player (a *sandbox*), feeds it the same packets the real client receives, and
-ticks it whenever the real client ticks. Whatever vanilla does in a situation, the sandbox does too, including
-situations nobody wrote a rule for.
+client-side copy of the world, of every entity the client knows and of the player with its items (a *sandbox*), feeds
+it the same packets the real client receives, and ticks it whenever the real client ticks. Whatever vanilla does in a
+situation, the sandbox does too, including situations nobody wrote a rule for.
 
 ### Modules
 
@@ -75,10 +75,13 @@ its own thread, which takes about 6-7 seconds; connections that start before it 
 code the sandbox runs is the common code the client runs as well: in 26.3 it is identical between the client jar and
 the server jar.
 
-The client-only parts the movement depends on are ported from the client jar and cite their original class:
-`ClientLevel`, `ClientChunkCache`, `LocalPlayer`, `KeyboardInput`, `ClientPacketListener` (the parts that change the
-level or the player), `RegistryDataCollector`, `KnownPacksManager` and `ClientClockManager`. Parts that only render,
-play sounds or show screens are left out.
+The client-only parts the simulation depends on are ported from the client jar and cite their original class:
+`ClientLevel` (including its block prediction handling), `ClientChunkCache`, `LocalPlayer`, `KeyboardInput`,
+`RemotePlayer` and `AbstractClientPlayer`, `ClientPacketListener` (the parts that change the level, the entities,
+the player or its menus), `MultiPlayerGameMode`, the key and mouse handling of `Minecraft` (`handleKeybinds`, `pick`),
+`MenuScreens` and the screens that change their menu themselves (merchant, anvil, crafter, stonecutter, enchanting
+table, loom, bundles), `ClientRecipeContainer`, `RegistryDataCollector`, `KnownPacksManager` and
+`ClientClockManager`. Parts that only render, play sounds or show screens are left out.
 
 ### Following the client's timeline
 
@@ -86,15 +89,23 @@ The client processes the server's packets between its ticks, so the sandbox must
 tick the client applied it before. ClauAC keeps the server's packets pending until a packet from the client proves it
 processed them:
 
-- ClauAC sends a ping at the end of every server tick; the client answers each ping with a pong when it processes it.
+- Every relevant play packet is followed by a ping, queued on the connection's event loop right behind it; the client
+  answers each ping with a pong when it processes it. One ping covers everything written before it.
 - A teleport is answered with the teleport acceptance, a rotation packet with a rotation, and the start of a
   configuration phase with its acknowledgement.
 
-When the client's tick end packet arrives, the sandbox runs `Minecraft.tick` for one tick with the keys, rotation and
-sprint commands the client sent for that tick, then mirrors `LocalPlayer.sendPosition` and compares: whether a
-position had to be sent, the exact position, `onGround`, horizontal collision, sprinting, flying and the start of
-gliding. When anything differs, the sandbox continues from the client's reported state, including a velocity
-correction derived from the tick it just simulated.
+When the client's tick end packet arrives, the sandbox runs `Minecraft.tick` for one tick: it replays what the client
+did with its keys and mouse during that tick from the packets that produced (hotbar selection, breaking and placing
+blocks with the client's own block predictions, using items, attacks, interactions, dropping items), ticks every
+entity, and moves the player with the keys, rotation and sprint commands the client sent. It then mirrors
+`LocalPlayer.sendPosition` and compares: whether a position had to be sent, the exact position, `onGround`,
+horizontal collision, sprinting, flying and the start of gliding. When anything differs, the sandbox continues from the
+client's reported state, including a velocity estimated from the tick it just simulated.
+
+Menu clicks happen on screens between the client's ticks and are applied right away. The client sends the slots a
+click changed as hashes, so every click is checked: when the sandbox's items turn out to differ from the client's, it
+marks them unknown and ClauAC has the server resend the player's inventory (Paper's `Player#updateInventory`), which
+the sandbox takes over when it arrives.
 
 ### Results
 
@@ -104,34 +115,64 @@ Each client tick gets one outcome:
 |-----------------|--------------------------------------------------------------------------------------------|
 | `MATCHED`       | The simulation produced exactly what the client sent                                       |
 | `MISMATCHED`    | It did not, and nothing outside the simulation's reach was involved                        |
-| `UNVERIFIED`    | It did not, but something the simulation does not reproduce was involved (see the notes)   |
+| `UNVERIFIED`    | It did not, but something the simulation cannot know was involved (see the notes)          |
 | `NOT_SIMULATED` | The client did not move its player (loading screen, dead, riding)                          |
 
 - Every connection is recorded to `plugins/ClauAC/reports/<time>-<player>.csv`, one line per client tick, with the
   predicted and reported values, the offset, whether another entity was within one block, and notes.
-- `MISMATCHED` ticks are logged to the server console, and a summary is logged when the player leaves.
+- `MISMATCHED` ticks are logged to the server console, and a summary is logged when the player leaves; so is every
+  inventory resend.
 - `/clauac debug` shows the outcome of every tick in your action bar, `/clauac status` summarises all connections
   (permission `clauac.admin`, operators by default).
 
-### Not simulated yet
+### What the simulation cannot know
 
-Some influences on the client's movement are outside the sandbox. Those ClauAC can recognise from the client's own
-packets turn a differing tick into `UNVERIFIED` instead of `MISMATCHED`; the others still show up as `MISMATCHED`.
+The client's packets do not tell everything it did. Where the difference that follows can come from such a gap,
+the tick is `UNVERIFIED` instead of `MISMATCHED`:
 
-- Recognised: item use (the inventory is not tracked), starting to glide (the equipment is not tracked), the
-  client's own block predictions until the server acknowledges them, attacks and entity interactions, and teleports
-  whose result differs from the sandbox's. Riding is reported as `NOT_SIMULATED`.
-- Not recognised: pushes and collisions from other entities, which are not part of the sandbox (the CSV's
-  `entityNearby` column helps to tell these apart), equipment effects that do not reach the client as attributes (for
-  example leather boots on powder snow), and blocks moved by pistons.
+- A hotbar switch the client reports at the start of a tick may have happened during the previous tick's key handling
+  instead, when that tick's player already held the new item. A tick whose difference can come from the item use that
+  switch stopped is reported one tick late, as `UNVERIFIED`; an attack whose knockback depends on when the attack
+  strength was reset that way is `UNVERIFIED` as well.
+- The client's velocity is never reported. After a difference the sandbox estimates it from the reported movement;
+  the rounding of that estimate can move later positions by a few units in the last place, and after an `UNVERIFIED`
+  tick, a difference that keeps shrinking in the ticks right after it stays `UNVERIFIED`.
+- Items the sandbox had to mark unknown, the first tick after riding, attacks on or interactions with entities the
+  sandbox does not know, and teleports whose result differs from the sandbox's.
+
+Known limits:
+
+- An `UNVERIFIED` tick accepts any difference; the alternatives are not simulated yet, so a tick that is uncertain is
+  not bounded either.
+- Riding is `NOT_SIMULATED`: vehicles are placed where the client reports them, not compared.
+- The client opens its own inventory screen without telling the server, and its creative inventory screen ignores
+  cursor updates and keeps its own menu when the game mode changes. The sandbox cannot follow those; the differences
+  show up in the next checked click and are resolved by the inventory resend.
+- A ping is queued right behind the packets it covers, but the client can still start a tick between receiving a
+  packet and receiving the ping behind it; the sandbox then applies that packet one tick late.
+- A relative rotation packet whose answer the client computed from a rotation the sandbox has not seen yet is applied
+  at the next pong instead.
+- A packet no vanilla client sends can make the vanilla code in the sandbox fail. That stops the simulation of the
+  connection and is logged as an error, but nothing acts on it yet.
+- Not verified yet: pistons moving blocks and entities, and equipment effects such as leather boots on powder snow.
 
 ### Verified so far
 
-With a real 26.3 client on Paper 26.3 (build 45): walking, jumping, sneaking, sprinting and sprint jumping, stairs
-up and down, sinking, swimming and leaving water, a 50 block fall into water, speed and jump boost effects, knockback
-from damage, teleports and creative flight all produced `MATCHED` on every tick, with an offset of exactly 0. While
-the player was dead the sandbox, like the client, did not move it (`NOT_SIMULATED`), and matching resumed after the
-respawn. Walking into a cow produced `MISMATCHED` only on the ticks the cow pushed the player.
+With a real 26.3 client on Paper 26.3, every tick of the following produced `MATCHED` with an offset of exactly 0:
+walking, jumping, sneaking, sprinting and sprint jumping, stairs up and down, sinking, swimming and leaving water, a
+50 block fall into water, speed and jump boost effects, knockback from damage, a TNT explosion and a wind charge, teleports,
+creative flight, gliding with an elytra and boosting with fireworks, cows and another player pushing the player,
+walking into a boat and stepping onto it, a team whose collision rule stops those pushes, eating, blocking with a
+shield and drawing a bow while walking, placing a block and walking into it, breaking blocks, and a sprint hit on a
+boat and on another player. Riding a boat and a horse was `NOT_SIMULATED`, and the first
+tick after dismounting matched the client's dismount position.
+
+Menu clicks matched the client's hashes in chests, the player's inventory (crafting included), furnaces, stonecutters,
+anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.
+A switch from the creative inventory screen straight to survival made the client click in a menu the sandbox did not
+have; the next click showed the difference and the inventory resend brought both back in line. Switching the hotbar
+slot while eating produced `UNVERIFIED` for the tick the switch was ambiguous for, as intended. While the player was
+dead the sandbox, like the client, did not move it (`NOT_SIMULATED`), and matching resumed after the respawn.
 
 ## How PacketEvents is bundled
 

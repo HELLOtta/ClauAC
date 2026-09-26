@@ -3,12 +3,14 @@ package io.github.hellotta.clauac.simulation.world;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.particles.ExplosionParticleInfo;
 import net.minecraft.core.particles.ParticleOptions;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.network.protocol.Packet;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundSource;
@@ -50,15 +52,16 @@ import net.minecraft.world.ticks.LevelTickAccess;
 import org.jspecify.annotations.Nullable;
 
 // - Port of the client-only ClientLevel as far as it affects how the local player moves: it is a client-side level -
-// - (isClientSide), so vanilla code takes the client's branches and never runs server-only logic. What the client -
-// - renders, plays or shows (particles, sounds, block breaking progress, tints, sky) has no effect here. Other -
-// - entities are not tracked: the only entity in the level is the simulated player, so entity collisions and -
-// - pushing by other entities are outside what this level reproduces -
+// - (isClientSide), so vanilla code takes the client's branches and never runs server-only logic. Every entity the -
+// - server shows the client lives and ticks here as on the client, so pushes, collisions and vehicles act on the -
+// - simulated player. What the client renders, plays or shows (particles, sounds, block breaking progress, tints, -
+// - sky) has no effect here -
 public final class SandboxLevel extends Level {
 
     private final EntityTickList tickingEntities = new EntityTickList();
     private final TransientEntitySectionManager<Entity> entityStorage = new TransientEntitySectionManager<>(Entity.class, new EntityCallbacks());
     private final SandboxLevelData clientLevelData;
+    private final SandboxBlockPredictions blockPredictions = new SandboxBlockPredictions();
     private final TickRateManager tickRateManager = new TickRateManager();
     private final List<Player> players = new ArrayList<>();
     private final List<EnderDragonPart> dragonParts = new ArrayList<>();
@@ -66,6 +69,8 @@ public final class SandboxLevel extends Level {
     private final WorldBorder worldBorder = new WorldBorder();
     private final SandboxClockManager clockManager;
     private final Scoreboard scoreboard;
+    // - ClientLevel.recipeAccess asks the connection, whose recipes outlive the level -
+    private final Supplier<RecipeAccess> recipes;
     private final FeatureFlagSet enabledFeatures;
     private final EnvironmentAttributeSystem environmentAttributes;
     private final int seaLevel;
@@ -85,12 +90,14 @@ public final class SandboxLevel extends Level {
             int seaLevel,
             SandboxClockManager clockManager,
             Scoreboard scoreboard,
+            Supplier<RecipeAccess> recipes,
             FeatureFlagSet enabledFeatures
     ) {
         super(levelData, dimension, registryAccess, dimensionType, true, isDebug, biomeZoomSeed, 1000000);
         this.clientLevelData = levelData;
         this.clockManager = clockManager;
         this.scoreboard = scoreboard;
+        this.recipes = recipes;
         this.enabledFeatures = enabledFeatures;
         this.chunkSource = new SandboxChunkSource(this, serverChunkRadius);
         this.seaLevel = seaLevel;
@@ -209,10 +216,49 @@ public final class SandboxLevel extends Level {
         return this.getEntities().get(id);
     }
 
-    // - The server's authoritative block changes; the client's own block predictions are not simulated, so a change -
-    // - is always applied directly, like the client does whenever no prediction is pending -
+    public SandboxBlockPredictions getBlockPredictions() {
+        return this.blockPredictions;
+    }
+
+    public void handleBlockChangedAck(int sequence) {
+        this.blockPredictions.endPredictionsUpTo(sequence, this);
+    }
+
+    // - The server's block changes wait while the client predicts something else at the same position -
     public void setServerVerifiedBlockState(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlag) {
-        super.setBlock(pos, blockState, updateFlag, 512);
+        if (!this.blockPredictions.updateKnownServerState(pos, blockState)) {
+            super.setBlock(pos, blockState, updateFlag, 512);
+        }
+    }
+
+    // - Ending a prediction the server did not confirm can put the player back where it stood when it predicted -
+    public void syncBlockState(BlockPos pos, BlockState state, @Nullable Vec3 playerPos) {
+        BlockState oldState = this.getBlockState(pos);
+        if (oldState != state) {
+            this.setBlock(pos, state, 19);
+            Player player = this.localPlayer;
+            if (playerPos != null && player != null && this == player.level() && player.isColliding(pos, state)) {
+                player.absSnapTo(playerPos.x, playerPos.y, playerPos.z);
+            }
+        }
+    }
+
+    @Override
+    public boolean setBlock(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlags, int updateLimit) {
+        if (this.blockPredictions.isPredicting()) {
+            BlockState oldState = this.getBlockState(pos);
+            boolean success = super.setBlock(pos, blockState, updateFlags, updateLimit);
+            if (success) {
+                Player player = this.localPlayer;
+                if (player == null) {
+                    throw new IllegalStateException("The client predicted a block change without a player");
+                }
+                this.blockPredictions.retainKnownServerState(pos, oldState, player.position());
+            }
+
+            return success;
+        }
+        return super.setBlock(pos, blockState, updateFlags, updateLimit);
     }
 
     public void setServerSimulationDistance(int serverSimulationDistance) {
@@ -226,6 +272,12 @@ public final class SandboxLevel extends Level {
     @Override
     public void sendBlockUpdated(BlockPos pos, BlockState old, BlockState current, @Block.UpdateFlags int updateFlags) {
         // - The client only tells its renderer about the change -
+    }
+
+    // - The only packet level code sends is the paddle state of a boat the local player steers; the real client sent -
+    // - its own, and the sandbox does not compare vehicles -
+    @Override
+    public void sendPacketToServer(Packet<?> packet) {
     }
 
     @Override
@@ -304,7 +356,7 @@ public final class SandboxLevel extends Level {
 
     @Override
     public RecipeAccess recipeAccess() {
-        return EmptyRecipeAccess.INSTANCE;
+        return this.recipes.get();
     }
 
     @Override

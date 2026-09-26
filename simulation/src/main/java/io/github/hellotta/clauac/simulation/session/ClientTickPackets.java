@@ -4,7 +4,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundMoveVehiclePacket;
 import org.jspecify.annotations.Nullable;
 
 // - What the client sent during one of its ticks, between two ServerboundClientTickEndPackets, plus the reasons -
@@ -13,6 +15,12 @@ final class ClientTickPackets {
 
     // - The movement packet LocalPlayer.sendPosition sent; it is sent at most once per tick -
     @Nullable ServerboundMovePlayerPacket movePacket;
+    // - The vehicle position LocalPlayer.sendChanges sent while the player steers its vehicle -
+    @Nullable ServerboundMoveVehiclePacket vehicleMove;
+    // - What the client did with its keys and mouse during this tick (Minecraft.handleKeybinds and -
+    // - MultiPlayerGameMode.tick), in order. These happen inside the tick, after the client processed the server's -
+    // - packets and with the rotation the tick's movement packet reports, so they are replayed at the tick's end -
+    final List<Packet<?>> actions = new ArrayList<>();
     // - A START_SPRINTING command was part of this tick -
     boolean sprintStartReported;
     // - A ServerboundPlayerAbilitiesPacket was part of this tick, and the flying state it carried -
@@ -28,6 +36,8 @@ final class ClientTickPackets {
 
     void reset() {
         this.movePacket = null;
+        this.vehicleMove = null;
+        this.actions.clear();
         this.sprintStartReported = false;
         this.abilitiesReported = false;
         this.reportedFlying = false;

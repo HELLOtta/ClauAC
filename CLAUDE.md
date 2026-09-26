@@ -71,4 +71,14 @@ Findings from running the official 26.3 client in a cloud container without a GP
 - **Stopping the client:** `pkill -f <pattern>` also matches the shell that runs the command when the pattern appears
   in it, and kills that shell. Kill the client by the PID of its `net.minecraft.client.main.Main` process instead.
 - **Simulation results:** `run/plugins/ClauAC/reports/*.csv` has one line per client tick; `/clauac debug` shows the
-  outcome of every tick in the action bar.
+  outcome of every tick in the action bar. The CSV is written through a buffer and lags a few seconds behind; for the
+  current client tick, run `clauac status` on the console, which prints one line per connection.
+- **Rebuilding:** `runServer` loads the plugin jar straight from `build/libs`. Building while the server runs replaces
+  the jar under it and later fails with `NoClassDefFoundError`, so stop the server before building.
+- **A second player:** start another client with its own game directory (a copy of `options.txt` with a low
+  `maxFps` and `renderDistance` keeps both clients responsive). Both windows share the Xvfb display: find them with
+  `xdotool search --pid <pid>`, move the second one off screen with `xdotool windowmove`, and give the first one the
+  keyboard with `xdotool windowfocus`.
+- **Test world:** blocks placed by earlier tests stay in the world and get in the way of later courses (a leftover
+  furnace swallowed the clicks meant for a chest). Clear them before a recording, for example with
+  `fill <from> <to> minecraft:air replace <block>`, which leaves the course itself alone.

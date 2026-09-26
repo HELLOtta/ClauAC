@@ -1,19 +1,13 @@
 package io.github.hellotta.clauac.simulation.player;
 
-import net.minecraft.world.level.GameType;
-import org.jspecify.annotations.Nullable;
-
-// - Client state that lives outside the player on the client (connection, game mode, camera) -
-public interface ClientContext {
+// - Client state that lives outside the player on the client (connection, game mode, camera, tab list) -
+public interface ClientContext extends PlayerInfoDirectory {
 
     // - ClientPacketListener.hasClientLoaded: the player does not tick before the client reported it has loaded -
     boolean hasClientLoaded();
 
     // - LocalPlayer.isControlledCamera: whether the camera is the player itself rather than a spectated entity -
     boolean isCameraOnPlayer();
-
-    // - AbstractClientPlayer.gameMode: the game mode from the tab list entry of the player, if there is one -
-    @Nullable GameType playerInfoGameMode();
 
     // - MultiPlayerGameMode.isSpectator: the game mode the client applied to itself -
     boolean isLocalModeSpectator();

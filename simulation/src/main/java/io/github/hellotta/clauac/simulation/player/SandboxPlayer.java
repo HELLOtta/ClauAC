@@ -1,26 +1,40 @@
 package io.github.hellotta.clauac.simulation.player;
 
 import com.mojang.authlib.GameProfile;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.syncher.EntityDataAccessor;
+import net.minecraft.server.permissions.LevelBasedPermissionSet;
+import net.minecraft.server.permissions.PermissionSet;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityEvent;
+import net.minecraft.world.entity.EntitySelector;
 import net.minecraft.world.entity.PlayerRideableJumping;
 import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Abilities;
 import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.projectile.ProjectileUtil;
+import net.minecraft.world.entity.vehicle.boat.AbstractBoat;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.AttackRange;
 import net.minecraft.world.item.component.UseEffects;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Portal;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec2;
 import net.minecraft.world.phys.Vec3;
 import org.jspecify.annotations.Nullable;
@@ -28,21 +42,40 @@ import org.jspecify.annotations.Nullable;
 // - Port of the parts of the client-only LocalPlayer and AbstractClientPlayer that decide how the local player moves. -
 // - Everything else is inherited unchanged from the vanilla Player, LivingEntity and Entity classes. Left out on -
 // - purpose, because they only render, play or show something: view bobbing, walked distance, first person hands, -
-// - ambient sounds, water vision, the nausea and portal spinning effect, the tutorial and every screen. Riding is not -
-// - simulated at all (the session stops simulating while the player is a passenger), so neither is the riding jump -
+// - ambient sounds, water vision, the nausea and portal spinning effect, the tutorial and every screen. The riding -
+// - jump is left out as well: the session reports ticks spent riding as not simulated -
 public final class SandboxPlayer extends Player {
 
+    // - Player.attack weighs the attack strength half a tick ahead -
+    private static final float ATTACK_STRENGTH_PARTIAL_TICK = 0.5F;
+    // - Player.attack only makes a knockback attack, the one that slows the attacker down, above this strength -
+    private static final float FULL_ATTACK_STRENGTH = 0.9F;
+
     private final ClientContext client;
+    private final CachedPlayerInfo playerInfo;
     public SandboxInput input = new SandboxInput();
+    private PermissionSet permissions = PermissionSet.NO_PERMISSIONS;
     private Input reportedKeys = Input.EMPTY;
     private boolean crouching;
     private boolean flashOnSetHealth;
     private boolean startedUsingItem;
     private @Nullable InteractionHand usingItemHand;
+    // - The other values the client's attackStrengthTicker may have. A hotbar switch the client reports at the start -
+    // - of a tick may already have happened during the previous tick's key handling (see PlayConnection); the -
+    // - client's player then reset the ticker one tick before this one did. Values that became equal to this -
+    // - player's ticker are dropped -
+    private final List<AlternativeAttackStrength> alternativeAttackStrengths = new ArrayList<>();
+    private boolean tickingPlayer;
+    private boolean mainHandChangeResetDuringTick;
+    // - Mirrors of Player.lastItemInMainHand, the item Player.tick compares the main hand with: its value before -
+    // - the player's last tick, and its value now -
+    private ItemStack mainHandItemBeforeLastTick = ItemStack.EMPTY;
+    private ItemStack mainHandItemAfterLastTick = ItemStack.EMPTY;
 
     public SandboxPlayer(Level level, GameProfile profile, ClientContext client) {
         super(level, profile);
         this.client = client;
+        this.playerInfo = new CachedPlayerInfo(client, profile.id());
     }
 
     // - The keys of the ServerboundPlayerInputPacket for the tick about to be simulated -
@@ -55,9 +88,69 @@ public final class SandboxPlayer extends Player {
         this.input = new SandboxInput();
     }
 
-    // - Whether the living entity flags the server synchronizes say that the player is using an item -
-    public boolean serverReportsItemUse() {
-        return (this.entityData.get(DATA_LIVING_ENTITY_FLAGS) & 1) != 0;
+    // - LocalPlayer.setExperienceValues, from ClientboundSetExperiencePacket. The levels decide what an anvil lets -
+    // - the player take -
+    public void setExperienceValues(float experienceProgress, int totalExperience, int experienceLevel) {
+        this.experienceProgress = experienceProgress;
+        this.totalExperience = totalExperience;
+        this.experienceLevel = experienceLevel;
+    }
+
+    // - LocalPlayer.clientSideCloseContainer: the client returns to its own inventory menu -
+    public void clientSideCloseContainer() {
+        super.closeContainer();
+    }
+
+    // - LocalPlayer.raycastHitResult: what the crosshair points at, which Minecraft.pick computes at the start of -
+    // - every tick with a partial tick of 1 -
+    public HitResult raycastHitResult(float partialTicks, Entity cameraEntity) {
+        ItemStack itemStack = this.getActiveItem();
+        AttackRange itemAttackRange = itemStack.get(DataComponents.ATTACK_RANGE);
+        double blockInteractionRange = this.blockInteractionRange();
+        HitResult hitResult = null;
+        if (itemAttackRange != null) {
+            hitResult = itemAttackRange.getClosesetHit(cameraEntity, partialTicks, EntitySelector.CAN_BE_PICKED);
+            if (hitResult instanceof BlockHitResult) {
+                hitResult = filterHitResult(hitResult, cameraEntity.getEyePosition(partialTicks), blockInteractionRange);
+            }
+        }
+
+        if (hitResult == null || hitResult.getType() == HitResult.Type.MISS) {
+            double entityInteractionRange = this.entityInteractionRange();
+            hitResult = pick(cameraEntity, blockInteractionRange, entityInteractionRange, partialTicks);
+        }
+
+        return hitResult;
+    }
+
+    private static HitResult pick(Entity cameraEntity, double blockInteractionRange, double entityInteractionRange, float partialTicks) {
+        double maxDistance = Math.max(blockInteractionRange, entityInteractionRange);
+        double maxDistanceSq = Mth.square(maxDistance);
+        Vec3 from = cameraEntity.getEyePosition(partialTicks);
+        HitResult blockHitResult = cameraEntity.pick(maxDistance, partialTicks, false);
+        double blockDistanceSq = blockHitResult.getLocation().distanceToSqr(from);
+        if (blockHitResult.getType() != HitResult.Type.MISS) {
+            maxDistanceSq = blockDistanceSq;
+            maxDistance = Math.sqrt(maxDistanceSq);
+        }
+
+        Vec3 direction = cameraEntity.getViewVector(partialTicks);
+        Vec3 to = from.add(direction.x * maxDistance, direction.y * maxDistance, direction.z * maxDistance);
+        AABB box = cameraEntity.getBoundingBox().expandTowards(direction.scale(maxDistance)).inflate(1.0, 1.0, 1.0);
+        EntityHitResult entityHitResult = ProjectileUtil.getEntityHitResult(cameraEntity, from, to, box, EntitySelector.CAN_BE_PICKED, maxDistanceSq);
+        return entityHitResult != null && entityHitResult.getLocation().distanceToSqr(from) < blockDistanceSq
+                ? filterHitResult(entityHitResult, from, entityInteractionRange)
+                : filterHitResult(blockHitResult, from, blockInteractionRange);
+    }
+
+    private static HitResult filterHitResult(HitResult hitResult, Vec3 from, double maxRange) {
+        Vec3 hitLocation = hitResult.getLocation();
+        if (!hitLocation.closerThan(from, maxRange)) {
+            Vec3 location = hitResult.getLocation();
+            Direction direction = Direction.getApproximateNearest(location.x - from.x, location.y - from.y, location.z - from.z);
+            return BlockHitResult.miss(location, direction, BlockPos.containing(location));
+        }
+        return hitResult;
     }
 
     @Override
@@ -67,13 +160,119 @@ public final class SandboxPlayer extends Player {
 
     @Override
     public @Nullable GameType gameMode() {
-        return this.client.playerInfoGameMode();
+        return this.playerInfo.gameMode();
+    }
+
+    // - Operator levels decide whether the player may break or use game master blocks -
+    @Override
+    public PermissionSet permissions() {
+        return this.permissions;
+    }
+
+    @Override
+    public void handleEntityEvent(@EntityEvent.Value byte id) {
+        switch (id) {
+            case EntityEvent.PERMISSION_LEVEL_ALL -> this.permissions = PermissionSet.NO_PERMISSIONS;
+            case EntityEvent.PERMISSION_LEVEL_MODERATORS -> this.permissions = LevelBasedPermissionSet.MODERATOR;
+            case EntityEvent.PERMISSION_LEVEL_GAMEMASTERS -> this.permissions = LevelBasedPermissionSet.GAMEMASTER;
+            case EntityEvent.PERMISSION_LEVEL_ADMINS -> this.permissions = LevelBasedPermissionSet.ADMIN;
+            case EntityEvent.PERMISSION_LEVEL_OWNERS -> this.permissions = LevelBasedPermissionSet.OWNER;
+            default -> super.handleEntityEvent(id);
+        }
+    }
+
+    // - LocalPlayer.rideTick hands the keys to a boat the player steers; the hands-busy flag it also sets only -
+    // - gates the client's own attack and use key handling, which the sandbox learns from the client's packets -
+    @Override
+    public void rideTick() {
+        super.rideTick();
+        if (this.getControlledVehicle() instanceof AbstractBoat boat) {
+            boat.setInput(this.input.keyPresses.left(), this.input.keyPresses.right(), this.input.keyPresses.forward(), this.input.keyPresses.backward());
+        }
     }
 
     @Override
     public void tick() {
         if (this.client.hasClientLoaded()) {
-            super.tick();
+            this.tickingPlayer = true;
+            this.mainHandChangeResetDuringTick = false;
+            this.mainHandItemBeforeLastTick = this.mainHandItemAfterLastTick;
+            try {
+                super.tick();
+            } finally {
+                this.tickingPlayer = false;
+            }
+            this.mainHandItemAfterLastTick = this.getMainHandItem().copy();
+            this.advanceAlternativeAttackStrengths();
+        }
+    }
+
+    // - Called right after the hotbar switch was applied. The client's player may already have held the new main -
+    // - hand item during its last tick; Player.tick then reset the ticker to zero in that tick if the item differed -
+    // - from the one before, a reset this player only does in its coming tick -
+    public void considerEarlierHotbarSwitch() {
+        if (!ItemStack.isSameItem(this.mainHandItemBeforeLastTick, this.getMainHandItem())) {
+            this.alternativeAttackStrengths.add(new AlternativeAttackStrength());
+        }
+    }
+
+    // - Whether an attack now would be a knockback attack for one possible ticker and not for another -
+    public boolean attackDependsOnHotbarSwitchTiming() {
+        if (!this.isSprinting()) {
+            return false;
+        }
+        boolean fullStrength = this.isFullStrengthAttack(this.attackStrengthTicker);
+        for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
+            if (this.isFullStrengthAttack(alternative.ticker) != fullStrength) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // - Player.getAttackStrengthScale as Player.attack uses it, for any ticker -
+    private boolean isFullStrengthAttack(int attackStrengthTicker) {
+        float scale = Mth.clamp((attackStrengthTicker + ATTACK_STRENGTH_PARTIAL_TICK) / this.getCurrentItemAttackStrengthDelay(), 0.0F, 1.0F);
+        return scale > FULL_ATTACK_STRENGTH;
+    }
+
+    // - Player.tick for the alternative tickers: they count up and reset for a new main hand item, unless the -
+    // - client's player already held that item. Afterwards every alternative evolves exactly like this player's -
+    // - ticker, so an equal value stays equal -
+    private void advanceAlternativeAttackStrengths() {
+        for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
+            alternative.ticker++;
+            if (this.mainHandChangeResetDuringTick && !alternative.heldMainHandItem) {
+                alternative.ticker = 0;
+            }
+            alternative.heldMainHandItem = false;
+        }
+        Set<Integer> distinctTickers = new HashSet<>();
+        distinctTickers.add(this.attackStrengthTicker);
+        this.alternativeAttackStrengths.removeIf(alternative -> !distinctTickers.add(alternative.ticker));
+    }
+
+    // - During the player's own tick only the main hand check of Player.tick resets the ticker; every other reset -
+    // - comes from what the client did, which happened whenever the hotbar switch did -
+    @Override
+    public void resetAttackStrengthTicker() {
+        super.resetAttackStrengthTicker();
+        if (this.tickingPlayer) {
+            this.mainHandChangeResetDuringTick = true;
+        } else {
+            this.resetAlternativeAttackStrengths();
+        }
+    }
+
+    @Override
+    public void resetOnlyAttackStrengthTicker() {
+        super.resetOnlyAttackStrengthTicker();
+        this.resetAlternativeAttackStrengths();
+    }
+
+    private void resetAlternativeAttackStrengths() {
+        for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
+            alternative.ticker = 0;
         }
     }
 
@@ -470,5 +669,12 @@ public final class SandboxPlayer extends Player {
         if (gameType == GameType.SPECTATOR) {
             this.setDeltaMovement(this.getDeltaMovement().with(Direction.Axis.Y, 0.0));
         }
+    }
+
+    // - One other value the client's attackStrengthTicker may have; it starts at the zero the client's player reset -
+    // - its ticker to, while already holding the new main hand item -
+    private static final class AlternativeAttackStrength {
+        private int ticker;
+        private boolean heldMainHandItem = true;
     }
 }

@@ -6,6 +6,12 @@ public interface SimulationListener {
 
     void onClientTick(ClientTickReport report);
 
+    // - The simulation found that its items differ from the client's, and cannot know the client's. The server -
+    // - should send the client its whole inventory and open menu again, as Paper's Player.updateInventory does; the -
+    // - simulation takes over those contents when they arrive. Requested again only if the client closed the menu -
+    // - before they arrived -
+    void onInventoryResyncNeeded();
+
     // - A problem that stops the simulation of this connection; no further ticks are reported afterwards -
     void onSimulationFailure(String message, Throwable cause);
 }

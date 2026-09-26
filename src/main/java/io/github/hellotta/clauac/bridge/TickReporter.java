@@ -15,6 +15,7 @@ import java.nio.file.Path;
 import java.util.EnumMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.jspecify.annotations.Nullable;
@@ -38,6 +39,7 @@ final class TickReporter implements SimulationListener {
     private double largestMismatch;
     private volatile boolean actionBarEnabled;
     private volatile boolean entityNearby;
+    private final AtomicBoolean inventoryResyncRequested = new AtomicBoolean();
 
     TickReporter(User user, String playerName, Path csvFile, Logger logger) throws IOException {
         this.user = user;
@@ -58,10 +60,20 @@ final class TickReporter implements SimulationListener {
         return this.actionBarEnabled;
     }
 
-    // - Set by the server thread every tick: whether another entity is close enough to push or carry the player, -
-    // - which the simulation does not reproduce -
+    // - Set by the server thread every tick: whether another entity is close enough to push or carry the player. -
+    // - Recorded with every tick, so that ticks around other entities can be told apart in the report -
     void setEntityNearby(boolean entityNearby) {
         this.entityNearby = entityNearby;
+    }
+
+    // - Taken by the server thread at the end of every tick, which then sends the player its inventory -
+    boolean takeInventoryResyncRequest() {
+        return this.inventoryResyncRequested.getAndSet(false);
+    }
+
+    @Override
+    public void onInventoryResyncNeeded() {
+        this.inventoryResyncRequested.set(true);
     }
 
     @Override

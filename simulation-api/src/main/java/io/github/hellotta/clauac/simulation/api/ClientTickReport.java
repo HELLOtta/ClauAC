@@ -1,5 +1,6 @@
 package io.github.hellotta.clauac.simulation.api;
 
+import java.util.ArrayList;
 import java.util.List;
 
 // - Result of simulating one client tick. Positions are the player's feet position in world coordinates -
@@ -29,5 +30,17 @@ public record ClientTickReport(
 
     public ClientTickReport {
         notes = List.copyOf(notes);
+    }
+
+    // - The same tick with another outcome, and a note on why -
+    public ClientTickReport withOutcome(TickOutcome newOutcome, String note) {
+        List<String> newNotes = new ArrayList<>(this.notes);
+        newNotes.add(note);
+        return new ClientTickReport(
+                this.clientTick, newOutcome,
+                this.predictedX, this.predictedY, this.predictedZ, this.predictedOnGround, this.predictedHorizontalCollision, this.predictedSprinting,
+                this.positionReported, this.reportedX, this.reportedY, this.reportedZ, this.reportedOnGround, this.reportedHorizontalCollision, this.reportedSprinting,
+                this.offset, newNotes
+        );
     }
 }

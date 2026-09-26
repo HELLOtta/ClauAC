@@ -32,13 +32,24 @@ import net.minecraft.network.protocol.game.ServerboundAcceptTeleportationPacket;
 import net.minecraft.network.protocol.game.ServerboundAttackPacket;
 import net.minecraft.network.protocol.game.ServerboundClientTickEndPacket;
 import net.minecraft.network.protocol.game.ServerboundConfigurationAcknowledgedPacket;
+import net.minecraft.network.protocol.game.ServerboundContainerButtonClickPacket;
+import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
+import net.minecraft.network.protocol.game.ServerboundContainerClosePacket;
+import net.minecraft.network.protocol.game.ServerboundContainerSlotStateChangedPacket;
 import net.minecraft.network.protocol.game.ServerboundInteractPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundMoveVehiclePacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerAbilitiesPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerInputPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerLoadedPacket;
+import net.minecraft.network.protocol.game.ServerboundPunchPacket;
+import net.minecraft.network.protocol.game.ServerboundRenameItemPacket;
+import net.minecraft.network.protocol.game.ServerboundSelectBundleItemPacket;
+import net.minecraft.network.protocol.game.ServerboundSelectTradePacket;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
+import net.minecraft.network.protocol.game.ServerboundSetCreativeModeSlotPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
 import net.minecraft.world.flag.FeatureFlagSet;
@@ -90,10 +101,22 @@ public final class ClientSession implements PlayerSimulation {
     }
 
     private void release() {
+        this.endPlay();
         this.pending.clear();
         this.pendingNotes.clear();
         this.configuration = null;
+    }
+
+    // - Drops the play phase; a report it still held back is final now -
+    private void endPlay() {
+        PlayConnection ending = this.play;
         this.play = null;
+        if (ending != null) {
+            ClientTickReport held = ending.takeHeldReport();
+            if (held != null) {
+                this.listener.onClientTick(held);
+            }
+        }
     }
 
     private void process(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket) {
@@ -125,9 +148,15 @@ public final class ClientSession implements PlayerSimulation {
         }
     }
 
+    // - A report the failed play phase still held back is delivered before the failure, in tick order. Releasing -
+    // - must not hide the original problem, so a problem while releasing is attached to it -
     private void fail(String message, Throwable cause) {
         this.failed = true;
-        this.release();
+        try {
+            this.release();
+        } catch (RuntimeException releaseProblem) {
+            cause.addSuppressed(releaseProblem);
+        }
         this.listener.onSimulationFailure(message, cause);
     }
 
@@ -193,7 +222,7 @@ public final class ClientSession implements PlayerSimulation {
     // - ClientPacketListener.handleConfigurationStart: the level and the player are dropped, and a new configuration -
     // - listener starts from the registries and features of the play phase that ends -
     private void startConfiguration() {
-        this.play = null;
+        this.endPlay();
         this.configuration = new ConfigurationSession(this.registryCache, this.registries.access(), this.enabledFeatures);
     }
 
@@ -215,7 +244,7 @@ public final class ClientSession implements PlayerSimulation {
         this.enabledFeatures = session.enabledFeatures();
         this.configuration = null;
         this.decoders.bindPlay(this.registries.access());
-        PlayConnection newPlay = new PlayConnection(this.profile, this.registries, this.enabledFeatures);
+        PlayConnection newPlay = new PlayConnection(this.profile, this.registries, this.enabledFeatures, this.listener::onInventoryResyncNeeded);
         newPlay.tickPackets().notes.addAll(this.pendingNotes);
         this.pendingNotes.clear();
         this.play = newPlay;
@@ -248,40 +277,36 @@ public final class ClientSession implements PlayerSimulation {
             case ServerboundMovePlayerPacket.Rot rotation when this.isRotationAnswer(rotation) ->
                     this.applyThrough(pending -> pending instanceof ClientboundPlayerRotationPacket, "rotation answer");
             case ServerboundMovePlayerPacket move -> this.requirePlay().tickPackets().movePacket = move;
+            case ServerboundMoveVehiclePacket vehicleMove -> this.requirePlay().tickPackets().vehicleMove = vehicleMove;
             case ServerboundPlayerInputPacket input -> this.requirePlay().onInputReported(input.input());
             case ServerboundPlayerCommandPacket command -> {
                 switch (command.getAction()) {
                     case START_SPRINTING -> this.requirePlay().onSprintReported(true);
                     case STOP_SPRINTING -> this.requirePlay().onSprintReported(false);
                     case START_FALL_FLYING -> this.requirePlay().onFallFlyingStartReported();
-                    default -> {
-                        // - Sleeping, riding jumps and inventories do not change how the player moves on foot -
+                    case STOP_SLEEPING, START_RIDING_JUMP, STOP_RIDING_JUMP, OPEN_INVENTORY -> {
+                        // - Requests the server answers: leaving the bed, the riding jump and the mount's inventory -
+                        // - screen only change the client once the server's packets for them arrive -
                     }
                 }
             }
             case ServerboundPlayerAbilitiesPacket abilities -> this.requirePlay().onAbilitiesReported(abilities.isFlying());
             case ServerboundPlayerLoadedPacket ignored -> this.requirePlay().onPlayerLoaded();
             case ServerboundClientTickEndPacket ignored -> this.endClientTick();
-            case ServerboundPlayerActionPacket action -> {
-                PlayConnection connection = this.requirePlay();
-                connection.onBlockPrediction(action.getSequence());
-                switch (action.getAction()) {
-                    case RELEASE_USE_ITEM -> connection.onItemReleased();
-                    case STAB -> connection.tickPackets().uncertainties.add("attack");
-                    default -> {
-                        // - Breaking blocks is covered by the prediction sequence; dropping and swapping items does -
-                        // - not change movement -
-                    }
-                }
-            }
-            case ServerboundUseItemOnPacket useItemOn -> this.requirePlay().onBlockPrediction(useItemOn.sequence());
-            case ServerboundUseItemPacket useItem -> {
-                PlayConnection connection = this.requirePlay();
-                connection.onBlockPrediction(useItem.sequence());
-                connection.onItemUseRequested();
-            }
-            case ServerboundAttackPacket ignored -> this.requirePlay().tickPackets().uncertainties.add("attack");
-            case ServerboundInteractPacket ignored -> this.requirePlay().tickPackets().uncertainties.add("entity interaction");
+            // - What the client did during a tick with its keys and mouse; replayed at the tick's end -
+            case ServerboundSetCarriedItemPacket _, ServerboundPlayerActionPacket _, ServerboundUseItemOnPacket _, ServerboundUseItemPacket _,
+                 ServerboundAttackPacket _, ServerboundInteractPacket _, ServerboundPunchPacket _ ->
+                    this.requirePlay().tickPackets().actions.add(packet);
+            // - What the client did on a screen, between its ticks -
+            case ServerboundContainerClickPacket click -> this.requirePlay().onContainerClick(click);
+            case ServerboundContainerClosePacket close -> this.requirePlay().onContainerClose(close.getContainerId());
+            case ServerboundSetCreativeModeSlotPacket creativeSlot -> this.requirePlay().onCreativeModeSlot(creativeSlot);
+            case ServerboundContainerButtonClickPacket buttonClick -> this.requirePlay().onContainerButtonClick(buttonClick.containerId(), buttonClick.buttonId());
+            case ServerboundSelectBundleItemPacket bundleItem -> this.requirePlay().onSelectBundleItem(bundleItem.slotId(), bundleItem.selectedItemIndex());
+            case ServerboundSelectTradePacket trade -> this.requirePlay().onSelectTrade(trade.getItem());
+            case ServerboundRenameItemPacket rename -> this.requirePlay().onRenameItem(rename.getName());
+            case ServerboundContainerSlotStateChangedPacket slotState ->
+                    this.requirePlay().onSlotStateChanged(slotState.slotId(), slotState.containerId(), slotState.newState());
             default -> throw new IllegalArgumentException("No handler for " + packet.type());
         }
     }
@@ -305,7 +330,8 @@ public final class ClientSession implements PlayerSimulation {
     private void endClientTick() {
         PlayConnection connection = this.requirePlay();
         this.clientTick++;
-        ClientTickReport report = connection.tick(this.clientTick);
-        this.listener.onClientTick(report);
+        for (ClientTickReport report : connection.tick(this.clientTick)) {
+            this.listener.onClientTick(report);
+        }
     }
 }

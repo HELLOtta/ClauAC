@@ -14,7 +14,7 @@ import net.minecraft.network.protocol.game.GamePacketTypes;
 import net.minecraft.network.protocol.game.GameProtocols;
 
 // - The packets ClientSession handles, as network ids of the vanilla protocols. Everything else neither changes -
-// - the state the client's player moves in nor tells what the client did in a tick -
+// - the world, the entities or the items the client's player moves and acts with, nor tells what the client did -
 public final class RelevantPackets {
 
     private static final Set<PacketType<?>> CONFIGURATION_CLIENTBOUND = Set.of(
@@ -37,12 +37,31 @@ public final class RelevantPackets {
             GamePacketTypes.CLIENTBOUND_BLOCK_UPDATE,
             GamePacketTypes.CLIENTBOUND_SECTION_BLOCKS_UPDATE,
             GamePacketTypes.CLIENTBOUND_BLOCK_CHANGED_ACK,
+            GamePacketTypes.CLIENTBOUND_BLOCK_EVENT,
+            GamePacketTypes.CLIENTBOUND_BLOCK_ENTITY_DATA,
             GamePacketTypes.CLIENTBOUND_SET_CHUNK_CACHE_CENTER,
             GamePacketTypes.CLIENTBOUND_SET_CHUNK_CACHE_RADIUS,
             GamePacketTypes.CLIENTBOUND_SET_SIMULATION_DISTANCE,
             GamePacketTypes.CLIENTBOUND_PLAYER_POSITION,
             GamePacketTypes.CLIENTBOUND_PLAYER_ROTATION,
             GamePacketTypes.CLIENTBOUND_TELEPORT_ENTITY,
+            GamePacketTypes.CLIENTBOUND_ADD_ENTITY,
+            GamePacketTypes.CLIENTBOUND_ENTITY_POSITION_SYNC,
+            GamePacketTypes.CLIENTBOUND_MOVE_ENTITY_POS,
+            GamePacketTypes.CLIENTBOUND_MOVE_ENTITY_POS_ROT,
+            GamePacketTypes.CLIENTBOUND_MOVE_ENTITY_ROT,
+            GamePacketTypes.CLIENTBOUND_MOVE_MINECART_ALONG_TRACK,
+            GamePacketTypes.CLIENTBOUND_ROTATE_HEAD,
+            GamePacketTypes.CLIENTBOUND_SET_ENTITY_LINK,
+            GamePacketTypes.CLIENTBOUND_ENTITY_EVENT,
+            GamePacketTypes.CLIENTBOUND_DAMAGE_EVENT,
+            GamePacketTypes.CLIENTBOUND_HURT_ANIMATION,
+            GamePacketTypes.CLIENTBOUND_ANIMATE,
+            GamePacketTypes.CLIENTBOUND_SWING_ANIMATION,
+            GamePacketTypes.CLIENTBOUND_TAKE_ITEM_ENTITY,
+            GamePacketTypes.CLIENTBOUND_SET_EQUIPMENT,
+            GamePacketTypes.CLIENTBOUND_MOVE_VEHICLE,
+            GamePacketTypes.CLIENTBOUND_PROJECTILE_POWER,
             GamePacketTypes.CLIENTBOUND_PLAYER_ABILITIES,
             GamePacketTypes.CLIENTBOUND_GAME_EVENT,
             GamePacketTypes.CLIENTBOUND_PLAYER_INFO_UPDATE,
@@ -54,6 +73,10 @@ public final class RelevantPackets {
             GamePacketTypes.CLIENTBOUND_REMOVE_MOB_EFFECT,
             GamePacketTypes.CLIENTBOUND_SET_ENTITY_DATA,
             GamePacketTypes.CLIENTBOUND_SET_HEALTH,
+            GamePacketTypes.CLIENTBOUND_SET_EXPERIENCE,
+            GamePacketTypes.CLIENTBOUND_UPDATE_RECIPES,
+            GamePacketTypes.CLIENTBOUND_SET_PLAYER_TEAM,
+            GamePacketTypes.CLIENTBOUND_CHANGE_DIFFICULTY,
             GamePacketTypes.CLIENTBOUND_SET_PASSENGERS,
             GamePacketTypes.CLIENTBOUND_REMOVE_ENTITIES,
             GamePacketTypes.CLIENTBOUND_SET_CAMERA,
@@ -66,6 +89,17 @@ public final class RelevantPackets {
             GamePacketTypes.CLIENTBOUND_SET_TIME,
             GamePacketTypes.CLIENTBOUND_TICKING_STATE,
             GamePacketTypes.CLIENTBOUND_TICKING_STEP,
+            GamePacketTypes.CLIENTBOUND_CONTAINER_SET_CONTENT,
+            GamePacketTypes.CLIENTBOUND_CONTAINER_SET_SLOT,
+            GamePacketTypes.CLIENTBOUND_CONTAINER_SET_DATA,
+            GamePacketTypes.CLIENTBOUND_CONTAINER_CLOSE,
+            GamePacketTypes.CLIENTBOUND_SET_CURSOR_ITEM,
+            GamePacketTypes.CLIENTBOUND_SET_PLAYER_INVENTORY,
+            GamePacketTypes.CLIENTBOUND_SET_HELD_SLOT,
+            GamePacketTypes.CLIENTBOUND_OPEN_SCREEN,
+            GamePacketTypes.CLIENTBOUND_MOUNT_SCREEN_OPEN,
+            GamePacketTypes.CLIENTBOUND_MERCHANT_OFFERS,
+            GamePacketTypes.CLIENTBOUND_COOLDOWN,
             CommonPacketTypes.CLIENTBOUND_UPDATE_TAGS,
             CommonPacketTypes.CLIENTBOUND_PING
     );
@@ -86,7 +120,18 @@ public final class RelevantPackets {
             GamePacketTypes.SERVERBOUND_USE_ITEM,
             GamePacketTypes.SERVERBOUND_USE_ITEM_ON,
             GamePacketTypes.SERVERBOUND_ATTACK,
-            GamePacketTypes.SERVERBOUND_INTERACT
+            GamePacketTypes.SERVERBOUND_INTERACT,
+            GamePacketTypes.SERVERBOUND_PUNCH,
+            GamePacketTypes.SERVERBOUND_SET_CARRIED_ITEM,
+            GamePacketTypes.SERVERBOUND_MOVE_VEHICLE,
+            GamePacketTypes.SERVERBOUND_CONTAINER_CLICK,
+            GamePacketTypes.SERVERBOUND_CONTAINER_CLOSE,
+            GamePacketTypes.SERVERBOUND_CONTAINER_BUTTON_CLICK,
+            GamePacketTypes.SERVERBOUND_CONTAINER_SLOT_STATE_CHANGED,
+            GamePacketTypes.SERVERBOUND_SET_CREATIVE_MODE_SLOT,
+            GamePacketTypes.SERVERBOUND_BUNDLE_ITEM_SELECTED,
+            GamePacketTypes.SERVERBOUND_SELECT_TRADE,
+            GamePacketTypes.SERVERBOUND_RENAME_ITEM
     );
 
     private final BitSet configurationClientbound;
