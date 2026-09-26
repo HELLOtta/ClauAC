@@ -22,6 +22,17 @@ version on the classpath (see [`gradle/libs.versions.toml`](gradle/libs.versions
 - **Other plugins or mods as dependencies:** clone that product's source code and check the exact version that is
   depended on.
 
+## Rules for the simulation module
+
+- Code in `simulation` runs inside the isolated vanilla runtime (see README): it may use `net.minecraft` and the
+  libraries of the vanilla server, never Paper, Bukkit or PacketEvents. The plugin and the simulation only exchange
+  the types in `simulation-api` (plain Java types and raw packet bytes).
+- The client jar is not on the build's class path. Client-only behaviour is ported from the 26.3 client jar (read it
+  with `javap` or a decompiler such as Vineflower) and each port names the class or method it comes from.
+- Ports keep the client's order of operations. Leave out only what renders, plays sounds or shows screens, and say in
+  a comment what was left out. Anything the sandbox cannot reproduce must be reported (`UNVERIFIED` with a note), never
+  approximated silently.
+
 ## Verify by running it
 
 A successful build is not verification. For every change:
@@ -49,3 +60,15 @@ Findings from running the official 26.3 client in a cloud container without a GP
   capture keeps up in real time. Measured on 26.3 gameplay, re-encoding the finished recording with
   `-preset medium -crf 21` gave an equal or slightly higher SSIM at about half the file size. Check the audio of every
   recording (for example with ffmpeg's `volumedetect`); a fully silent track measures about -91 dB.
+- **Test world settings:** game rule ids are snake_case in 26.3 (`log_admin_commands`, `advance_time`,
+  `drowning_damage`). Set `broadcast-console-to-ops=false` in `run/server.properties` for recordings, otherwise console
+  commands fill the chat and cover the action bar. A test player left idle under water drowns, so turn
+  `drowning_damage` off on the test world.
+- **Console commands:** `~ ~ ~` in a console command means the console's position (the world spawn); run relative
+  commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`.
+- **Key presses:** `xdotool key` releases the key within the same client tick, which the client's per-tick key polling
+  can miss (a double tap of jump to fly never registers). Hold keys with `keydown`, `sleep 0.1`, `keyup`.
+- **Stopping the client:** `pkill -f <pattern>` also matches the shell that runs the command when the pattern appears
+  in it, and kills that shell. Kill the client by the PID of its `net.minecraft.client.main.Main` process instead.
+- **Simulation results:** `run/plugins/ClauAC/reports/*.csv` has one line per client tick; `/clauac debug` shows the
+  outcome of every tick in the action bar.

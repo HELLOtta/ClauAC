@@ -1,0 +1,30 @@
+package io.github.hellotta.clauac.simulation.player;
+
+import net.minecraft.world.level.GameType;
+import org.jspecify.annotations.Nullable;
+
+// - Client state that lives outside the player on the client (connection, game mode, camera) -
+public interface ClientContext {
+
+    // - ClientPacketListener.hasClientLoaded: the player does not tick before the client reported it has loaded -
+    boolean hasClientLoaded();
+
+    // - LocalPlayer.isControlledCamera: whether the camera is the player itself rather than a spectated entity -
+    boolean isCameraOnPlayer();
+
+    // - AbstractClientPlayer.gameMode: the game mode from the tab list entry of the player, if there is one -
+    @Nullable GameType playerInfoGameMode();
+
+    // - MultiPlayerGameMode.isSpectator: the game mode the client applied to itself -
+    boolean isLocalModeSpectator();
+
+    // - The client started sprinting this tick through a path the server cannot observe directly (double tapping -
+    // - forward within the client's sprint window option); its START_SPRINTING command of the tick reveals it -
+    boolean sprintStartReportedThisTick();
+
+    // - LocalPlayer.onUpdateAbilities sends the abilities to the server -
+    void onAbilitiesSent();
+
+    // - LocalPlayer.aiStep sends START_FALL_FLYING when the player starts gliding -
+    void onFallFlyingStartSent();
+}

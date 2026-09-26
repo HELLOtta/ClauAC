@@ -5,10 +5,18 @@ paper-api = "26.3.build.45-alpha"
 packetevents = "2.14.0"
 shadow = "9.6.1"
 run-paper = "3.1.0"
+# - Annotation artifacts referenced by the class files of the Guava version bundled with the vanilla server -
+error-prone-annotations = "2.47.0"
+j2objc-annotations = "3.1"
+# - Referenced by the class files of the vanilla server itself (same version Paper builds against) -
+jetbrains-annotations = "26.1.0"
 
 [libraries]
 paper-api = { module = "io.papermc.paper:paper-api", version.ref = "paper-api" }
 packetevents-spigot = { module = "com.github.retrooper:packetevents-spigot", version.ref = "packetevents" }
+error-prone-annotations = { module = "com.google.errorprone:error_prone_annotations", version.ref = "error-prone-annotations" }
+j2objc-annotations = { module = "com.google.j2objc:j2objc-annotations", version.ref = "j2objc-annotations" }
+jetbrains-annotations = { module = "org.jetbrains:annotations", version.ref = "jetbrains-annotations" }
 
 [plugins]
 shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }

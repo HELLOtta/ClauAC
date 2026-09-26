@@ -13,3 +13,12 @@ softdepend:
   - ViaBackwards
   - ViaRewind
   - Geyser-Spigot
+commands:
+  clauac:
+    description: Shows what the movement simulation found
+    usage: /clauac <debug|status>
+    permission: clauac.admin
+permissions:
+  clauac.admin:
+    description: Allows /clauac
+    default: op

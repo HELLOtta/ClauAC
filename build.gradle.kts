@@ -1,7 +1,7 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 
 plugins {
-    java
+    id("clauac.java-conventions")
     alias(libs.plugins.shadow)
     alias(libs.plugins.run.paper)
 }
@@ -18,10 +18,6 @@ val bundledLibrariesPackage = "io.github.hellotta.clauac.libs"
 
 fun ShadowJar.relocateBundled(pattern: String) =
     relocate(pattern, "$bundledLibrariesPackage.$pattern")
-
-java {
-    toolchain.languageVersion = JavaLanguageVersion.of(25)
-}
 
 repositories {
     mavenCentral()
@@ -41,8 +37,18 @@ repositories {
     }
 }
 
+// - The simulation jar is not a class path dependency: it is shipped as a resource and loaded by an isolated class loader -
+val simulationJar = configurations.create("simulationJar") {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+    isTransitive = false
+}
+
 dependencies {
     compileOnly(libs.paper.api)
+
+    implementation(project(":simulation-api"))
+    simulationJar(project(":simulation"))
 
     implementation(libs.packetevents.spigot) {
         // - Netty is part of the server's network stack, which PacketEvents injects into; it must never be bundled -
@@ -53,11 +59,6 @@ dependencies {
 }
 
 tasks {
-    withType<JavaCompile>().configureEach {
-        options.encoding = Charsets.UTF_8.name()
-        options.compilerArgs.add("-Xlint:all")
-    }
-
     processResources {
         val properties = mapOf(
             "version" to project.version.toString(),
@@ -67,6 +68,10 @@ tasks {
         inputs.properties(properties)
         filesMatching("plugin.yml") {
             expand(properties)
+        }
+        from(simulationJar) {
+            into("simulation")
+            rename { "clauac-simulation.jar" }
         }
     }
 
