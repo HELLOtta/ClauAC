@@ -1,0 +1,15 @@
+[versions]
+# - Minecraft release targeted by the server API, the plugin.yml api-version and the development server -
+minecraft = "26.3"
+paper-api = "26.3.build.45-alpha"
+packetevents = "2.14.0"
+shadow = "9.6.1"
+run-paper = "3.1.0"
+
+[libraries]
+paper-api = { module = "io.papermc.paper:paper-api", version.ref = "paper-api" }
+packetevents-spigot = { module = "com.github.retrooper:packetevents-spigot", version.ref = "packetevents" }
+
+[plugins]
+shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }
+run-paper = { id = "xyz.jpenilla.run-paper", version.ref = "run-paper" }

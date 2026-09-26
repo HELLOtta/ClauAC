@@ -1,0 +1,15 @@
+name: ClauAC
+version: '${version}'
+main: io.github.hellotta.clauac.ClauACPlugin
+description: '${description}'
+api-version: '${apiVersion}'
+author: HELLOtta
+website: https://github.com/HELLOtta/ClauAC
+# - PacketEvents injects into the network pipeline after these plugins, so they have to load first when present -
+softdepend:
+  - ProtocolLib
+  - ProtocolSupport
+  - ViaVersion
+  - ViaBackwards
+  - ViaRewind
+  - Geyser-Spigot
