@@ -316,9 +316,15 @@ final class ConnectionSimulation {
             }
             return;
         }
-        if (type == PacketType.Play.Server.CONFIGURATION_START || type == PacketType.Play.Server.DISCONNECT) {
+        if (type == PacketType.Play.Server.CONFIGURATION_START || type == PacketType.Play.Server.DISCONNECT
+                || type == PacketType.Play.Server.KEEP_ALIVE) {
             // - The client refuses a terminal packet inside a bundle (PacketBundlePacker), and would never handle a -
-            // - disconnect held back in a bundle that the closed connection cannot end any more -
+            // - disconnect held back in a bundle that the closed connection cannot end any more. It answers a -
+            // - keep-alive right away on its network thread (ClientCommonPacketListenerImpl.handleKeepAlive), but one -
+            // - inside a bundle only once its main thread handles the bundle: when the connection stalled and the -
+            // - keep-alives of those seconds reach the client together, a later one outside of a bundle is answered -
+            // - first, and Paper disconnects a client that answers its keep-alives out of order -
+            // - (ServerCommonPacketListenerImpl.handleKeepAlive) -
             if (this.bundleOpen) {
                 this.endBundle();
             }

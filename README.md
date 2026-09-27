@@ -103,8 +103,13 @@ processed them:
   of a bundle in one go, in one task on its main thread (`ClientPacketListener.handleBundlePacket`), and answers the
   ping right there, so none of its ticks can fall between a packet and the ping behind it. A bundle collects
   everything the connection's event loop writes before it gets to end it; vanilla's own bundles become part of it.
-  The start of a configuration phase and a disconnect end the bundle before them: the client refuses the former inside
-  a bundle and would never handle the latter in a bundle the closed connection cannot end any more.
+  The start of a configuration phase, a disconnect and a keep-alive end the bundle before them: the client refuses the
+  first inside a bundle and would never handle the second in a bundle the closed connection cannot end any more. It
+  answers a keep-alive right away on its network thread (`ClientCommonPacketListenerImpl.handleKeepAlive`), but one
+  inside a bundle only once its main thread handles the bundle. After a stall of the connection, the keep-alives of
+  those seconds reach the client together: in a test with long stalls, one in a bundle was answered after the later
+  ones outside of bundles, and Paper disconnected the player for answering out of order
+  (`ServerCommonPacketListenerImpl.handleKeepAlive`).
 - The pongs that answer these pings go to the simulation and no further. The server never sent those pings and ignores
   pongs anyway, but Paper's packet limiter counts every packet the server decodes, and the pongs make up most of what
   a client sends: 55 to 95 per second for a player standing still among the animals of the test world, and 150 per
