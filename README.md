@@ -101,6 +101,13 @@ processed them:
   everything the connection's event loop writes before it gets to end it; vanilla's own bundles become part of it.
   The start of a configuration phase and a disconnect end the bundle before them: the client refuses the former inside
   a bundle and would never handle the latter in a bundle the closed connection cannot end any more.
+- The pongs that answer these pings go to the simulation and no further. The server never sent those pings and ignores
+  pongs anyway, but Paper's packet limiter counts every packet the server decodes, and the pongs make up most of what
+  a client sends: 55 to 95 per second for a player standing still among the animals of the test world, and 150 per
+  second with 150 chickens walking around it, 87% of all it sent. The pings' ids start at a random place among the
+  2^30 lowest ints, away from the small counters other plugins use for their own pings, whose pongs pass through. A
+  connection stall of 25 seconds, whose 3052 held packets arrived at once, stays below Paper's limit of 500 packets
+  per second over 7 seconds (`packet-limiter` in `paper-global.yml`) that way.
 - A teleport is answered with the teleport acceptance, a rotation packet with a rotation, and the start of a
   configuration phase with its acknowledgement.
 
@@ -285,13 +292,6 @@ Known limits:
   ends fewer ticks than real time allows for a while may end that many more later, up to the ticks of 60 seconds at
   once, and 1% more than real time allows all along. Those ticks are simulated and checked like any other, so each of
   them still has to move the player as vanilla would.
-- Every bundle ClauAC sends ends with a ping that the client answers, so the client sends more packets than without
-  ClauAC. The server's packets for one tick leave the event loop in several batches, each its own bundle: in the test
-  world, a player standing still among the animals around answered 55 to 95 pings per second next to its 20 tick
-  ends, and 150 per second with 150 chickens walking around it, 87% of all it sent. Paper disconnects a client that
-  sends more than 500 packets per second over 7 seconds (`packet-limiter` in `paper-global.yml`), so the pongs a
-  connection stall held back can do that once they arrive: a stall of 25 seconds did in the test world, where without
-  the pongs it would have stayed far below the limit.
 
 ### Verified so far
 

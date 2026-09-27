@@ -82,8 +82,9 @@ Findings from running the official 26.3 client in a cloud container without a GP
   properties to it instead of replacing it, e.g.
   `JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Dclauac.verifyRepeatedTicks=true" ./gradlew runServer`.
 - **Holding the client's packets** (a proxy imitating a stalled connection): Paper disconnects a client that sent more
-  than 500 packets per second over 7 s, and the pongs to ClauAC's pings make the test client send about 80 to 170
-  per second. Releasing 25 s of held packets got it disconnected; holds of 15 s stayed below the limit.
+  than 500 packets per second over 7 s. The test client sends about 80 to 170 packets per second, most of them pongs
+  to ClauAC's pings, which ClauAC takes out before Paper counts them: releasing 25 s of held packets (3052) stayed
+  below the limit, together with a flood of 1500 tick ends 12 s later.
 - **A second player:** start another client with its own game directory (a copy of `options.txt` with a low
   `maxFps` and `renderDistance` keeps both clients responsive). Both windows share the Xvfb display: find them with
   `xdotool search --pid <pid>`, move the second one off screen with `xdotool windowmove`, and give the first one the

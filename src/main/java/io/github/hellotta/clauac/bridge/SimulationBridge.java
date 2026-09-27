@@ -70,6 +70,14 @@ public final class SimulationBridge implements PacketListener {
         this.observe(event, PacketDirection.SERVERBOUND);
     }
 
+    // - Called on the connection's event loop by OwnPongConsumer; a connection only starts with its configuration -
+    void consumeOwnPong(PacketReceiveEvent event) {
+        ConnectionSimulation connection = this.connections.get(event.getUser().getChannel());
+        if (connection != null) {
+            connection.consumeOwnPong(event);
+        }
+    }
+
     private void observe(ProtocolPacketEvent event, PacketDirection direction) {
         ProtocolPhase phase = phaseOf(event.getConnectionState());
         if (phase == null) {

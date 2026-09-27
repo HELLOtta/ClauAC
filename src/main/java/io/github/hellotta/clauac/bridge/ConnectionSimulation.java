@@ -1,5 +1,6 @@
 package io.github.hellotta.clauac.bridge;
 
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
 import com.github.retrooper.packetevents.event.ProtocolPacketEvent;
 import com.github.retrooper.packetevents.netty.buffer.ByteBufHelper;
 import com.github.retrooper.packetevents.netty.channel.ChannelHelper;
@@ -15,13 +16,18 @@ import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationRuntime;
 import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -57,6 +63,15 @@ final class ConnectionSimulation {
     // - The client refuses a bundle of more than BundlerInfo.BUNDLE_SIZE_LIMIT (4096) packets. A bundle is ended -
     // - before it would hold more than this, which leaves room for the ping that ends it -
     private static final int MAXIMUM_BUNDLE_PACKETS = 4000;
+    // - The ids of the connection's own pings: 2^30 ids from the lowest int up, far from the small counters around 0 -
+    // - that other plugins use for their pings, whose pongs must pass through untouched (see consumeOwnPong). Each -
+    // - connection starts at a random place among them -
+    private static final int OWN_PING_ID_BASE = Integer.MIN_VALUE;
+    private static final int OWN_PING_ID_MASK = (1 << 30) - 1;
+    // - The unanswered pings remembered at most; the pongs a client sends for older ones pass through to the server -
+    private static final int MAXIMUM_OWN_PINGS = 100_000;
+    // - The payload of the play pong (serverbound minecraft:pong): the id as an int -
+    private static final int PONG_PAYLOAD_BYTES = Integer.BYTES;
 
     private record WaitingPacket(ProtocolPhase phase, PacketDirection direction, int packetId, byte[] encodedPacket) {
     }
@@ -80,7 +95,9 @@ final class ConnectionSimulation {
     private boolean bundleOpen;
     private int bundlePackets;
     private boolean bundleEndScheduled;
-    private int nextPingId = -1;
+    private int pingSequence = ThreadLocalRandom.current().nextInt();
+    // - The ids of the connection's own pings that the client has not answered yet, oldest first -
+    private final Set<Integer> ownPingIds = new LinkedHashSet<>();
 
     private ConnectionSimulation(User user, Path reportDirectory, Logger logger, AtomicLong totalWaitingBytes, State state, @Nullable String notSimulatedReason) {
         this.user = user;
@@ -263,10 +280,50 @@ final class ConnectionSimulation {
         });
     }
 
-    // - Ids count down from -1 so that they never collide with the positive ids other plugins tend to use; the -
-    // - simulation matches every ping with its pong regardless of who sent it -
+    // - The simulation matches every ping with its pong regardless of who sent it; the plugin remembers its own ids -
+    // - to take their pongs out of the connection -
     private int nextPingId() {
-        return this.nextPingId--;
+        int id = OWN_PING_ID_BASE + (this.pingSequence++ & OWN_PING_ID_MASK);
+        this.ownPingIds.add(id);
+        if (this.ownPingIds.size() > MAXIMUM_OWN_PINGS) {
+            Iterator<Integer> oldest = this.ownPingIds.iterator();
+            oldest.next();
+            oldest.remove();
+        }
+        return id;
+    }
+
+    // - Called on the event loop for every play pong of the client, with the priority that decides a packet's final -
+    // - state. A pong that answers one of the connection's own pings goes to the simulation in its place and no -
+    // - further: the server never sent that ping and ignores pongs anyway (ServerCommonPacketListenerImpl.handlePong), -
+    // - while Paper's packet limiter, which counts every packet the server decodes (Connection.channelRead0), would -
+    // - count it against the client. Every other pong, a malformed one included, goes on to the server as it came -
+    void consumeOwnPong(PacketReceiveEvent event) {
+        Object buffer = event.getByteBuf();
+        if (ByteBufHelper.readableBytes(buffer) != PONG_PAYLOAD_BYTES) {
+            return;
+        }
+        byte[] payload = ByteBufHelper.copyBytes(buffer);
+        if (!this.ownPingIds.remove(ByteBuffer.wrap(payload).getInt())) {
+            return;
+        }
+        event.setCancelled(true);
+        int packetId = event.getPacketId();
+        boolean handedOver = switch (this.state) {
+            case WAITING -> true;
+            case SIMULATED -> Objects.requireNonNull(this.runtime).isRelevant(ProtocolPhase.PLAY, PacketDirection.SERVERBOUND, packetId);
+            case NOT_SIMULATED -> false;
+        };
+        if (handedOver) {
+            Object encoded = ChannelHelper.pooledByteBuf(this.user.getChannel());
+            try {
+                ByteBufHelper.writeVarInt(encoded, packetId);
+                ByteBufHelper.writeBytes(encoded, payload);
+                this.handOver(ProtocolPhase.PLAY, PacketDirection.SERVERBOUND, packetId, ByteBufHelper.copyBytes(encoded));
+            } finally {
+                ByteBufHelper.release(encoded);
+            }
+        }
     }
 
     private void handOver(ProtocolPhase phase, PacketDirection direction, int packetId, byte[] encodedPacket) {

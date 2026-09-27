@@ -3,6 +3,7 @@ package io.github.hellotta.clauac;
 import com.destroystokyo.paper.event.server.ServerTickEndEvent;
 import com.github.retrooper.packetevents.PacketEvents;
 import com.github.retrooper.packetevents.event.PacketListenerPriority;
+import io.github.hellotta.clauac.bridge.OwnPongConsumer;
 import io.github.hellotta.clauac.bridge.SimulationBridge;
 import io.github.hellotta.clauac.runtime.SimulationRuntimeLoader;
 import io.github.retrooper.packetevents.factory.spigot.SpigotPacketEventsBuilder;
@@ -41,6 +42,8 @@ public final class ClauACPlugin extends JavaPlugin implements Listener {
         this.bridge = simulationBridge;
         // - Runs after every other listener, so that the simulation sees packets exactly as they are sent -
         PacketEvents.getAPI().getEventManager().registerListener(simulationBridge, PacketListenerPriority.MONITOR);
+        // - Decides the final state of the pongs that answer ClauAC's own pings: they go no further than the simulation -
+        PacketEvents.getAPI().getEventManager().registerListener(new OwnPongConsumer(simulationBridge), PacketListenerPriority.HIGHEST);
         this.getServer().getPluginManager().registerEvents(this, this);
         ClauACCommand command = new ClauACCommand(simulationBridge);
         PluginCommand pluginCommand = Objects.requireNonNull(this.getCommand("clauac"), "plugin.yml declares the clauac command");
