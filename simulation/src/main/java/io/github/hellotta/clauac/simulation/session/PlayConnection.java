@@ -3,7 +3,9 @@ package io.github.hellotta.clauac.simulation.session;
 import com.google.common.hash.HashCode;
 import com.mojang.authlib.GameProfile;
 import com.mojang.logging.LogUtils;
+import io.github.hellotta.clauac.simulation.api.Check;
 import io.github.hellotta.clauac.simulation.api.ClientTickReport;
+import io.github.hellotta.clauac.simulation.api.Flag;
 import io.github.hellotta.clauac.simulation.api.TickOutcome;
 import io.github.hellotta.clauac.simulation.player.ClientContext;
 import io.github.hellotta.clauac.simulation.player.SandboxPlayer;
@@ -17,6 +19,7 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -886,7 +889,7 @@ final class PlayConnection implements ClientContext {
             if (held != null) {
                 reports.add(held);
             }
-            reports.add(this.unsimulatedTick(clientTick, "the simulation of this tick failed (" + problem + ")"));
+            reports.add(this.unsimulatedTick(clientTick, new Flag(Check.SIMULATION_FAILURE, "the simulation of this tick failed (" + problem + ")")));
         }
         // - ClientLevel.tick, after the player sent its movement; a failure here shows in the next tick -
         String levelTickFailure = null;
@@ -901,7 +904,7 @@ final class PlayConnection implements ClientContext {
         }
         this.tickPackets.reset();
         if (levelTickFailure != null) {
-            this.tickPackets.rejections.add(levelTickFailure);
+            this.tickPackets.reject(Check.SIMULATION_FAILURE, levelTickFailure);
         }
         return reports;
     }
@@ -909,7 +912,7 @@ final class PlayConnection implements ClientContext {
     // - A tick the client ended sooner than real time allows (see TickBudget) is not simulated, so that ending ticks -
     // - faster cannot make the simulation fall behind: the client's reported state is taken over, and neither the -
     // - player nor the level with its entities ticks. A report held back from the previous tick goes first -
-    List<ClientTickReport> skipTick(long clientTick, String rejection) {
+    List<ClientTickReport> skipTick(long clientTick, Flag rejection) {
         List<ClientTickReport> reports = new ArrayList<>(2);
         ClientTickReport held = this.takeHeldReport("the next tick, which had to report the hotbar switch this tick assumed, came too soon to be simulated");
         if (held != null) {
@@ -1295,14 +1298,14 @@ final class PlayConnection implements ClientContext {
     // - A tick that is not simulated, since its simulation failed partway or it came too soon (see skipTick). Nothing -
     // - the client sent is checked, so the tick is MISMATCHED with the reason, and the sandbox takes over what the -
     // - client reported, as after a mismatch, so that the next tick starts from where the client is -
-    private ClientTickReport unsimulatedTick(long clientTick, String rejection) {
+    private ClientTickReport unsimulatedTick(long clientTick, Flag rejection) {
         ClientTickPackets packets = this.tickPackets;
         ReportedState reported = this.reportedState();
         boolean reportedSprinting = this.lastSent.sprinting;
-        List<String> rejections = new ArrayList<>(packets.rejections);
+        List<Flag> rejections = new ArrayList<>(packets.rejections);
         rejections.add(rejection);
         List<String> notes = new ArrayList<>(packets.notes);
-        notes.add("rejected: " + String.join(", ", rejections));
+        notes.add(ClientTickPackets.rejectionNote(rejections));
         double predictedX = Double.NaN;
         double predictedY = Double.NaN;
         double predictedZ = Double.NaN;
@@ -1327,7 +1330,7 @@ final class PlayConnection implements ClientContext {
                 clientTick, TickOutcome.MISMATCHED,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
-                Double.NaN, null, notes
+                Double.NaN, null, rejections, notes
         );
     }
 
@@ -1370,23 +1373,21 @@ final class PlayConnection implements ClientContext {
         ItemStack switchedTo = leadingSwitch != null ? player.getInventory().getItem(leadingSwitch.getSlot()) : null;
         if (!stoppedItem.isEmpty()) {
             if (switchedTo != null && !ItemStack.isSameItem(switchedTo, stoppedItem)) {
-                held = held.withOutcome(held.outcome(), "the hotbar switch the client reported with its next tick stopped the item use in this tick");
+                held = held.withNote("the hotbar switch the client reported with its next tick stopped the item use in this tick");
             } else {
-                held = held.withOutcome(TickOutcome.MISMATCHED,
-                        "differs in: the item use stopped in this tick, which only a hotbar switch explains, and the client reported none with its next tick");
+                String difference = "the item use stopped in this tick, which only a hotbar switch explains, and the client reported none with its next tick";
+                held = held.withFlag(new Flag(Check.SIMULATION, difference), "differs in: " + difference);
             }
         }
         if (!usedItem.isEmpty() && switchedTo != null && !ItemStack.isSameItem(switchedTo, usedItem)) {
             if (!useStopTried || changesMovementAttributes(switchedTo)) {
-                held = held.withOutcome(TickOutcome.UNVERIFIED,
-                        "not simulated: the hotbar switch the client reported with its next tick may have stopped the item use in this tick");
+                held = held.explainedBy("not simulated: the hotbar switch the client reported with its next tick may have stopped the item use in this tick");
                 // - The held tick was the last one to estimate the velocity, and its difference is now unverified -
                 if (this.ticksSinceVelocityEstimate == 0) {
                     this.estimatedAfterOutcome = TickOutcome.UNVERIFIED;
                 }
             } else {
-                held = held.withOutcome(held.outcome(),
-                        "the item use the hotbar switch reported with the next tick would have stopped does not explain the difference either");
+                held = held.withNote("the item use the hotbar switch reported with the next tick would have stopped does not explain the difference either");
             }
         }
         reports.add(held);
@@ -1424,13 +1425,13 @@ final class PlayConnection implements ClientContext {
                 if (!ItemStack.isSameItem(assumedItem, inventory.getItem(reportedSlot))) {
                     player.considerEarlierHotbarSwitch();
                 }
-                return held.withOutcome(held.outcome(),
-                        "the client selected hotbar slot " + (reportedSlot + 1) + " in this tick, where the sandbox chose slot " + (inferred.slot() + 1));
+                return held.withNote("the client selected hotbar slot " + (reportedSlot + 1) + " in this tick, where the sandbox chose slot " + (inferred.slot() + 1));
             }
         }
         inventory.setSelectedSlot(inferred.previousSlot());
-        return held.withOutcome(TickOutcome.MISMATCHED, "rejected: the client " + (inferred.steers() ? "steered" : "stopped steering")
-                + " its vehicle, which only a hotbar switch explains, and reported none with its next tick");
+        String rejection = "the client " + (inferred.steers() ? "steered" : "stopped steering")
+                + " its vehicle, which only a hotbar switch explains, and reported none with its next tick";
+        return held.withFlag(new Flag(Check.BAD_PACKETS, rejection), "rejected: " + rejection);
     }
 
     // - Whether selecting this slot hands the vehicle of the inferred switch to the client, or takes it away, as the -
@@ -1460,7 +1461,7 @@ final class PlayConnection implements ClientContext {
         this.heldReportStoppedItem = ItemStack.EMPTY;
         this.heldReportInferredSwitch = null;
         if (held != null && (inferredSwitch != null || !stoppedItem.isEmpty())) {
-            return held.withOutcome(TickOutcome.UNVERIFIED, "not simulated: " + undecidedReason);
+            return held.explainedBy("not simulated: " + undecidedReason);
         }
         return held;
     }
@@ -1538,7 +1539,7 @@ final class PlayConnection implements ClientContext {
                 swingAccompanied = this.performTickAction(action, index, leadingSwitch, crosshair, swingAccompanied, level, player);
             } catch (RuntimeException problem) {
                 this.problemLog.log("rejected " + action.type() + " replayed at the end of a client tick", problem);
-                this.tickPackets.rejections.add(action.type() + " could not be performed (" + problem + ")");
+                this.tickPackets.reject(Check.BAD_PACKETS, action.type() + " could not be performed (" + problem + ")");
             }
         }
     }
@@ -1671,7 +1672,7 @@ final class PlayConnection implements ClientContext {
     // - The server ignores a slot outside the hotbar, which a vanilla client never selects -
     private void selectHotbarSlot(SandboxPlayer player, int slot, boolean mayHaveChangedEarlier) {
         if (!Inventory.isHotbarSlot(slot)) {
-            this.tickPackets.rejections.add("the client selected hotbar slot " + slot + ", which does not exist");
+            this.tickPackets.reject(Check.BAD_PACKETS, "the client selected hotbar slot " + slot + ", which does not exist");
             return;
         }
         player.getInventory().setSelectedSlot(slot);
@@ -1731,15 +1732,15 @@ final class PlayConnection implements ClientContext {
     // - A tick the client did not simulate its player in; a rejected packet still makes it MISMATCHED -
     private ClientTickReport notSimulated(long clientTick, SandboxPlayer tickPlayer, boolean reportedSprinting, List<String> notes) {
         ReportedState reported = this.reportedState();
-        Set<String> rejections = this.tickPackets.rejections;
+        Set<Flag> rejections = this.tickPackets.rejections;
         if (!rejections.isEmpty()) {
-            notes.add("rejected: " + String.join(", ", rejections));
+            notes.add(ClientTickPackets.rejectionNote(rejections));
         }
         return new ClientTickReport(
                 clientTick, rejections.isEmpty() ? TickOutcome.NOT_SIMULATED : TickOutcome.MISMATCHED,
                 tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), tickPlayer.onGround(), tickPlayer.horizontalCollision, tickPlayer.isSprinting(),
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
-                Double.NaN, null, notes
+                Double.NaN, null, List.copyOf(rejections), notes
         );
     }
 
@@ -1825,7 +1826,9 @@ final class PlayConnection implements ClientContext {
 
         this.advanceLastSent(reported);
 
-        TickOutcome outcome = this.outcome(differences, uncertainties, notes);
+        Verdict verdict = this.verdict(differences.stream().map(difference -> difference.equals(POSITION_DIFFERENCE)
+                ? String.format(Locale.ROOT, "%s %.4g blocks off", POSITION_DIFFERENCE, offset) : difference).toList(), List.of(), uncertainties, notes);
+        TickOutcome outcome = verdict.outcome();
         if (!differences.isEmpty()) {
             // - Continue from the client's state -
             if (positionReported) {
@@ -1842,7 +1845,7 @@ final class PlayConnection implements ClientContext {
                 clientTick, outcome,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
                 positionReported, reportedX, reportedY, reportedZ, reportedOnGround, reportedHorizontalCollision, reportedSprinting,
-                offset, null, notes
+                offset, null, verdict.flags(), notes
         );
     }
 
@@ -1899,27 +1902,43 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - The outcome of a compared tick, with the notes that explain it. A rejected packet makes the tick MISMATCHED -
-    // - even when everything else matched: no uncertainty explains a packet no vanilla client sends -
-    private TickOutcome outcome(List<String> differences, List<String> uncertainties, List<String> notes) {
-        Set<String> rejections = this.tickPackets.rejections;
-        boolean rejected = !rejections.isEmpty();
-        if (differences.isEmpty() && !rejected) {
+    // - The outcome of a compared tick and the checks it failed, from how the player and how its vehicle differ from -
+    // - what the client reported, with the notes that explain it. An uncertainty explains the differences, but a -
+    // - rejected packet makes the tick MISMATCHED even when everything else matched: no uncertainty explains a packet -
+    // - no vanilla client sends -
+    private Verdict verdict(List<String> playerDifferences, List<String> vehicleDifferences, List<String> uncertainties, List<String> notes) {
+        Set<Flag> rejections = this.tickPackets.rejections;
+        List<String> differences = new ArrayList<>(playerDifferences);
+        differences.addAll(vehicleDifferences);
+        if (differences.isEmpty() && rejections.isEmpty()) {
             if (!uncertainties.isEmpty()) {
                 notes.add("matched despite: " + String.join(", ", uncertainties));
             }
-            return TickOutcome.MATCHED;
+            return new Verdict(TickOutcome.MATCHED, List.of());
         }
         if (!differences.isEmpty()) {
             notes.add("differs in: " + String.join(", ", differences));
         }
-        if (rejected) {
-            notes.add("rejected: " + String.join(", ", rejections));
+        if (!rejections.isEmpty()) {
+            notes.add(ClientTickPackets.rejectionNote(rejections));
         }
         if (!uncertainties.isEmpty()) {
             notes.add((differences.isEmpty() ? "matched despite: " : "not simulated: ") + String.join(", ", uncertainties));
         }
-        return uncertainties.isEmpty() || rejected ? TickOutcome.MISMATCHED : TickOutcome.UNVERIFIED;
+        List<Flag> flags = new ArrayList<>(rejections);
+        if (uncertainties.isEmpty()) {
+            if (!playerDifferences.isEmpty()) {
+                flags.add(new Flag(Check.SIMULATION, "differs in: " + String.join(", ", playerDifferences)));
+            }
+            if (!vehicleDifferences.isEmpty()) {
+                flags.add(new Flag(Check.VEHICLE, "differs in: " + String.join(", ", vehicleDifferences)));
+            }
+        }
+        return new Verdict(flags.isEmpty() ? TickOutcome.UNVERIFIED : TickOutcome.MISMATCHED, flags);
+    }
+
+    // - The outcome of a compared tick and the checks it failed -
+    private record Verdict(TickOutcome outcome, List<Flag> flags) {
     }
 
     // - LocalPlayer.sendChanges while the player rides: a rotation packet every tick with the player's ground and -
@@ -1938,25 +1957,27 @@ final class PlayConnection implements ClientContext {
         boolean predictedOnGround = tickPlayer.onGround();
         boolean predictedHorizontalCollision = tickPlayer.horizontalCollision;
         boolean predictedSprinting = tickPlayer.isSprinting();
-        List<String> differences = new ArrayList<>();
+        // - What the player itself sends while riding, and what it sends for its vehicle -
+        List<String> playerDifferences = new ArrayList<>();
+        List<String> vehicleDifferences = new ArrayList<>();
         ServerboundMovePlayerPacket movePacket = packets.movePacket;
         if (movePacket == null || !movePacket.hasRotation()) {
-            differences.add("expected a rotation, none was sent");
+            playerDifferences.add("expected a rotation, none was sent");
         } else if (movePacket.hasPosition()) {
-            differences.add("a position was sent while riding");
+            playerDifferences.add("a position was sent while riding");
         } else {
             if (movePacket.isOnGround() != predictedOnGround) {
-                differences.add("on ground");
+                playerDifferences.add("on ground");
             }
             if (movePacket.horizontalCollision() != predictedHorizontalCollision) {
-                differences.add("horizontal collision");
+                playerDifferences.add("horizontal collision");
             }
         }
         // - LocalPlayer.sendIsSprintingIfNeeded only runs for a steered vehicle -
         if (steering && predictedSprinting != reportedSprinting) {
-            differences.add("sprinting");
+            playerDifferences.add("sprinting");
         }
-        this.addPlayerCommandDifferences(differences, tickPlayer);
+        this.addPlayerCommandDifferences(playerDifferences, tickPlayer);
 
         ServerboundMoveVehiclePacket vehicleMove = packets.vehicleMove;
         ClientTickReport.VehicleState vehicleState = null;
@@ -1965,7 +1986,7 @@ final class PlayConnection implements ClientContext {
             Vec3 predictedPosition = predicted.position();
             boolean predictedVehicleOnGround = vehicle.onGround();
             if (vehicleMove == null) {
-                differences.add("expected a vehicle position, none was sent");
+                vehicleDifferences.add("expected a vehicle position, none was sent");
                 vehicleState = new ClientTickReport.VehicleState(
                         vehicleType, predictedPosition.x, predictedPosition.y, predictedPosition.z, predicted.yRot(), predicted.xRot(), predictedVehicleOnGround,
                         false, Double.NaN, Double.NaN, Double.NaN, Float.NaN, Float.NaN, false, Double.NaN
@@ -1974,13 +1995,13 @@ final class PlayConnection implements ClientContext {
                 PositionAndRotation reportedVehicle = vehicleMove.movingTo();
                 Vec3 reportedPosition = reportedVehicle.position();
                 if (predictedPosition.x != reportedPosition.x || predictedPosition.y != reportedPosition.y || predictedPosition.z != reportedPosition.z) {
-                    differences.add("vehicle position");
+                    vehicleDifferences.add(String.format(Locale.ROOT, "vehicle position %.4g blocks off", predictedPosition.distanceTo(reportedPosition)));
                 }
                 if (predicted.yRot() != reportedVehicle.yRot() || predicted.xRot() != reportedVehicle.xRot()) {
-                    differences.add("vehicle rotation");
+                    vehicleDifferences.add("vehicle rotation");
                 }
                 if (predictedVehicleOnGround != vehicleMove.onGround()) {
-                    differences.add("vehicle on ground");
+                    vehicleDifferences.add("vehicle on ground");
                 }
                 vehicleState = new ClientTickReport.VehicleState(
                         vehicleType, predictedPosition.x, predictedPosition.y, predictedPosition.z, predicted.yRot(), predicted.xRot(), predictedVehicleOnGround,
@@ -1991,12 +2012,12 @@ final class PlayConnection implements ClientContext {
         } else {
             notes.add("riding " + vehicleType + ", which the server moves");
             if (vehicleMove != null) {
-                differences.add("a vehicle position was sent for a vehicle the client does not steer");
+                vehicleDifferences.add("a vehicle position was sent for a vehicle the client does not steer");
             }
         }
 
-        TickOutcome outcome = this.outcome(differences, uncertainties, notes);
-        if (!differences.isEmpty()) {
+        Verdict verdict = this.verdict(playerDifferences, vehicleDifferences, uncertainties, notes);
+        if (!playerDifferences.isEmpty() || !vehicleDifferences.isEmpty()) {
             // - Continue from the client's state -
             if (steering && vehicleMove != null) {
                 PositionAndRotation reportedVehicle = vehicleMove.movingTo();
@@ -2036,10 +2057,10 @@ final class PlayConnection implements ClientContext {
 
         ReportedState reported = this.reportedState();
         return new ClientTickReport(
-                clientTick, outcome,
+                clientTick, verdict.outcome(),
                 tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), predictedOnGround, predictedHorizontalCollision, predictedSprinting,
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
-                Double.NaN, vehicleState, notes
+                Double.NaN, vehicleState, verdict.flags(), notes
         );
     }
 

@@ -1,7 +1,9 @@
 package io.github.hellotta.clauac.simulation.session;
 
 import com.mojang.authlib.GameProfile;
+import io.github.hellotta.clauac.simulation.api.Check;
 import io.github.hellotta.clauac.simulation.api.ClientTickReport;
+import io.github.hellotta.clauac.simulation.api.Flag;
 import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
@@ -80,7 +82,7 @@ public final class ClientSession implements PlayerSimulation {
     private final ProblemLog problemLog;
     // - Notes and rejections for the next tick report that arrive while no play connection exists -
     private final List<String> pendingNotes = new ArrayList<>();
-    private final List<String> pendingRejections = new ArrayList<>();
+    private final List<Flag> pendingRejections = new ArrayList<>();
     private volatile boolean closed;
     // - Set on the connection's event loop once the simulation fell too far behind (see checkKeepingUp) -
     private volatile boolean fellBehind;
@@ -197,7 +199,7 @@ public final class ClientSession implements PlayerSimulation {
             String packetDescription = packet != null ? packet.type().toString() : phase + " " + direction + " packet id " + packetId(encodedPacket);
             if (direction == PacketDirection.SERVERBOUND && throwable instanceof RuntimeException problem) {
                 this.problemLog.log("rejected " + packetDescription + " after client tick " + this.clientTick, problem);
-                this.reject(packetDescription + " could not be applied (" + problem + ")");
+                this.reject(Check.BAD_PACKETS, packetDescription + " could not be applied (" + problem + ")");
                 return;
             }
             this.fail("Could not process " + packetDescription + " at client tick " + this.clientTick, throwable);
@@ -235,12 +237,13 @@ public final class ClientSession implements PlayerSimulation {
         }
     }
 
-    // - Something the client sent that the sandbox rejected; it makes the next tick report MISMATCHED -
-    private void reject(String rejection) {
+    // - Something the client sent that the sandbox rejected, with the check it fails; it makes the next tick report -
+    // - MISMATCHED -
+    private void reject(Check check, String rejection) {
         if (this.play != null) {
-            this.play.tickPackets().rejections.add(rejection);
+            this.play.tickPackets().reject(check, rejection);
         } else {
-            this.pendingRejections.add(rejection);
+            this.pendingRejections.add(new Flag(check, rejection));
         }
     }
 
@@ -266,7 +269,7 @@ public final class ClientSession implements PlayerSimulation {
         for (PendingClientbound.PendingPacket released : this.pending.takeOldest(maximumBytes / 2, maximumPackets / 2)) {
             this.apply(released);
         }
-        this.reject(String.format(Locale.ROOT, "the client left more than %d MiB or %d of the server's packets unconfirmed; the older half was applied without its answer",
+        this.reject(Check.PINGS, String.format(Locale.ROOT, "the client left more than %d MiB or %d of the server's packets unconfirmed; the older half was applied without its answer",
                 maximumBytes / SimulationLimits.MEBIBYTE, maximumPackets));
     }
 
@@ -284,7 +287,7 @@ public final class ClientSession implements PlayerSimulation {
         List<PendingClientbound.PendingPacket> released = this.pending.takeThrough(answeredPacket);
         if (released.isEmpty()) {
             // - Every packet a client can answer reaches the sandbox, so a vanilla client never does this -
-            this.reject("the client sent " + answer + " for a packet the server never sent");
+            this.reject(Check.BAD_PACKETS, "the client sent " + answer + " for a packet the server never sent");
             return false;
         }
         for (PendingClientbound.PendingPacket packet : released) {
@@ -390,7 +393,7 @@ public final class ClientSession implements PlayerSimulation {
                     // - The client jumps its vehicle itself and tells the server the power -
                     case START_RIDING_JUMP -> this.requirePlay().onRidingJumpReported(command.getData());
                     // - Only the enum and the server's handler know it; no code of the 26.3 client sends it -
-                    case STOP_RIDING_JUMP -> this.reject("the client sent STOP_RIDING_JUMP, which a vanilla client never sends");
+                    case STOP_RIDING_JUMP -> this.reject(Check.BAD_PACKETS, "the client sent STOP_RIDING_JUMP, which a vanilla client never sends");
                     case STOP_SLEEPING, OPEN_INVENTORY -> {
                         // - Requests the server answers: leaving the bed and the mount's inventory screen only change -
                         // - the client once the server's packets for them arrive -
@@ -447,9 +450,9 @@ public final class ClientSession implements PlayerSimulation {
         }
         List<ClientTickReport> reports = inBudget
                 ? connection.tick(this.clientTick)
-                : connection.skipTick(this.clientTick, String.format(Locale.ROOT,
+                : connection.skipTick(this.clientTick, new Flag(Check.TICK_RATE, String.format(Locale.ROOT,
                         "the client ended more ticks than real time allows, one per %.1f ms and at once those of %d ms, so this tick was not simulated",
-                        millisPerTick, TimeUnit.NANOSECONDS.toMillis(this.limits.maximumTickBurstNanos())));
+                        millisPerTick, TimeUnit.NANOSECONDS.toMillis(this.limits.maximumTickBurstNanos()))));
         long tickNanos = this.cost.endTick(System.nanoTime());
         boolean delivered = false;
         for (ClientTickReport report : reports) {
@@ -471,17 +474,17 @@ public final class ClientSession implements PlayerSimulation {
 
     // - A vanilla client only ends its ticks while it is in a level; there is nothing to simulate or compare -
     private ClientTickReport tickOutsidePlay() {
-        List<String> rejections = new ArrayList<>(this.pendingRejections);
-        rejections.add("the client ended a tick outside the play phase, which a vanilla client never does");
+        List<Flag> rejections = new ArrayList<>(this.pendingRejections);
+        rejections.add(new Flag(Check.BAD_PACKETS, "the client ended a tick outside the play phase, which a vanilla client never does"));
         List<String> notes = new ArrayList<>(this.pendingNotes);
-        notes.add("rejected: " + String.join(", ", rejections));
+        notes.add(ClientTickPackets.rejectionNote(rejections));
         this.pendingNotes.clear();
         this.pendingRejections.clear();
         return new ClientTickReport(
                 this.clientTick, TickOutcome.MISMATCHED,
                 Double.NaN, Double.NaN, Double.NaN, false, false, false,
                 false, Double.NaN, Double.NaN, Double.NaN, false, false, false,
-                Double.NaN, null, notes
+                Double.NaN, null, rejections, notes
         );
     }
 

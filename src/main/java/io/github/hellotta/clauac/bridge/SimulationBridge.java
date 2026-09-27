@@ -8,6 +8,7 @@ import com.github.retrooper.packetevents.event.ProtocolPacketEvent;
 import com.github.retrooper.packetevents.event.UserDisconnectEvent;
 import com.github.retrooper.packetevents.protocol.ConnectionState;
 import com.github.retrooper.packetevents.protocol.player.User;
+import io.github.hellotta.clauac.response.Responses;
 import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationRuntime;
@@ -33,15 +34,17 @@ public final class SimulationBridge implements PacketListener {
 
     private final Logger logger;
     private final Path reportDirectory;
+    private final Responses responses;
     private final Map<Object, ConnectionSimulation> connections = new ConcurrentHashMap<>();
     // - What the connections that wait for the runtime to start keep, together -
     private final AtomicLong totalWaitingBytes = new AtomicLong();
     private volatile @Nullable SimulationRuntime runtime;
     private volatile @Nullable String runtimeFailure;
 
-    public SimulationBridge(Logger logger, Path reportDirectory) {
+    public SimulationBridge(Logger logger, Path reportDirectory, Responses responses) {
         this.logger = logger;
         this.reportDirectory = reportDirectory;
+        this.responses = responses;
     }
 
     // - Waiting connections start on their own event loops; one created at the same moment sees the runtime with its -
@@ -117,14 +120,14 @@ public final class SimulationBridge implements PacketListener {
     // - A connection is simulated from its first configuration packet on, or not at all; see ConnectionSimulation -
     private ConnectionSimulation startConnection(User user, ProtocolPhase phase) {
         if (phase != ProtocolPhase.CONFIGURATION) {
-            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.totalWaitingBytes,
+            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.responses, this.totalWaitingBytes,
                     "the connection was already playing when ClauAC started watching it");
         }
         String failure = this.runtimeFailure;
         if (failure != null) {
-            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.totalWaitingBytes, failure);
+            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.responses, this.totalWaitingBytes, failure);
         }
-        return ConnectionSimulation.begin(user, this.reportDirectory, this.logger, this.totalWaitingBytes, this.runtime);
+        return ConnectionSimulation.begin(user, this.reportDirectory, this.logger, this.responses, this.totalWaitingBytes, this.runtime);
     }
 
     @Override
@@ -157,6 +160,7 @@ public final class SimulationBridge implements PacketListener {
             ConnectionSimulation connection = this.connections.get(user.getChannel());
             TickReporter reporter = connection != null ? connection.reporter() : null;
             if (reporter != null) {
+                reporter.setPlayer(player);
                 reporter.setEntityNearby(!player.getNearbyEntities(NEARBY_ENTITY_DISTANCE, NEARBY_ENTITY_DISTANCE, NEARBY_ENTITY_DISTANCE).isEmpty());
                 if (reporter.takeInventoryResyncRequest()) {
                     this.logger.info("Resending the inventory of {}: the simulated items differ from the client's", player.getName());

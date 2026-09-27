@@ -10,6 +10,7 @@ import com.github.retrooper.packetevents.protocol.packettype.PacketTypeCommon;
 import com.github.retrooper.packetevents.protocol.player.User;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerBundle;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPing;
+import io.github.hellotta.clauac.response.Responses;
 import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
@@ -79,6 +80,7 @@ final class ConnectionSimulation {
     private final User user;
     private final Path reportDirectory;
     private final Logger logger;
+    private final Responses responses;
     // - Shared by all connections of the bridge -
     private final AtomicLong totalWaitingBytes;
     private final LocalDateTime startTime;
@@ -99,23 +101,28 @@ final class ConnectionSimulation {
     // - The ids of the connection's own pings that the client has not answered yet, oldest first -
     private final Set<Integer> ownPingIds = new LinkedHashSet<>();
 
-    private ConnectionSimulation(User user, Path reportDirectory, Logger logger, AtomicLong totalWaitingBytes, State state, @Nullable String notSimulatedReason) {
+    private ConnectionSimulation(
+            User user, Path reportDirectory, Logger logger, Responses responses, AtomicLong totalWaitingBytes, State state, @Nullable String notSimulatedReason
+    ) {
         this.user = user;
         this.reportDirectory = reportDirectory;
         this.logger = logger;
+        this.responses = responses;
         this.totalWaitingBytes = totalWaitingBytes;
         this.startTime = LocalDateTime.now();
         this.state = state;
         this.notSimulatedReason = notSimulatedReason;
     }
 
-    static ConnectionSimulation notSimulated(User user, Path reportDirectory, Logger logger, AtomicLong totalWaitingBytes, String reason) {
-        return new ConnectionSimulation(user, reportDirectory, logger, totalWaitingBytes, State.NOT_SIMULATED, reason);
+    static ConnectionSimulation notSimulated(User user, Path reportDirectory, Logger logger, Responses responses, AtomicLong totalWaitingBytes, String reason) {
+        return new ConnectionSimulation(user, reportDirectory, logger, responses, totalWaitingBytes, State.NOT_SIMULATED, reason);
     }
 
     // - A connection that starts its configuration now: simulated right away, or waiting while the runtime starts -
-    static ConnectionSimulation begin(User user, Path reportDirectory, Logger logger, AtomicLong totalWaitingBytes, @Nullable SimulationRuntime runtime) {
-        ConnectionSimulation connection = new ConnectionSimulation(user, reportDirectory, logger, totalWaitingBytes, State.WAITING, null);
+    static ConnectionSimulation begin(
+            User user, Path reportDirectory, Logger logger, Responses responses, AtomicLong totalWaitingBytes, @Nullable SimulationRuntime runtime
+    ) {
+        ConnectionSimulation connection = new ConnectionSimulation(user, reportDirectory, logger, responses, totalWaitingBytes, State.WAITING, null);
         if (runtime != null) {
             connection.start(runtime);
         } else {
@@ -389,7 +396,7 @@ final class ConnectionSimulation {
         Path csvFile = this.reportDirectory.resolve(this.startTime.format(REPORT_TIME) + "-" + name + ".csv");
         TickReporter newReporter;
         try {
-            newReporter = new TickReporter(this.user, name, csvFile, this.logger);
+            newReporter = new TickReporter(this.user, name, csvFile, this.logger, this.responses);
         } catch (IOException exception) {
             this.logger.error("Could not create {}", csvFile, exception);
             this.notSimulatedReason = "its report file could not be created";

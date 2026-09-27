@@ -4,7 +4,9 @@ import com.github.retrooper.packetevents.protocol.ConnectionState;
 import com.github.retrooper.packetevents.protocol.player.User;
 import com.github.retrooper.packetevents.netty.channel.ChannelHelper;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerActionBar;
+import io.github.hellotta.clauac.response.Responses;
 import io.github.hellotta.clauac.simulation.api.ClientTickReport;
+import io.github.hellotta.clauac.simulation.api.Flag;
 import io.github.hellotta.clauac.simulation.api.SimulationListener;
 import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
 import io.github.hellotta.clauac.simulation.api.TickOutcome;
@@ -13,24 +15,28 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.entity.Player;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
 // - Records the simulation results of one connection: every client tick as a CSV line, mismatches in the server log, -
-// - and, while enabled, the latest result in the player's action bar -
+// - and, while enabled, the latest result in the player's action bar. A failed tick also goes to the responses once -
+// - the server has the player -
 final class TickReporter implements SimulationListener {
 
     private static final String CSV_HEADER = "clientTick,outcome,predictedX,predictedY,predictedZ,predictedOnGround,predictedHorizontalCollision,"
             + "predictedSprinting,positionReported,reportedX,reportedY,reportedZ,reportedOnGround,reportedHorizontalCollision,reportedSprinting,"
             + "offset,entityNearby,vehicle,vehiclePredictedX,vehiclePredictedY,vehiclePredictedZ,vehiclePredictedYRot,vehiclePredictedXRot,"
             + "vehiclePredictedOnGround,vehiclePositionReported,vehicleReportedX,vehicleReportedY,vehicleReportedZ,vehicleReportedYRot,"
-            + "vehicleReportedXRot,vehicleReportedOnGround,vehicleOffset,simulationNanos,notes";
+            + "vehicleReportedXRot,vehicleReportedOnGround,vehicleOffset,simulationNanos,checks,notes";
     // - The vehicle columns of a tick without a steered vehicle -
     private static final String NO_VEHICLE_COLUMNS = ",".repeat(14);
     private static final double NANOS_PER_MILLISECOND = 1.0E6;
@@ -41,6 +47,9 @@ final class TickReporter implements SimulationListener {
     private final User user;
     private final String playerName;
     private final Logger logger;
+    private final Responses responses;
+    // - Set by the server thread once the player is in the world -
+    private volatile @Nullable Player player;
     private final Path csvFile;
     private final Map<TickOutcome, Long> outcomeCounts = new EnumMap<>(TickOutcome.class);
     private @Nullable BufferedWriter csv;
@@ -52,15 +61,20 @@ final class TickReporter implements SimulationListener {
     // - Why the simulation stopped, once it has -
     private @Nullable String stopReason;
 
-    TickReporter(User user, String playerName, Path csvFile, Logger logger) throws IOException {
+    TickReporter(User user, String playerName, Path csvFile, Logger logger, Responses responses) throws IOException {
         this.user = user;
         this.playerName = playerName;
         this.logger = logger;
+        this.responses = responses;
         this.csvFile = csvFile;
         Files.createDirectories(csvFile.getParent());
         this.csv = Files.newBufferedWriter(csvFile, StandardCharsets.UTF_8);
         this.csv.write(CSV_HEADER);
         this.csv.newLine();
+    }
+
+    void setPlayer(Player player) {
+        this.player = player;
     }
 
     void setActionBarEnabled(boolean enabled) {
@@ -109,14 +123,18 @@ final class TickReporter implements SimulationListener {
             }
         }
         if (report.outcome() == TickOutcome.MISMATCHED) {
-            this.logger.info("{} tick {} MISMATCHED by {}: predicted {} {} {} ground={} collision={} sprint={}, reported {} {} {} ground={} collision={} sprint={}{}{}; {}",
-                    this.playerName, report.clientTick(), report.offset(),
+            this.logger.info("{} tick {} MISMATCHED ({}) by {}: predicted {} {} {} ground={} collision={} sprint={}, reported {} {} {} ground={} collision={} sprint={}{}{}; {}",
+                    this.playerName, report.clientTick(), failedChecks(report), report.offset(),
                     report.predictedX(), report.predictedY(), report.predictedZ(), report.predictedOnGround(), report.predictedHorizontalCollision(), report.predictedSprinting(),
                     report.reportedX(), report.reportedY(), report.reportedZ(), report.reportedOnGround(), report.reportedHorizontalCollision(), report.reportedSprinting(),
                     nearby ? " (entity nearby)" : "", vehicleDescription(report.vehicle()), String.join("; ", report.notes()));
         }
         if (this.actionBarEnabled) {
             this.showInActionBar(report);
+        }
+        Player known = this.player;
+        if (report.outcome() == TickOutcome.MISMATCHED && known != null) {
+            this.responses.onFailedTick(known, report);
         }
     }
 
@@ -141,8 +159,18 @@ final class TickReporter implements SimulationListener {
                 Boolean.toString(entityNearby),
                 vehicleColumns(report.vehicle()),
                 Long.toString(simulationNanos),
+                quote(String.join("|", report.flags().stream().map(flag -> flag.check().displayName()).distinct().toList())),
                 quote(String.join("; ", report.notes()))
         );
+    }
+
+    // - The checks a tick failed with what failed, as the log shows them -
+    private static String failedChecks(ClientTickReport report) {
+        List<String> failed = new ArrayList<>();
+        for (Flag flag : report.flags()) {
+            failed.add(flag.check().displayName() + ": " + flag.detail());
+        }
+        return String.join("; ", failed);
     }
 
     private static String vehicleColumns(ClientTickReport.@Nullable VehicleState vehicle) {

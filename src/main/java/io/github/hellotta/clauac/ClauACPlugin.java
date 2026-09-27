@@ -5,6 +5,8 @@ import com.github.retrooper.packetevents.PacketEvents;
 import com.github.retrooper.packetevents.event.PacketListenerPriority;
 import io.github.hellotta.clauac.bridge.OwnPongConsumer;
 import io.github.hellotta.clauac.bridge.SimulationBridge;
+import io.github.hellotta.clauac.response.ClauACSettings;
+import io.github.hellotta.clauac.response.Responses;
 import io.github.hellotta.clauac.runtime.SimulationRuntimeLoader;
 import io.github.retrooper.packetevents.factory.spigot.SpigotPacketEventsBuilder;
 import java.io.IOException;
@@ -14,6 +16,8 @@ import org.bukkit.command.PluginCommand;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jspecify.annotations.Nullable;
 
@@ -21,6 +25,7 @@ public final class ClauACPlugin extends JavaPlugin implements Listener {
 
     private @Nullable CompletableFuture<SimulationRuntimeLoader.LoadedRuntime> runtimeLoading;
     private @Nullable SimulationBridge bridge;
+    private @Nullable Responses responses;
 
     @Override
     public void onLoad() {
@@ -38,14 +43,17 @@ public final class ClauACPlugin extends JavaPlugin implements Listener {
     @Override
     public void onEnable() {
         PacketEvents.getAPI().init();
-        SimulationBridge simulationBridge = new SimulationBridge(this.getSLF4JLogger(), this.getDataPath().resolve("reports"));
+        this.saveDefaultConfig();
+        Responses newResponses = new Responses(this, this.getSLF4JLogger(), ClauACSettings.load(this.getConfig(), this.getSLF4JLogger()));
+        this.responses = newResponses;
+        SimulationBridge simulationBridge = new SimulationBridge(this.getSLF4JLogger(), this.getDataPath().resolve("reports"), newResponses);
         this.bridge = simulationBridge;
         // - Runs after every other listener, so that the simulation sees packets exactly as they are sent -
         PacketEvents.getAPI().getEventManager().registerListener(simulationBridge, PacketListenerPriority.MONITOR);
         // - Decides the final state of the pongs that answer ClauAC's own pings: they go no further than the simulation -
         PacketEvents.getAPI().getEventManager().registerListener(new OwnPongConsumer(simulationBridge), PacketListenerPriority.HIGHEST);
         this.getServer().getPluginManager().registerEvents(this, this);
-        ClauACCommand command = new ClauACCommand(simulationBridge);
+        ClauACCommand command = new ClauACCommand(simulationBridge, newResponses, this::reloadSettings);
         PluginCommand pluginCommand = Objects.requireNonNull(this.getCommand("clauac"), "plugin.yml declares the clauac command");
         pluginCommand.setExecutor(command);
         pluginCommand.setTabCompleter(command);
@@ -59,6 +67,29 @@ public final class ClauACPlugin extends JavaPlugin implements Listener {
         });
     }
 
+    // - Reads config.yml again for /clauac reload; returns the file's path for the confirmation -
+    private String reloadSettings() {
+        this.reloadConfig();
+        Objects.requireNonNull(this.responses, "the plugin is enabled").reload(ClauACSettings.load(this.getConfig(), this.getSLF4JLogger()));
+        return this.getDataPath().resolve("config.yml").toString();
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onJoin(PlayerJoinEvent event) {
+        Responses current = this.responses;
+        if (current != null) {
+            current.onJoin(event.getPlayer());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onQuit(PlayerQuitEvent event) {
+        Responses current = this.responses;
+        if (current != null) {
+            current.onQuit(event.getPlayer().getUniqueId());
+        }
+    }
+
     @EventHandler(priority = EventPriority.MONITOR)
     public void onServerTickEnd(ServerTickEndEvent event) {
         SimulationBridge simulationBridge = this.bridge;
@@ -69,6 +100,9 @@ public final class ClauACPlugin extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
+        if (this.responses != null) {
+            this.responses.close();
+        }
         PacketEvents.getAPI().terminate();
         if (this.bridge != null) {
             this.bridge.closeAll();

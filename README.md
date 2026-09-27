@@ -4,8 +4,8 @@ A predictive (simulation-based) anticheat plugin for [Paper](https://papermc.io/
 [PacketEvents](https://github.com/retrooper/packetevents).
 
 > **Status:** prototype. ClauAC simulates every client tick of a player's movement with Minecraft's own code and
-> compares the result with what the client sent, but it only reports the results (CSV files, server log, action bar);
-> it does not flag, set back or punish anyone yet.
+> compares the result with what the client sent. It names the checks a tick failed, alerts the players who watch for
+> them and calls an event other plugins can act on (see "Responses"), but it does not set back or punish anyone yet.
 
 ## Target platform
 
@@ -64,7 +64,8 @@ situation, the sandbox does too, including situations nobody wrote a rule for.
 |------------------|---------------------------------------|-----------------------------------------------------------------------|
 | `simulation-api` | the plugin's class loader             | The small interface between the plugin and the simulation             |
 | `simulation`     | an isolated class loader (see below)  | The sandbox, compiled against the vanilla server                      |
-| root project     | Paper                                 | The plugin: runtime loader, PacketEvents bridge, reports, `/clauac`   |
+| root project     | Paper                                 | The plugin: runtime loader, PacketEvents bridge, reports, responses,  |
+|                  |                                       | `/clauac`                                                             |
 
 ### The isolated vanilla runtime
 
@@ -153,11 +154,12 @@ Each client tick gets one outcome:
 
 - Every connection is recorded to `plugins/ClauAC/reports/<time>-<player>.csv`, one line per client tick, with the
   predicted and reported values, the offset, whether another entity was within one block, the predicted and reported
-  state of a vehicle the player steers, the time the simulation spent on the tick (see below), and notes.
-- `MISMATCHED` ticks are logged to the server console, and a summary is logged when the player leaves; so is every
-  inventory resend.
+  state of a vehicle the player steers, the time the simulation spent on the tick (see below), the checks the tick
+  failed (see "Responses") and notes.
+- `MISMATCHED` ticks are logged to the server console with the checks they failed, and a summary is logged when the
+  player leaves; so is every inventory resend.
 - `/clauac debug` shows the outcome of every tick in your action bar, `/clauac status` summarises all connections
-  (permission `clauac.admin`, operators by default).
+  (see "Responses" for all commands).
 
 A packet from the client that the sandbox cannot decode or apply, or that no vanilla client sends in the situation
 the sandbox is in (a pong or a teleport acceptance for something the server never sent, a tick outside the play phase,
@@ -335,6 +337,95 @@ reported it, which the next tick confirmed; a sprint attack right after a hotbar
 strength that switch left, and an attack on an entity id the sandbox did not know, injected into the connection,
 matched without slowing the player down. While the player was dead the sandbox, like the client, did not move it
 (`NOT_SIMULATED`), and matching resumed after the respawn.
+
+## Responses
+
+Every `MISMATCHED` tick names the checks it failed, each with what exactly failed; a tick can fail several at once.
+
+| Check               | Failed when                                                                                  |
+|---------------------|----------------------------------------------------------------------------------------------|
+| `Simulation`        | The player did not move the way the vanilla client moves it with the same keys and rotation: |
+|                     | its position, ground or collision state, sprinting, flying or the start of gliding differs,  |
+|                     | or a position was sent where the vanilla client sends none, or the other way round           |
+| `Vehicle`           | The vehicle the player steers did not move the way the vanilla client moves it               |
+| `BadPackets`        | The client sent a packet no vanilla client sends in its situation, or one the sandbox could  |
+|                     | not decode or apply (see "Results")                                                          |
+| `TickRate`          | The client ended more ticks than the tick budget holds (see "Cost and limits")               |
+| `Pings`             | The client left so many of the server's packets unconfirmed that the older half was applied  |
+|                     | without its answers (see "Cost and limits")                                                  |
+| `SimulationFailure` | The simulation itself failed during the tick, so nothing the client sent in it was checked   |
+
+Something the simulation cannot know (see "What the simulation cannot know") only ever explains a difference in the
+movement: the tick is `UNVERIFIED` instead of failing `Simulation` or `Vehicle`. The other checks fail regardless.
+
+### Alerts
+
+Players with the permission `clauac.alerts` see in their chat when a player fails a check: from the moment they join
+while `alerts.on-join` is `true` (the default), and otherwise once they turn alerts on with `/clauac alerts`, which
+turns them off again as well. There is at most one alert per player and check within `alerts.interval-millis` (a second
+by default); the flags in between are counted into the next alert. With the default format an alert reads:
+
+    [ClauAC] Tester failed Simulation x677 differs in: expected a position, none was sent
+
+where `x677` counts the flags of that player and check since its previous alert, this one included. The console logs
+every `MISMATCHED` tick with the checks it failed either way.
+
+### Commands and permissions
+
+| Command          | Permission      | Does                                                                      |
+|------------------|-----------------|---------------------------------------------------------------------------|
+| `/clauac alerts` | `clauac.alerts` | Turns your alerts on or off                                               |
+| `/clauac debug`  | `clauac.admin`  | Shows the outcome of every tick of your own connection in your action bar |
+| `/clauac status` | `clauac.admin`  | Summarises the simulation of every connection (see "Cost and limits")     |
+| `/clauac reload` | `clauac.admin`  | Reads `config.yml` again                                                  |
+
+Both permissions default to operators, and `clauac.admin` includes `clauac.alerts`.
+
+### Configuration
+
+The first start writes `plugins/ClauAC/config.yml` with the defaults and a comment on every setting; `/clauac reload`
+reads it again while the server runs.
+
+| Setting                  | Default     | Meaning                                                                     |
+|--------------------------|-------------|-----------------------------------------------------------------------------|
+| `alerts.on-join`         | `true`      | Players with `clauac.alerts` get alerts as soon as they join                |
+| `alerts.interval-millis` | `1000`      | At most one alert per player and check within this many milliseconds        |
+| `alerts.format`          | (see above) | The alert in MiniMessage, with `%player%`, `%check%`, `%detail%`, `%tick%`  |
+|                          |             | (the client tick) and `%count%` filled in                                   |
+| `checks.<name>.alert`    | `true`      | Whether failing the check of that name (see the table above) alerts         |
+
+The format is [MiniMessage](https://docs.papermc.io/adventure/minimessage/format/) text. The filled-in values are
+escaped, so that a detail with a `<` in it shows as it is instead of becoming a MiniMessage tag. A value ClauAC cannot
+use, such as text where a number belongs or a negative interval, is replaced by its default, and a check name ClauAC
+does not know is ignored, each with a warning in the log. The alerts go out through Paper's `String` API
+(`Player#sendRichMessage`), so no adventure object crosses into Paper (see "Rule for ClauAC's own code").
+
+### For other plugins: `ClauACFlagEvent`
+
+ClauAC calls `io.github.hellotta.clauac.api.ClauACFlagEvent` once for every check a tick failed, before it responds to
+it. The event holds the player, the check (`io.github.hellotta.clauac.simulation.api.Check`), the detail and the
+client tick; cancelling it keeps ClauAC from responding to that flag, so it does not alert. The event is asynchronous:
+the simulation thread that finished the tick calls it as soon as the result is known, with ClauAC's plugin class
+loader as the thread's context class loader. A listener therefore has to be quick and must hand anything that touches
+the world or the player's state to the server thread. A plugin that listens for it depends on ClauAC in its
+`plugin.yml` (`depend: [ClauAC]`), so that it loads after ClauAC and sees its classes:
+
+```java
+@EventHandler
+public void onFlag(ClauACFlagEvent event) {
+    // - Leave the tick rate of this server's own test bots to them -
+    if (event.getCheck() == Check.TICK_RATE && event.getPlayer().getName().startsWith("Bot")) {
+        event.setCancelled(true);
+    }
+}
+```
+
+A test plugin that logged every event and cancelled those of `BadPackets` showed this in game: three pongs injected for
+pings the server never sent failed `BadPackets` and brought no alert. 1500 tick ends injected at once brought a
+`Simulation` alert, a second one a second later that counted the 677 flags since, and a `TickRate` alert. After
+`checks.Simulation.alert` was set to `false` and `/clauac reload`, 300 more brought a single `TickRate` alert, which
+counted 310 flags. All 1808 events came asynchronously on the simulation threads with ClauAC's class loader as their
+context class loader.
 
 ## How PacketEvents is bundled
 

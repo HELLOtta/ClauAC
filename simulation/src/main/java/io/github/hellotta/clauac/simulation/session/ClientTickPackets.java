@@ -1,5 +1,7 @@
 package io.github.hellotta.clauac.simulation.session;
 
+import io.github.hellotta.clauac.simulation.api.Check;
+import io.github.hellotta.clauac.simulation.api.Flag;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -40,9 +42,23 @@ final class ClientTickPackets {
     // - tick as simulated differs from what the client reported (see PlayConnection.tickLocalPlayer) -
     final List<TickAlternative> alternatives = new ArrayList<>();
     // - What the sandbox rejected during this tick: packets no vanilla client sends in the sandbox's situation, and -
-    // - steps of the simulation that failed. Any of them makes the tick MISMATCHED, whatever the comparison finds -
-    final Set<String> rejections = new LinkedHashSet<>();
+    // - steps of the simulation that failed, each with the check it fails. Any of them makes the tick MISMATCHED, -
+    // - whatever the comparison finds -
+    final Set<Flag> rejections = new LinkedHashSet<>();
     final List<String> notes = new ArrayList<>();
+
+    void reject(Check check, String detail) {
+        this.rejections.add(new Flag(check, detail));
+    }
+
+    // - The note that lists what was rejected -
+    static String rejectionNote(Iterable<Flag> rejections) {
+        List<String> details = new ArrayList<>();
+        for (Flag rejection : rejections) {
+            details.add(rejection.detail());
+        }
+        return "rejected: " + String.join(", ", details);
+    }
 
     void reset() {
         this.movePacket = null;

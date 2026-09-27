@@ -1,9 +1,12 @@
 package io.github.hellotta.clauac.simulation.api;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 
-// - Result of simulating one client tick. Positions are the player's feet position in world coordinates -
+// - Result of simulating one client tick. Positions are the player's feet position in world coordinates. A tick is -
+// - MISMATCHED exactly when it failed a check, and its flags say which and why -
 public record ClientTickReport(
         long clientTick,
         TickOutcome outcome,
@@ -28,8 +31,14 @@ public record ClientTickReport(
         double offset,
         // - The vehicle the player steered this tick; null when it steered none -
         VehicleState vehicle,
+        // - The checks the tick failed; empty unless the outcome is MISMATCHED -
+        List<Flag> flags,
         List<String> notes
 ) {
+
+    // - The checks an uncertainty can explain: it leaves what the player and its vehicle did unknown, but never a -
+    // - packet no vanilla client sends or anything else the tick failed -
+    private static final Set<Check> MOVEMENT_CHECKS = EnumSet.of(Check.SIMULATION, Check.VEHICLE);
 
     // - A vehicle the player steers, as the simulation moved it and as the client reported it -
     // - (ServerboundMoveVehiclePacket). Positions are the vehicle's own position in world coordinates -
@@ -56,18 +65,40 @@ public record ClientTickReport(
     }
 
     public ClientTickReport {
+        flags = List.copyOf(flags);
         notes = List.copyOf(notes);
+        if (flags.isEmpty() == (outcome == TickOutcome.MISMATCHED)) {
+            throw new IllegalArgumentException("a " + outcome + " tick with the flags " + flags);
+        }
     }
 
-    // - The same tick with another outcome, and a note on why -
-    public ClientTickReport withOutcome(TickOutcome newOutcome, String note) {
+    // - The same tick with a further note -
+    public ClientTickReport withNote(String note) {
+        return this.with(this.outcome, this.flags, note);
+    }
+
+    // - The same tick having failed one more check -
+    public ClientTickReport withFlag(Flag flag, String note) {
+        List<Flag> newFlags = new ArrayList<>(this.flags);
+        newFlags.add(flag);
+        return this.with(TickOutcome.MISMATCHED, newFlags, note);
+    }
+
+    // - The same tick with its movement left to an uncertainty found afterwards: the flags of the movement checks are -
+    // - gone, and it is UNVERIFIED unless it failed another check -
+    public ClientTickReport explainedBy(String note) {
+        List<Flag> remaining = this.flags.stream().filter(flag -> !MOVEMENT_CHECKS.contains(flag.check())).toList();
+        return this.with(remaining.isEmpty() ? TickOutcome.UNVERIFIED : TickOutcome.MISMATCHED, remaining, note);
+    }
+
+    private ClientTickReport with(TickOutcome newOutcome, List<Flag> newFlags, String note) {
         List<String> newNotes = new ArrayList<>(this.notes);
         newNotes.add(note);
         return new ClientTickReport(
                 this.clientTick, newOutcome,
                 this.predictedX, this.predictedY, this.predictedZ, this.predictedOnGround, this.predictedHorizontalCollision, this.predictedSprinting,
                 this.positionReported, this.reportedX, this.reportedY, this.reportedZ, this.reportedOnGround, this.reportedHorizontalCollision, this.reportedSprinting,
-                this.offset, this.vehicle, newNotes
+                this.offset, this.vehicle, newFlags, newNotes
         );
     }
 }

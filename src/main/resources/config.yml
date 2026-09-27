@@ -1,0 +1,34 @@
+# - ClauAC's configuration. /clauac reload reads it again; see the README's "Responses" section -
+
+alerts:
+  # - Players with the permission clauac.alerts get alerts once they turn them on with /clauac alerts, or as soon -
+  # - as they join when this is true -
+  on-join: true
+  # - At most one alert per player and check within this many milliseconds; the flags in between are counted into -
+  # - the next alert -
+  interval-millis: 1000
+  # - The alert, in MiniMessage (https://docs.papermc.io/adventure/minimessage/format/). ClauAC replaces %player% -
+  # - (the player's name), %check% (the check's name), %detail% (what exactly failed), %tick% (the client tick) and -
+  # - %count% (the flags of that player and check since its last alert, this one included) -
+  format: "<dark_gray>[<aqua>ClauAC</aqua>]</dark_gray> <white>%player%</white> <gray>failed</gray> <red>%check%</red> <dark_gray>x%count%</dark_gray> <gray>%detail%</gray>"
+
+# - What ClauAC does when a client tick fails a check, per check. alert: whether players with alerts on hear of it -
+checks:
+  # - The player did not move the way the vanilla client moves it -
+  Simulation:
+    alert: true
+  # - The vehicle the player steers did not move the way the vanilla client moves it -
+  Vehicle:
+    alert: true
+  # - The client sent a packet no vanilla client sends in its situation -
+  BadPackets:
+    alert: true
+  # - The client ended more ticks than the simulation takes on -
+  TickRate:
+    alert: true
+  # - The client held back its answers to the server's packets -
+  Pings:
+    alert: true
+  # - The simulation itself failed during a tick -
+  SimulationFailure:
+    alert: true
