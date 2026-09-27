@@ -73,6 +73,7 @@ public final class ClientSession implements PlayerSimulation {
     private final ServerRegistryCache registryCache;
     private final SimulationLimits limits;
     private final SimulationCost cost = new SimulationCost();
+    private final TickBudget tickBudget;
     private final SerialExecutor executor;
     private final ProtocolDecoders decoders = new ProtocolDecoders();
     private final PendingClientbound pending = new PendingClientbound();
@@ -101,18 +102,21 @@ public final class ClientSession implements PlayerSimulation {
         this.problemLog = new ProblemLog(profileName);
         this.registryCache = registryCache;
         this.limits = limits;
+        this.tickBudget = new TickBudget(limits.maximumTickBurstNanos());
         this.executor = new SerialExecutor(simulationThreads, this.cost);
         this.registries = ConfigurationSession.initialRegistries();
         this.enabledFeatures = ConfigurationSession.initialFeatures();
         this.configuration = new ConfigurationSession(registryCache, this.registries.access(), this.enabledFeatures);
     }
 
+    // - The time a packet was handed in is the time it arrived, which the tick budget measures the client's ticks by -
     @Override
     public void handlePacket(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket) {
         if (this.closed || this.fellBehind) {
             return;
         }
-        this.executor.execute(() -> this.process(phase, direction, encodedPacket), encodedPacket.length);
+        long arrivedAt = System.nanoTime();
+        this.executor.execute(() -> this.process(phase, direction, encodedPacket, arrivedAt), encodedPacket.length);
         this.checkKeepingUp();
     }
 
@@ -177,7 +181,7 @@ public final class ClientSession implements PlayerSimulation {
     // - sandbox's situation: it is rejected, which makes its tick MISMATCHED, and the simulation goes on, so that such -
     // - packets cannot switch it off. A server packet the sandbox cannot apply would make the real client fail as -
     // - well, since the sandbox runs the client's own handlers; it stops the simulation -
-    private void process(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket) {
+    private void process(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket, long arrivedAt) {
         if (this.closed || this.failed) {
             return;
         }
@@ -187,7 +191,7 @@ public final class ClientSession implements PlayerSimulation {
             if (direction == PacketDirection.CLIENTBOUND) {
                 this.onClientbound(phase, packet, encodedPacket);
             } else {
-                this.onServerbound(phase, packet);
+                this.onServerbound(phase, packet, arrivedAt);
             }
         } catch (Throwable throwable) {
             String packetDescription = packet != null ? packet.type().toString() : phase + " " + direction + " packet id " + packetId(encodedPacket);
@@ -347,7 +351,7 @@ public final class ClientSession implements PlayerSimulation {
         this.play = newPlay;
     }
 
-    private void onServerbound(ProtocolPhase phase, Packet<?> packet) {
+    private void onServerbound(ProtocolPhase phase, Packet<?> packet, long arrivedAt) {
         if (phase == ProtocolPhase.CONFIGURATION) {
             if (packet instanceof ServerboundSelectKnownPacks knownPacks) {
                 if (!this.requireConfiguration().handleClientKnownPacks(knownPacks)) {
@@ -395,7 +399,7 @@ public final class ClientSession implements PlayerSimulation {
             }
             case ServerboundPlayerAbilitiesPacket abilities -> this.requirePlay().onAbilitiesReported(abilities.isFlying());
             case ServerboundPlayerLoadedPacket ignored -> this.requirePlay().onPlayerLoaded();
-            case ServerboundClientTickEndPacket ignored -> this.endClientTick();
+            case ServerboundClientTickEndPacket ignored -> this.endClientTick(arrivedAt);
             // - What the client did during a tick with its keys and mouse; replayed at the tick's end -
             case ServerboundSetCarriedItemPacket _, ServerboundPlayerActionPacket _, ServerboundUseItemOnPacket _, ServerboundUseItemPacket _,
                  ServerboundAttackPacket _, ServerboundInteractPacket _, ServerboundPunchPacket _ ->
@@ -430,15 +434,22 @@ public final class ClientSession implements PlayerSimulation {
         return this.play.isRotationAnswer(rotation, (ClientboundPlayerRotationPacket) rotationPacket.packet());
     }
 
-    private void endClientTick() {
+    // - Every tick end counts against the tick budget; the ones outside the play phase are rejected anyway -
+    private void endClientTick(long arrivedAt) {
         this.clientTick++;
         PlayConnection connection = this.play;
+        float millisPerTick = connection != null ? connection.clientTickMillis() : PlayConnection.DEFAULT_TICK_MILLIS;
+        boolean inBudget = this.tickBudget.take(arrivedAt, millisPerTick);
         if (connection == null) {
             ClientTickReport report = this.tickOutsidePlay();
             this.listener.onClientTick(report, this.cost.endTick(System.nanoTime()));
             return;
         }
-        List<ClientTickReport> reports = connection.tick(this.clientTick);
+        List<ClientTickReport> reports = inBudget
+                ? connection.tick(this.clientTick)
+                : connection.skipTick(this.clientTick, String.format(Locale.ROOT,
+                        "the client ended more ticks than real time allows, one per %.1f ms and at once those of %d ms, so this tick was not simulated",
+                        millisPerTick, TimeUnit.NANOSECONDS.toMillis(this.limits.maximumTickBurstNanos())));
         long tickNanos = this.cost.endTick(System.nanoTime());
         boolean delivered = false;
         for (ClientTickReport report : reports) {

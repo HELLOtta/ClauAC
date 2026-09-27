@@ -166,6 +166,8 @@ final class PlayConnection implements ClientContext {
     private static final double MINIMUM_REPORTED_MOVEMENT = 2.0E-4;
     // - Minecraft.tick picks what the crosshair points at with a partial tick of 1 -
     private static final float TICK_PARTIAL_TICK = 1.0F;
+    // - The client's timer runs at 20 ticks per second (Minecraft.deltaTracker, a DeltaTracker.Timer of 20 ticks) -
+    static final float DEFAULT_TICK_MILLIS = 1000.0F / 20.0F;
     // - Every tick of the player on foot runs a second time from a snapshot, which has to give the same result: a -
     // - development check that the snapshot holds everything a tick changes, on with -Dclauac.verifyRepeatedTicks=true -
     private static final boolean VERIFY_REPEATED_TICKS = Boolean.getBoolean("clauac.verifyRepeatedTicks");
@@ -884,7 +886,7 @@ final class PlayConnection implements ClientContext {
             if (held != null) {
                 reports.add(held);
             }
-            reports.add(this.failedTick(clientTick, problem));
+            reports.add(this.unsimulatedTick(clientTick, "the simulation of this tick failed (" + problem + ")"));
         }
         // - ClientLevel.tick, after the player sent its movement; a failure here shows in the next tick -
         String levelTickFailure = null;
@@ -902,6 +904,33 @@ final class PlayConnection implements ClientContext {
             this.tickPackets.rejections.add(levelTickFailure);
         }
         return reports;
+    }
+
+    // - A tick the client ended sooner than real time allows (see TickBudget) is not simulated, so that ending ticks -
+    // - faster cannot make the simulation fall behind: the client's reported state is taken over, and neither the -
+    // - player nor the level with its entities ticks. A report held back from the previous tick goes first -
+    List<ClientTickReport> skipTick(long clientTick, String rejection) {
+        List<ClientTickReport> reports = new ArrayList<>(2);
+        ClientTickReport held = this.takeHeldReport("the next tick, which had to report the hotbar switch this tick assumed, came too soon to be simulated");
+        if (held != null) {
+            reports.add(held);
+        }
+        reports.add(this.unsimulatedTick(clientTick, rejection));
+        this.tickPackets.reset();
+        return reports;
+    }
+
+    // - Minecraft.getTickTargetMillis: the client ticks no faster than its timer, and slower while the level runs -
+    // - normally at a lower tick rate -
+    float clientTickMillis() {
+        SandboxLevel tickLevel = this.level;
+        if (tickLevel != null) {
+            TickRateManager manager = tickLevel.tickRateManager();
+            if (manager.runsNormally()) {
+                return Math.max(DEFAULT_TICK_MILLIS, manager.millisecondsPerTick());
+            }
+        }
+        return DEFAULT_TICK_MILLIS;
     }
 
     // - Everything of a client tick up to the comparison. Returns the tick's report, or null when it is held back; a -
@@ -1263,15 +1292,15 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - A tick whose simulation failed partway. Nothing the client sent can be checked any more, so the tick is -
-    // - MISMATCHED, and the sandbox takes over what the client reported, as after a mismatch, so that the next tick -
-    // - starts from where the client is -
-    private ClientTickReport failedTick(long clientTick, RuntimeException problem) {
+    // - A tick that is not simulated, since its simulation failed partway or it came too soon (see skipTick). Nothing -
+    // - the client sent is checked, so the tick is MISMATCHED with the reason, and the sandbox takes over what the -
+    // - client reported, as after a mismatch, so that the next tick starts from where the client is -
+    private ClientTickReport unsimulatedTick(long clientTick, String rejection) {
         ClientTickPackets packets = this.tickPackets;
         ReportedState reported = this.reportedState();
         boolean reportedSprinting = this.lastSent.sprinting;
         List<String> rejections = new ArrayList<>(packets.rejections);
-        rejections.add("the simulation of this tick failed (" + problem + ")");
+        rejections.add(rejection);
         List<String> notes = new ArrayList<>(packets.notes);
         notes.add("rejected: " + String.join(", ", rejections));
         double predictedX = Double.NaN;

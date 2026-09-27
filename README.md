@@ -183,8 +183,26 @@ Two limits keep one connection from taking the server's memory:
   everything it received before its next tick anyway. That tick is `MISMATCHED`, and the simulation goes on, so that
   holding back the answers cannot switch it off.
 
-The system properties `clauac.maximumQueuedMebibytes`, `clauac.maximumLagMillis`, `clauac.maximumUnconfirmedMebibytes`
-and `clauac.maximumUnconfirmedPackets` change these limits; the runtime logs the ones in effect when it starts.
+Two more keep one connection from taking the simulation threads:
+
+- A client's ticks are simulated only as fast as a vanilla client can end them. The client's timer ends one tick per
+  50 ms, or per tick of the server's lower tick rate while its level runs normally
+  (`Minecraft.getTickTargetMillis`), and after a pause it catches up at most 10 ticks at a time and drops the rest, so
+  it never gets ahead of real time. The ticks still arrive at the server unevenly, all at once after the connection
+  stalled, so the budget refills with the time between their arrivals, up to the ticks of 60 seconds. Paper sends a
+  keep-alive every second and disconnects a client whose answer to one is more than 30 seconds late, so the client's
+  packets are never much later than that, and the rest of the budget covers the uneven arrivals of the ticks after
+  such a stall. It refills 1% faster than the tick rate, far more than the client's clock can drift from the
+  server's, so that a client whose clock runs fast never uses it up. A
+  tick beyond the budget is not simulated: it is `MISMATCHED` with the reason, the sandbox takes over what the client
+  reported, and the next tick within the budget is simulated from there. Ending ticks faster therefore cannot make
+  the simulation fall behind and stop.
+- The simulation threads work off a connection's packets for at most 10 ms at a time before the other connections
+  waiting for a thread go first.
+
+The system properties `clauac.maximumQueuedMebibytes`, `clauac.maximumLagMillis`, `clauac.maximumUnconfirmedMebibytes`,
+`clauac.maximumUnconfirmedPackets` and `clauac.maximumTickBurstMillis` change these limits; the runtime logs the ones
+in effect when it starts.
 
 Measured on the development server in a container with 4 processors (2 simulation threads) with a real 26.3 client,
 over the seven test courses (walking, swimming, effects, flight, entities, menus, gliding, riding, pistons):
@@ -200,11 +218,17 @@ over the seven test courses (walking, swimming, effects, flight, entities, menus
   used in the main hand, which then took 0.5 to 2 ms more. With `clauac.verifyRepeatedTicks=true`, which repeats
   every tick from a snapshot, a tick took 4 to 6 ms on average.
 
-Both limits were tried with lowered values. With `clauac.maximumLagMillis=100` the configuration phase of a joining
-client left a packet waiting longer than that, and the simulation stopped with the reason in the log and in
+The memory limits were tried with lowered values. With `clauac.maximumLagMillis=100` the configuration phase of a
+joining client left a packet waiting longer than that, and the simulation stopped with the reason in the log and in
 `/clauac status`. With `clauac.maximumUnconfirmedPackets=2000` and a proxy dropping the client's pongs next to 30
 chickens, the older half was applied about every 25 ticks, each time with a `MISMATCHED` tick, the ticks in between
 matched unless the chickens pushed the player, and every tick matched again once the pongs got through.
+
+The tick budget was tried with a proxy between the client and the server. Holding the client's packets for 15 or 25
+seconds and then sending them at once, as a stalled connection does, left every tick of that time `MATCHED`. 1500
+tick ends injected at once 12 seconds after a hold of 15 seconds were simulated until the budget ran out, 902 of
+them, and the other 598 were not; all 1500 were `MISMATCHED`, the simulation stayed within 0.53 s of the
+connection, and the client's own ticks matched again right after them.
 
 ### What the simulation cannot know
 
@@ -254,8 +278,15 @@ Known limits:
   at the next pong instead.
 - A connection that was already playing when ClauAC started watching it (after a plugin reload) is not simulated:
   the simulation has to see a connection from its first configuration packet on.
-- A client that sends its ticks much faster than a vanilla client makes its simulation do that much more work; one
-  that makes it fall behind the limit above stops it, with the reason in the log and in `/clauac status`.
+- The tick budget (see "Cost and limits") bounds what the simulation costs; it is not a timer check. A client that
+  ends fewer ticks than real time allows for a while may end that many more later, up to the ticks of 60 seconds at
+  once, and 1% more than real time allows all along. Those ticks are simulated and checked like any other, so each of
+  them still has to move the player as vanilla would.
+- Every bundle ClauAC sends ends with a ping that the client answers, so the client sends more packets than without
+  ClauAC: in the test world, a player standing still answered about 90 pings per second next to its 20 tick ends.
+  Paper disconnects a client that sends more than 500 packets per second over 7 seconds (`packet-limiter` in
+  `paper-global.yml`); the packets a connection stall of 25 seconds held back went over that once they arrived,
+  where without the pongs they would have stayed far below it.
 - Not verified yet: equipment effects such as leather boots on powder snow.
 
 ### Verified so far
