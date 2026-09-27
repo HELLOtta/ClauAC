@@ -11,12 +11,11 @@ import java.util.HashSet;
 import java.util.Set;
 import org.jspecify.annotations.Nullable;
 
-// - Keeps the client's play packets from the server from a tick's first movement packet, attack or interaction with -
-// - an entity until the simulation has judged that tick, so that the server only applies movement and actions ClauAC -
-// - has checked. It throws the movement of a tick away when the tick is to be set back, and its attacks and -
-// - interactions when those failed a check. The packets go on to the server in the order the client sent them: a -
-// - packet a verdict cannot throw away goes on right away while nothing is held, and otherwise waits behind what is -
-// - held. -
+// - Keeps the client's play packets from the server from a tick's first movement packet or action until the -
+// - simulation has judged that tick, so that the server only applies movement and actions ClauAC has checked. It -
+// - throws the movement of a tick away when the tick is to be set back, and each action that failed a check. The -
+// - packets go on to the server in the order the client sent them: a packet a verdict cannot throw away goes on -
+// - right away while nothing is held, and otherwise waits behind what is held. -
 // - A held packet is copied and its buffer emptied, which the vanilla decoder after PacketEvents' passes over, and -
 // - it goes on later from PacketEvents' decoder, past every packet listener, as if it came just then. -
 // -
@@ -26,8 +25,9 @@ import org.jspecify.annotations.Nullable;
 // - that everything behind it has to reach the server after it. Everything runs on the connection's event loop -
 final class TickHold {
 
-    // - The packets a tick's verdict can throw away: its movement, and its attacks and interactions with entities -
-    // - (Minecraft.startAttack and startUseItem, through MultiPlayerGameMode.attack and interact) -
+    // - The packets a tick's verdict can throw away: its movement, and the actions of its key handling -
+    // - (Minecraft.handleKeybinds): attacks and interactions with entities, block actions, item uses on blocks and -
+    // - in the air, and the hotbar slots it reports -
     private static final Set<PacketTypeCommon> MOVEMENT = Set.of(
             PacketType.Play.Client.PLAYER_POSITION,
             PacketType.Play.Client.PLAYER_POSITION_AND_ROTATION,
@@ -37,7 +37,18 @@ final class TickHold {
     );
     private static final Set<PacketTypeCommon> ACTIONS = Set.of(
             PacketType.Play.Client.ATTACK,
-            PacketType.Play.Client.INTERACT_ENTITY
+            PacketType.Play.Client.INTERACT_ENTITY,
+            PacketType.Play.Client.PLAYER_DIGGING,
+            PacketType.Play.Client.PLAYER_BLOCK_PLACEMENT,
+            PacketType.Play.Client.USE_ITEM,
+            PacketType.Play.Client.HELD_ITEM_CHANGE
+    );
+    // - The actions whose item the client uses up or changes on its own before the server answers -
+    // - (MultiPlayerGameMode.interact, useItemOn and useItem): the server never learns of a thrown away one -
+    private static final Set<PacketTypeCommon> ITEM_ACTIONS = Set.of(
+            PacketType.Play.Client.INTERACT_ENTITY,
+            PacketType.Play.Client.PLAYER_BLOCK_PLACEMENT,
+            PacketType.Play.Client.USE_ITEM
     );
     // - Both wait for their tick's verdict, and so does everything the client sent after them -
     private static final Set<PacketTypeCommon> JUDGED = union(MOVEMENT, ACTIONS);
@@ -50,6 +61,11 @@ final class TickHold {
     // - A held packet (its type and bytes, the packet id included), with the serverbound packets handed to the -
     // - simulation through it (see TickEnd), or a marker, whose action runs once the packets before it went on -
     private record Held(@Nullable PacketTypeCommon type, byte @Nullable [] packet, @Nullable Runnable marker, long sequence, long arrivedNanos) {
+    }
+
+    // - What refuse kept from the server: the places of the refused actions that were still held, and whether one -
+    // - of them used up or changed an item -
+    record Refusal(Set<Long> packets, boolean itemRefused) {
     }
 
     // - What the hold did so far, for /clauac status -
@@ -73,9 +89,8 @@ final class TickHold {
     // - The movement of the client's packets through this one never reaches the server: they belong to ticks that -
     // - are set back -
     private long droppedMovementThrough;
-    // - The attacks and interactions of the client's packets through this one never reach the server: they belong -
-    // - to ticks whose actions failed a check -
-    private long droppedActionsThrough;
+    // - The actions that failed a check, by their place among the serverbound packets; each never reaches the server -
+    private final Set<Long> refused = new HashSet<>();
     // - Written on the event loop only; volatile for the server thread and /clauac status -
     private volatile long oldestHeldNanos;
     private volatile int heldNow;
@@ -157,10 +172,20 @@ final class TickHold {
         this.droppedMovementThrough = Math.max(this.droppedMovementThrough, through);
     }
 
-    // - The attacks and interactions of a tick whose actions failed a check, through its end packet -
-    // - (TickEnd.serverboundPackets), do not reach the server. Asked before the tick is judged -
-    void dropActionsThrough(long through) {
-        this.droppedActionsThrough = Math.max(this.droppedActionsThrough, through);
+    // - The actions at these places among the serverbound packets failed a check: those still held never reach the -
+    // - server. The others went on unjudged (see releaseUnjudged), and the server answers them itself. Asked right -
+    // - before their tick is judged, which lets go of every one of them -
+    Refusal refuse(Set<Long> packets) {
+        Set<Long> kept = new HashSet<>();
+        boolean itemRefused = false;
+        for (Held entry : this.held) {
+            if (entry.type() != null && ACTIONS.contains(entry.type()) && packets.contains(entry.sequence())) {
+                kept.add(entry.sequence());
+                itemRefused |= ITEM_ACTIONS.contains(entry.type());
+            }
+        }
+        this.refused.addAll(kept);
+        return new Refusal(Set.copyOf(kept), itemRefused);
     }
 
     // - Runs the action once everything held now went on: right away when nothing is held -
@@ -190,6 +215,7 @@ final class TickHold {
     // - The connection closed: what is held can go nowhere -
     void close() {
         this.held.clear();
+        this.refused.clear();
         this.heldBytes = 0L;
         this.enabled = false;
         this.updateOldest();
@@ -251,7 +277,7 @@ final class TickHold {
             this.droppedMovement++;
             return;
         }
-        if (entry.sequence() <= this.droppedActionsThrough && ACTIONS.contains(entry.type())) {
+        if (ACTIONS.contains(entry.type()) && this.refused.remove(entry.sequence())) {
             this.droppedActions++;
             return;
         }

@@ -24,6 +24,8 @@ final class ClientTickPackets {
     // - MultiPlayerGameMode.tick), in order. These happen inside the tick, after the client processed the server's -
     // - packets and with the rotation the tick's movement packet reports, so they are replayed at the tick's end -
     final List<Packet<?>> actions = new ArrayList<>();
+    // - Where each action came among the connection's serverbound packets, counted as TickEnd counts them (see Flag) -
+    final List<Long> actionPackets = new ArrayList<>();
     // - A START_SPRINTING command was part of this tick -
     boolean sprintStartReported;
     // - A ServerboundPlayerAbilitiesPacket was part of this tick, and the flying state it carried -
@@ -51,6 +53,17 @@ final class ClientTickPackets {
         this.rejections.add(new Flag(check, detail));
     }
 
+    // - An action no vanilla client performs in the sandbox's situation, in the packet at this place, with the block -
+    // - prediction that packet carries (Flag.NO_PREDICTION when none) -
+    void rejectAction(Check check, String detail, long packet, int predictionSequence) {
+        this.rejections.add(new Flag(check, detail, packet, predictionSequence));
+    }
+
+    void addAction(Packet<?> action, long packet) {
+        this.actions.add(action);
+        this.actionPackets.add(packet);
+    }
+
     // - The note that lists what was rejected -
     static String rejectionNote(Iterable<Flag> rejections) {
         List<String> details = new ArrayList<>();
@@ -64,6 +77,7 @@ final class ClientTickPackets {
         this.movePacket = null;
         this.vehicleMove = null;
         this.actions.clear();
+        this.actionPackets.clear();
         this.sprintStartReported = false;
         this.abilitiesReported = false;
         this.reportedFlying = false;

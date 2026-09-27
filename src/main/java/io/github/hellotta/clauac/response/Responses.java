@@ -3,6 +3,8 @@ package io.github.hellotta.clauac.response;
 import io.github.hellotta.clauac.api.ClauACFlagEvent;
 import io.github.hellotta.clauac.simulation.api.ClientTickReport;
 import io.github.hellotta.clauac.simulation.api.Flag;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -11,8 +13,7 @@ import org.slf4j.Logger;
 
 // - What ClauAC does when a client tick fails checks: for every flag it calls ClauACFlagEvent and, unless a listener -
 // - cancelled it, alerts and responds as the configuration says: a check of the movement sets the player back, and a -
-// - check of the actions keeps the tick's attacks and interactions from the server. Ticks arrive on simulation -
-// - threads -
+// - check of the actions keeps the action that failed it from the server. Ticks arrive on simulation threads -
 public final class Responses {
 
     private final JavaPlugin plugin;
@@ -35,7 +36,7 @@ public final class Responses {
         }
         ClauACSettings current = this.settings;
         boolean setBack = false;
-        boolean dropActions = false;
+        Map<Long, Integer> refusedActions = new HashMap<>();
         for (Flag flag : report.flags()) {
             if (player != null && !this.call(new ClauACFlagEvent(player, flag.check(), flag.detail(), report.clientTick()))) {
                 continue;
@@ -44,14 +45,14 @@ public final class Responses {
                 this.alerts.flag(player, flag, report.clientTick(), current);
             }
             if (current.setsBack(flag.check())) {
-                if (flag.check().concernsActions()) {
-                    dropActions = true;
-                } else {
+                if (!flag.check().concernsActions()) {
                     setBack = true;
+                } else if (flag.hasPacket()) {
+                    refusedActions.put(flag.packet(), flag.predictionSequence());
                 }
             }
         }
-        return new TickResponse(setBack, dropActions);
+        return new TickResponse(setBack, refusedActions);
     }
 
     // - Calls the event with the plugin's class loader as the thread's context class loader: simulation threads -

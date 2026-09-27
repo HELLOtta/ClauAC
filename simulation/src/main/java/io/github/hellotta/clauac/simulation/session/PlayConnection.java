@@ -27,6 +27,7 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
 import net.minecraft.core.PositionAndRotation;
 import net.minecraft.core.component.DataComponents;
@@ -129,6 +130,7 @@ import net.minecraft.world.Difficulty;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.TickRateManager;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntitySelector;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
@@ -185,6 +187,11 @@ final class PlayConnection implements ClientContext {
     private static final double MOVING_BLOCK_REACH = 2.0;
     // - The player pushes the entities its box touches during its tick; its movement can carry the box this far -
     private static final double PUSH_REACH = 1.0;
+    // - Blocks beside the boxes a movement sweeps through still change it: the block the player stands on, the step -
+    // - up, the blocks it touches -
+    private static final double MOVEMENT_BLOCK_REACH = 1.0;
+    // - A broken block takes its second half along (a door, a bed, a tall plant), which lies next to it -
+    private static final double SECOND_HALF_REACH = 1.0;
     // - The difference in the reported position itself, which a velocity estimate can explain (see compareWithClient) -
     private static final String POSITION_DIFFERENCE = "position";
     // - Attributes that do not change how the local player moves within a tick: they count for attacks, mining, reach, -
@@ -209,6 +216,14 @@ final class PlayConnection implements ClientContext {
     // - place of the position are therefore expected for this many ticks after the last estimate -
     private static final int VELOCITY_ESTIMATE_ULPS = 8;
     private static final int VELOCITY_ESTIMATE_TICKS = 100;
+    // - A boat turns its rider by the boat's turn of the tick and keeps it within reach of the boat's heading, in -
+    // - float arithmetic (see checkRiderUses). The client reports the boat's yaw, so the sandbox knows the boat's turn -
+    // - only up to a unit in the last place of that yaw; each of the float operations rounds by at most half a unit -
+    // - in the last place of values no larger than the yaws plus half a turn (Mth.wrapDegrees keeps the rider within -
+    // - half a turn of the boat). The rider's yaw a vanilla client reports therefore lies within a few units in the -
+    // - last place of that size from where the sandbox turns the yaw it used an item with; this many leave a margin -
+    private static final int RIDER_ROTATION_ULPS = 8;
+    private static final float HALF_TURN_DEGREES = 180.0F;
 
     private final GameProfile localGameProfile;
     private final ReceivedRegistries registries;
@@ -255,6 +270,9 @@ final class PlayConnection implements ClientContext {
     private @Nullable String alternativesDisabled;
     // - What trying the tick's alternatives at the player's tick found, for the comparison after the tick -
     private @Nullable AlternativeResult alternativeResult;
+    // - The items the player used during the tick while a boat turns it, whose yaw only the tick decides on (see -
+    // - checkUseItem and checkRiderUses) -
+    private final List<RiderUse> riderUses = new ArrayList<>();
     private int ticksSinceVelocityEstimate = VELOCITY_ESTIMATE_TICKS;
     // - The difference and the outcome of the tick whose resync estimated the velocity last -
     private double estimatedAfterOffset;
@@ -374,7 +392,10 @@ final class PlayConnection implements ClientContext {
                     level.setServerVerifiedBlockState(blockUpdate.getPos(), blockUpdate.getBlockState(), SERVER_BLOCK_UPDATE_FLAGS);
             case ClientboundSectionBlocksUpdatePacket sectionUpdate ->
                     sectionUpdate.runUpdates((pos, state) -> level.setServerVerifiedBlockState(pos, state, SERVER_BLOCK_UPDATE_FLAGS));
-            case ClientboundBlockChangedAckPacket ack -> level.handleBlockChangedAck(ack.sequence());
+            case ClientboundBlockChangedAckPacket ack -> {
+                level.handleBlockChangedAck(ack.sequence());
+                this.gameMode.onBlockChangedAck(ack.sequence());
+            }
             case ClientboundBlockEventPacket blockEvent -> level.blockEvent(blockEvent.getPos(), blockEvent.getBlock(), blockEvent.getB0(), blockEvent.getB1());
             case ClientboundBlockEntityDataPacket blockEntityData -> handleBlockEntityData(blockEntityData, level);
             case ClientboundSetChunkCacheCenterPacket center -> level.getChunkSource().updateViewCenter(center.getX(), center.getZ());
@@ -1012,8 +1033,9 @@ final class PlayConnection implements ClientContext {
             tickLevel.setLocalPlayerTick(null);
         }
         tickLevel.tickBlockEntities();
+        this.checkRiderUses(tickPlayer);
         List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
-        this.collectOngoingUncertainties(uncertainties);
+        this.collectOngoingUncertainties(uncertainties, tickPlayer, positionBeforeTick, vehicleBeforeTick, vehiclePositionBeforeTick);
         List<String> notes = new ArrayList<>(this.tickPackets.notes);
         this.judgeAlternatives(uncertainties, notes);
         ClientTickReport report;
@@ -1304,11 +1326,17 @@ final class PlayConnection implements ClientContext {
     // - AbstractBoat.clampRotation adds to at every frame anyway (Entity.turn calls onPassengerTurned) -
     private float passengerTurnOfTick(SandboxPlayer player) {
         ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
-        if (vehicleMove != null && player.getVehicle() instanceof AbstractBoat boat && boat.isLocalInstanceAuthoritative()
-                && !player.is(EntityTypeTags.CAN_TURN_IN_BOATS)) {
+        AbstractBoat boat = turningBoat(player);
+        if (vehicleMove != null && boat != null && boat.isLocalInstanceAuthoritative()) {
             return vehicleMove.movingTo().yRot() - boat.getYRot();
         }
         return 0.0F;
+    }
+
+    // - The boat whose AbstractBoat.positionRider turns the player at the end of the player's tick and clamps its -
+    // - yaw (clampRotation), unless the player's type can turn in boats -
+    private static @Nullable AbstractBoat turningBoat(SandboxPlayer player) {
+        return player.getVehicle() instanceof AbstractBoat boat && !player.is(EntityTypeTags.CAN_TURN_IN_BOATS) ? boat : null;
     }
 
     // - Minecart.positionRider turns a passenger player with the experimental minecart movement, but only while the -
@@ -1560,25 +1588,66 @@ final class PlayConnection implements ClientContext {
     // - client's player held the new item already, unless it switched during this tick's key handling, so where the -
     // - two items pick differently either crosshair is possible. The interaction ranges the pick uses are the -
     // - attributes the server sent, as the client applies an item's attribute modifiers only when the server sends -
-    // - them (LivingEntity.detectEquipmentUpdates runs on the server), so a switch does not change them -
-    private record KeyHandlingStart(boolean usingItem, boolean handsBusy, Entity camera, HitResult crosshair, @Nullable HitResult crosshairWithSwitchedItem) {
+    // - them (LivingEntity.detectEquipmentUpdates runs on the server), so a switch does not change them. pickReach is -
+    // - how far along the camera's sight line the pick looked with either item (see pickReach) -
+    private record KeyHandlingStart(
+            boolean usingItem, boolean useMayHaveStopped, boolean handsBusy, Entity camera, HitResult crosshair, @Nullable HitResult crosshairWithSwitchedItem,
+            double pickReach
+    ) {
+
+        // - Every crosshair the client may have had -
+        List<HitResult> crosshairs() {
+            return this.crosshairWithSwitchedItem == null ? List.of(this.crosshair) : List.of(this.crosshair, this.crosshairWithSwitchedItem);
+        }
 
         // - Where the crosshair met the entity with each item the client may have held out; empty when it did not -
         List<EntityHitResult> hitsOn(Entity target) {
             List<EntityHitResult> hits = new ArrayList<>(2);
-            if (this.crosshair instanceof EntityHitResult hit && hit.getEntity() == target) {
-                hits.add(hit);
-            }
-            if (this.crosshairWithSwitchedItem instanceof EntityHitResult hit && hit.getEntity() == target) {
-                hits.add(hit);
+            for (HitResult crosshair : this.crosshairs()) {
+                if (crosshair instanceof EntityHitResult hit && hit.getEntity() == target) {
+                    hits.add(hit);
+                }
             }
             return hits;
         }
+
+        // - The block hits of the crosshairs the client may have had -
+        List<BlockHitResult> blockHits() {
+            List<BlockHitResult> hits = new ArrayList<>(2);
+            for (HitResult crosshair : this.crosshairs()) {
+                if (crosshair instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
+                    hits.add(hit);
+                }
+            }
+            return hits;
+        }
+
+        // - Whether the crosshair pointed at this face of this block with an item the client may have held out -
+        boolean pointsAt(BlockPos pos, Direction face) {
+            return this.blockHits().stream().anyMatch(hit -> hit.getBlockPos().equals(pos) && hit.getDirection() == face);
+        }
+    }
+
+    // - An action of the tick under check: what the client did, in words, the packet it sent for it and the block -
+    // - prediction that packet carries (see Flag) -
+    private record CheckedAction(String description, long packet, int predictionSequence) {
+    }
+
+    // - An item use while a boat turns the player: the use, the rotation the client sent with it and the boat -
+    private record RiderUse(CheckedAction action, float yRot, float xRot, AbstractBoat boat) {
     }
 
     // - Replays Minecraft.handleKeybinds and MultiPlayerGameMode.tick for this tick from the packets they sent. An -
-    // - action the sandbox's vanilla code cannot perform is rejected, and the others go on -
+    // - action the sandbox's vanilla code cannot perform is rejected, and the others go on. The hotbar keys come -
+    // - first in the key handling and nothing else in a tick changes the selected slot, so every action of the key -
+    // - handling was made with the slot they selected. The first action that calls -
+    // - MultiPlayerGameMode.ensureHasSentCarriedItem reports that slot right before itself (see reportsCarriedItem), -
+    // - while Minecraft.startAttack's start of breaking and swing, the aborts and the offhand swap do not and may come -
+    // - first, so the sandbox selects a slot reported during the key handling before its first action (see -
+    // - keyHandlingReport). Without such a report, the slot is known to be the one selected already once the tick -
+    // - shows an action that would have reported another -
     private void performTickActions(SandboxLevel level, SandboxPlayer player) {
+        this.riderUses.clear();
         List<Packet<?>> actions = this.tickPackets.actions;
         if (actions.isEmpty()) {
             return;
@@ -1592,17 +1661,25 @@ final class PlayConnection implements ClientContext {
         ItemStack activeItem = player.getActiveItem();
         // - LivingEntity.getActiveItem holds out the new main hand item unless the player is a spectator or goes on -
         // - using an item -
-        HitResult crosshairWithSwitchedItem = switchedTo != null && !player.isSpectator() && (!player.isUsingItem() || useMayHaveStopped)
+        boolean switchedItemHeldOut = switchedTo != null && !player.isSpectator() && (!player.isUsingItem() || useMayHaveStopped);
+        HitResult crosshairWithSwitchedItem = switchedItemHeldOut
                 && !Objects.equals(switchedTo.get(DataComponents.ATTACK_RANGE), activeItem.get(DataComponents.ATTACK_RANGE))
                 ? player.raycastHitResult(TICK_PARTIAL_TICK, camera, switchedTo)
                 : null;
-        KeyHandlingStart start = new KeyHandlingStart(player.isUsingItem() && !useMayHaveStopped, player.isHandsBusy(), camera,
-                player.raycastHitResult(TICK_PARTIAL_TICK, camera), crosshairWithSwitchedItem);
+        double pickReach = switchedItemHeldOut ? Math.max(pickReach(player, activeItem), pickReach(player, switchedTo)) : pickReach(player, activeItem);
+        KeyHandlingStart start = new KeyHandlingStart(player.isUsingItem() && !useMayHaveStopped, useMayHaveStopped, player.isHandsBusy(), camera,
+                player.raycastHitResult(TICK_PARTIAL_TICK, camera), crosshairWithSwitchedItem, pickReach);
+        int keyHandlingReport = keyHandlingReport(actions);
+        int firstKeyHandlingAction = actions.getFirst() instanceof ServerboundSetCarriedItemPacket ? 1 : 0;
+        boolean keyHandlingSlotKnown = keyHandlingReport >= 0 || actions.stream().anyMatch(PlayConnection::reportsCarriedItem);
         boolean swingAccompanied = false;
         for (int index = 0; index < actions.size(); index++) {
+            if (index == firstKeyHandlingAction && keyHandlingReport > index) {
+                this.selectHotbarSlot(player, ((ServerboundSetCarriedItemPacket) actions.get(keyHandlingReport)).getSlot(), false);
+            }
             Packet<?> action = actions.get(index);
             try {
-                swingAccompanied = this.performTickAction(action, index, leadingSwitch, start, swingAccompanied, level, player);
+                swingAccompanied = this.performTickAction(action, index, leadingSwitch, start, keyHandlingSlotKnown, swingAccompanied, level, player);
             } catch (RuntimeException problem) {
                 this.problemLog.log("rejected " + action.type() + " replayed at the end of a client tick", problem);
                 this.tickPackets.reject(Check.BAD_PACKETS, action.type() + " could not be performed (" + problem + ")");
@@ -1610,31 +1687,42 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - Performs one action of the tick; returns whether a swing that follows is part of an attack or a block action -
+    // - Performs one action of the tick; returns whether a swing that follows is part of an attack or a block action. -
+    // - Every action is checked against what the client's key handling allows before it is performed; the sandbox -
+    // - still performs a rejected one as the client did, since the client's player went on from it. keyHandlingSlotKnown -
+    // - tells whether the tick shows the slot its key handling acted with (see performTickActions) -
     private boolean performTickAction(
             Packet<?> action,
             int index,
             @Nullable ServerboundSetCarriedItemPacket leadingSwitch,
             KeyHandlingStart start,
+            boolean keyHandlingSlotKnown,
             boolean swingAccompanied,
             SandboxLevel level,
             SandboxPlayer player
     ) {
         List<Packet<?>> actions = this.tickPackets.actions;
+        long packet = this.tickPackets.actionPackets.get(index);
         switch (action) {
-            case ServerboundSetCarriedItemPacket carriedItem -> this.selectHotbarSlot(player, carriedItem.getSlot(), carriedItem == leadingSwitch);
+            case ServerboundSetCarriedItemPacket carriedItem -> {
+                this.checkHotbarReport(carriedItem, index, packet);
+                this.selectHotbarSlot(player, carriedItem.getSlot(), carriedItem == leadingSwitch);
+            }
             case ServerboundPlayerActionPacket playerAction -> {
+                this.checkPlayerAction(level, player, playerAction, packet, keyHandlingSlotKnown, start);
                 Packet<?> next = index + 1 < actions.size() ? actions.get(index + 1) : null;
-                return this.performPlayerAction(playerAction, next, level, player) || swingAccompanied;
+                return this.performPlayerAction(playerAction, next, keyHandlingSlotKnown, level, player) || swingAccompanied;
             }
             case ServerboundUseItemOnPacket useItemOn -> {
+                this.checkUseItemOn(level, player, useItemOn, packet, start);
                 // - A placed block faces by the player's rotation -
                 this.checkActionRotation(player, "used an item on a block");
                 this.gameMode.useItemOn(level, player, useItemOn.hand(), useItemOn.hitResult(), useItemOn.sequence(), this.tickPackets);
             }
             case ServerboundUseItemPacket useItem -> {
-                player.setYRot(useItem.yRot());
-                player.setXRot(useItem.xRot());
+                // - The rotation the packet carries is the player's own, which the tick's movement reported (see -
+                // - checkUseItem); the player keeps that one -
+                this.checkUseItem(level, player, useItem, packet, start);
                 this.gameMode.useItem(level, player, useItem.hand(), useItem.sequence(), this.tickPackets);
             }
             case ServerboundAttackPacket attack -> {
@@ -1642,7 +1730,7 @@ final class PlayConnection implements ClientContext {
                 if (target == null) {
                     this.attackUnknownEntity(player, this.onlySwingsFollow(index));
                 } else {
-                    this.checkAttack(level, player, target, start);
+                    this.checkAttack(level, player, target, new CheckedAction("attacked " + describeEntity(target), packet, Flag.NO_PREDICTION), start);
                     this.attackEntity(level, player, target, this.onlySwingsFollow(index));
                 }
                 return true;
@@ -1655,7 +1743,8 @@ final class PlayConnection implements ClientContext {
                     this.tickPackets.notes.add("interacted with entity " + interact.entityId() + ", which the sandbox does not know");
                     this.markInventoryUnknown(InventoryMenu.CONTAINER_ID);
                 } else {
-                    this.checkInteraction(level, player, target, interact.hand(), start);
+                    this.checkInteraction(level, player, target, interact.hand(),
+                            new CheckedAction("interacted with " + describeEntity(target), packet, Flag.NO_PREDICTION), start);
                     this.gameMode.interact(player, target, interact.hand(), interact.location());
                 }
             }
@@ -1663,7 +1752,7 @@ final class PlayConnection implements ClientContext {
                 if (!swingAccompanied) {
                     // - What the crosshair pointed at depends on the player's rotation -
                     this.checkActionRotation(player, "swung at what the crosshair pointed at");
-                    this.gameMode.swingAlone(level, player, start.crosshair());
+                    this.gameMode.swingAlone(level, player, start.crosshair(), index == actions.size() - 1, this.uncertainBreakOnSight(start) == null);
                 }
                 return false;
             }
@@ -1672,41 +1761,59 @@ final class PlayConnection implements ClientContext {
         return swingAccompanied;
     }
 
+    // - What the client's key handling could do depends on the items it held: the item in the hand, the attack range -
+    // - it picks along, whether it is in use. While the sandbox's items differ from the client's (see -
+    // - markInventoryUnknown), what a check finds is noted instead -
+    private void reject(CheckedAction action, Check check, String detail) {
+        if (this.unknownInventoryMenu.isPresent()) {
+            this.tickPackets.notes.add("not checked: " + detail + ", while the sandbox's items differ from the client's");
+            return;
+        }
+        this.tickPackets.rejectAction(check, detail, action.packet(), action.predictionSequence());
+    }
+
+    // - A rejection that a block the client may have broken otherwise than the sandbox can explain (see -
+    // - SandboxGameMode.startDestroyBlock), which is then noted instead -
+    private void rejectUnlessUncertain(CheckedAction action, Check check, String detail, @Nullable String uncertainty) {
+        if (uncertainty != null) {
+            this.tickPackets.notes.add("not checked: " + detail + ", since " + uncertainty);
+            return;
+        }
+        this.reject(action, check, detail);
+    }
+
+    // - The block prediction a packet carries: MultiPlayerGameMode.startPrediction numbers them from 1, and a packet -
+    // - sent without one carries 0 -
+    private static int predictionOf(int sequence) {
+        return sequence > 0 ? sequence : Flag.NO_PREDICTION;
+    }
+
     // - Minecraft.startAttack, the only place a vanilla client attacks from (MultiPlayerGameMode.attack). The attack -
     // - key does nothing while the player uses an item or paddles a boat (see checkHandsFree), and a spectator -
     // - spectates the entity instead. An item the level's features do not enable does not attack, a piercing weapon -
     // - stabs instead, and a weapon charged less than its minimum attack charge does nothing. Otherwise the player -
-    // - attacks the entity the crosshair points at, with a weapon that has an attack range only within that range. -
-    // - The sandbox still performs the attack as the client did, since the client's player went on from it -
-    private void checkAttack(SandboxLevel level, SandboxPlayer player, Entity target, KeyHandlingStart start) {
-        String action = "attacked " + describeEntity(target);
+    // - attacks the entity the crosshair points at, with a weapon that has an attack range only within that range -
+    private void checkAttack(SandboxLevel level, SandboxPlayer player, Entity target, CheckedAction action, KeyHandlingStart start) {
         this.checkHandsFree(action, "attack", start);
         if (this.gameMode.isSpectator()) {
-            this.tickPackets.reject(Check.INTERACTION, action + " as a spectator, who spectates an entity instead");
+            this.reject(action, Check.INTERACTION, action.description() + " as a spectator, who spectates an entity instead");
         }
         ItemStack weapon = player.getMainHandItem();
         if (!weapon.isItemEnabled(level.enabledFeatures())) {
-            this.tickPackets.reject(Check.INTERACTION, action + " with " + describeItem(weapon) + ", which the level's features do not enable");
+            this.reject(action, Check.INTERACTION, action.description() + " with " + describeItem(weapon) + ", which the level's features do not enable");
         } else if (weapon.has(DataComponents.PIERCING_WEAPON)) {
             // - Charged too little, a piercing weapon does nothing at all -
-            this.tickPackets.reject(Check.INTERACTION, action + " with " + describeItem(weapon) + ", which a vanilla client stabs with instead");
-        } else if (player.cannotAttackWithItem(weapon, 0)) {
-            // - The attack strength ticker depends on when the client switched its hotbar slot (see -
-            // - SandboxPlayer.considerEarlierHotbarSwitch); the attack speed is the attribute the server sent -
-            if (player.cannotAttackWithItemUnderAnyTicker(weapon)) {
-                this.tickPackets.reject(Check.INTERACTION, action + " with " + describeItem(weapon) + " charged less than its minimum attack charge");
-            } else {
-                this.tickPackets.notes.add("not checked: " + action + " with " + describeItem(weapon)
-                        + ", whose charge depends on when the client switched its hotbar slot");
-            }
+            this.reject(action, Check.INTERACTION, action.description() + " with " + describeItem(weapon) + ", which a vanilla client stabs with instead");
+        } else {
+            this.checkCharge(player, weapon, action);
         }
         AttackRange weaponRange = weapon.get(DataComponents.ATTACK_RANGE);
         List<EntityHitResult> hits = start.hitsOn(target);
         if (!hits.isEmpty()) {
             // - AttackRange.isInRange measures from the player's eyes to the point the crosshair met -
             if (weaponRange != null && hits.stream().noneMatch(hit -> weaponRange.isInRange(player, hit.getLocation()))) {
-                this.tickPackets.reject(Check.REACH, String.format(Locale.ROOT, "%s %.2f blocks away, outside the %.2f to %.2f blocks %s reaches",
-                        action, hits.getFirst().getLocation().distanceTo(player.getEyePosition()),
+                this.reject(action, Check.REACH, String.format(Locale.ROOT, "%s %.2f blocks away, outside the %.2f to %.2f blocks %s reaches",
+                        action.description(), hits.getFirst().getLocation().distanceTo(player.getEyePosition()),
                         weaponRange.effectiveMinRange(player) - weaponRange.hitboxMargin(),
                         weaponRange.effectiveMaxRange(player) + weaponRange.hitboxMargin(), describeItem(weapon)));
             }
@@ -1729,31 +1836,33 @@ final class PlayConnection implements ClientContext {
         }
     }
 
+    // - Player.cannotAttackWithItem as Minecraft.startAttack asks it before it attacks or stabs. The attack strength -
+    // - ticker depends on when the client switched its hotbar slot (see SandboxPlayer.considerEarlierHotbarSwitch); the -
+    // - attack speed is the attribute the server sent -
+    private void checkCharge(SandboxPlayer player, ItemStack weapon, CheckedAction action) {
+        if (!player.cannotAttackWithItem(weapon, 0)) {
+            return;
+        }
+        if (player.cannotAttackWithItemUnderAnyTicker(weapon)) {
+            this.reject(action, Check.INTERACTION, action.description() + " with " + describeItem(weapon) + " charged less than its minimum attack charge");
+        } else {
+            this.tickPackets.notes.add("not checked: " + action.description() + " with " + describeItem(weapon)
+                    + ", whose charge depends on when the client switched its hotbar slot");
+        }
+    }
+
     // - Minecraft.startUseItem, the only place a vanilla client interacts with an entity from -
     // - (MultiPlayerGameMode.interact, which sends the interaction for a spectator as well). The use key does nothing -
-    // - while the player uses an item or paddles a boat (see checkHandsFree) or breaks a block. The hands are tried -
-    // - main hand first, and an item the level's features do not enable ends the key's handling. The player interacts -
-    // - with the entity the crosshair points at, within the world border, while the entity's box lies closer than the -
-    // - player's entity interaction range (Player.isWithinEntityInteractionRange). The sandbox still performs the -
-    // - interaction as the client did, since the client's player went on from it -
-    private void checkInteraction(SandboxLevel level, SandboxPlayer player, Entity target, InteractionHand hand, KeyHandlingStart start) {
-        String action = "interacted with " + describeEntity(target);
+    // - while the player uses an item or paddles a boat (see checkHandsFree) or breaks a block, and the hands are -
+    // - tried as checkItemsEnabled says. The player interacts with the entity the crosshair points at, within the -
+    // - world border, while the entity's box lies closer than the player's entity interaction range -
+    // - (Player.isWithinEntityInteractionRange) -
+    private void checkInteraction(SandboxLevel level, SandboxPlayer player, Entity target, InteractionHand hand, CheckedAction action, KeyHandlingStart start) {
         this.checkHandsFree(action, "use", start);
-        if (this.gameMode.isDestroying()) {
-            this.tickPackets.reject(Check.INTERACTION, action + " while breaking a block, when a vanilla client ignores the use key");
-        }
-        for (InteractionHand tried : InteractionHand.values()) {
-            ItemStack held = player.getItemInHand(tried);
-            if (!held.isItemEnabled(level.enabledFeatures())) {
-                this.tickPackets.reject(Check.INTERACTION, action + " while holding " + describeItem(held) + ", which the level's features do not enable");
-                break;
-            }
-            if (tried == hand) {
-                break;
-            }
-        }
+        this.checkNotBreaking(action);
+        this.checkItemsEnabled(level, player, hand, action);
         if (!level.getWorldBorder().isWithinBounds(target.blockPosition())) {
-            this.tickPackets.reject(Check.INTERACTION, action + " outside the world border");
+            this.reject(action, Check.INTERACTION, action.description() + " outside the world border");
         }
         double reach = player.entityInteractionRange();
         if (!player.isWithinEntityInteractionRange(target, 0.0)) {
@@ -1763,52 +1872,431 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - Minecraft.handleKeybinds consumes the attack and use key clicks without acting while the player uses an item, -
-    // - and Minecraft.startAttack and startUseItem do nothing while paddling a boat keeps the player's hands busy -
-    private void checkHandsFree(String action, String key, KeyHandlingStart start) {
-        if (start.usingItem()) {
-            this.tickPackets.reject(Check.INTERACTION, action + " while using an item, when a vanilla client ignores the " + key + " key");
-        }
-        if (start.handsBusy()) {
-            this.tickPackets.reject(Check.INTERACTION, action + " while paddling a boat, which keeps a vanilla client's hands busy");
+    // - The block actions of MultiPlayerGameMode and the stab of a piercing weapon, as the client's key handling -
+    // - allows them (see checkBlockBreaking and checkStab). The client drops, swaps and releases items whenever it -
+    // - handles its keys, and aborts breaking whenever it stops, also while the server teleports it -
+    // - (ClientPacketListener.handleMovePlayer): those only change what the client itself holds or breaks. Whether the -
+    // - client could finish or turn depends on its mining state, which the sandbox knows only while no start of -
+    // - breaking left it open (SandboxGameMode.miningStateKnown); a finish or turn comes from continueDestroyBlock, -
+    // - which reports the slot it acts with first, while a start's item is known as keyHandlingSlotKnown tells -
+    private void checkPlayerAction(
+            SandboxLevel level, SandboxPlayer player, ServerboundPlayerActionPacket action, long packet, boolean keyHandlingSlotKnown, KeyHandlingStart start
+    ) {
+        BlockPos pos = action.getPos();
+        int prediction = predictionOf(action.getSequence());
+        String miningStateUnknown = this.gameMode.miningStateKnown()
+                ? null
+                : "the client may have started breaking with another hotbar item than the sandbox, which breaks another block";
+        switch (action.getAction()) {
+            case START_DESTROY_BLOCK -> this.checkBlockBreaking(level, player, new CheckedAction("started breaking " + describeBlock(level, pos), packet, prediction),
+                    pos, action.getDirection(), true, keyHandlingSlotKnown, start);
+            case STOP_DESTROY_BLOCK -> {
+                CheckedAction finish = new CheckedAction("finished breaking " + describeBlock(level, pos), packet, prediction);
+                this.checkBlockBreaking(level, player, finish, pos, action.getDirection(), false, true, start);
+                String whyNoFinish = this.gameMode.whyNoFinish(level, player, pos);
+                if (whyNoFinish != null) {
+                    this.rejectUnlessUncertain(finish, Check.FAST_BREAK, finish.description() + " " + whyNoFinish, miningStateUnknown);
+                }
+            }
+            case CHANGE_DESTROY_DIRECTION -> {
+                CheckedAction turn = new CheckedAction("turned to another face of " + describeBlock(level, pos) + " while breaking it", packet, prediction);
+                this.checkBlockBreaking(level, player, turn, pos, action.getDirection(), false, true, start);
+                // - MultiPlayerGameMode.continueDestroyBlock only turns while it goes on breaking that block -
+                if (!this.gameMode.sameDestroyTarget(player, pos)) {
+                    this.rejectUnlessUncertain(turn, Check.INTERACTION, turn.description() + ", which a vanilla client only does for the block it is breaking",
+                            miningStateUnknown);
+                }
+            }
+            case STAB -> this.checkStab(level, player, new CheckedAction("stabbed", packet, Flag.NO_PREDICTION), start);
+            case ABORT_DESTROY_BLOCK, DROP_ITEM, DROP_ALL_ITEMS, RELEASE_USE_ITEM, SWAP_ITEM_WITH_OFFHAND -> {
+            }
         }
     }
 
-    private void rejectOutOfReach(String action, double distance, double reach, String reacher) {
-        this.tickPackets.reject(Check.REACH, String.format(Locale.ROOT, "%s %.2f blocks away, beyond the %.2f blocks %s reaches", action, distance, reach, reacher));
+    // - MultiPlayerGameMode.startDestroyBlock and continueDestroyBlock, from Minecraft.startAttack and continueAttack, -
+    // - the only senders of START_DESTROY_BLOCK, STOP_DESTROY_BLOCK and CHANGE_DESTROY_DIRECTION. They act on the block -
+    // - and face the crosshair points at, which is not air (both skip air). startAttack does nothing while the player -
+    // - uses an item as the key handling starts, and continueAttack, which comes after everything else in it, while -
+    // - the player uses one then (a release earlier in the tick ends the use), so a start needs either free and a -
+    // - finish or turn the latter. Neither breaks blocks with a piercing weapon: startAttack stabs with it, and -
+    // - continueAttack leaves blocks alone. A start also leaves alone a block the game mode keeps the player from -
+    // - breaking (Player.blockActionRestricted) and one outside the world border. The item the client started with is -
+    // - only known when itemKnown (see SandboxGameMode.startDestroyBlock), so otherwise a check that depends on it -
+    // - fails only when no hotbar item passes it -
+    private void checkBlockBreaking(
+            SandboxLevel level, SandboxPlayer player, CheckedAction action, BlockPos pos, Direction face, boolean starting, boolean itemKnown,
+            KeyHandlingStart start
+    ) {
+        boolean usingItem = player.isUsingItem() && !start.useMayHaveStopped();
+        if (starting ? start.usingItem() && usingItem : usingItem) {
+            this.reject(action, Check.INTERACTION, action.description() + " while using an item, when a vanilla client does not break blocks");
+        }
+        if (!SandboxGameMode.anyPossibleItem(player, itemKnown, () -> !player.getMainHandItem().has(DataComponents.PIERCING_WEAPON))) {
+            this.reject(action, Check.INTERACTION, action.description() + " with " + describeItem(player.getMainHandItem()) + ", which a vanilla client stabs with instead");
+        }
+        if (starting && !SandboxGameMode.anyPossibleItem(player, itemKnown, () -> !player.blockActionRestricted(level, pos, this.gameMode.localPlayerMode()))) {
+            this.reject(action, Check.INTERACTION, action.description() + ", which its game mode does not let it break");
+        }
+        if (starting && !level.getWorldBorder().isWithinBounds(pos)) {
+            this.reject(action, Check.INTERACTION, action.description() + " outside the world border");
+        }
+        if (level.getBlockState(pos).isAir()) {
+            this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + ", where no block is", this.uncertainBreakOnSight(start));
+        } else if (!start.pointsAt(pos, face)) {
+            this.rejectBlockMiss(action, player, pos, start, "its " + face.getSerializedName() + " face");
+        }
+    }
+
+    // - MultiPlayerGameMode.useItemOn, from Minecraft.startUseItem: it sends the crosshair's block hit itself, as -
+    // - BlockHitResult.STREAM_CODEC encodes it (see sentAs), only inside the world border, and only while the use key -
+    // - acts (see checkHandsFree), the player breaks no block and the hands up to this one hold enabled items -
+    private void checkUseItemOn(SandboxLevel level, SandboxPlayer player, ServerboundUseItemOnPacket useItemOn, long packet, KeyHandlingStart start) {
+        BlockHitResult sent = useItemOn.hitResult();
+        BlockPos pos = sent.getBlockPos();
+        CheckedAction action = new CheckedAction("used " + describeItem(player.getItemInHand(useItemOn.hand())) + " on " + describeBlock(level, pos),
+                packet, predictionOf(useItemOn.sequence()));
+        this.checkHandsFree(action, "use", start);
+        this.checkNotBreaking(action);
+        this.checkItemsEnabled(level, player, useItemOn.hand(), action);
+        if (!level.getWorldBorder().isWithinBounds(pos)) {
+            this.reject(action, Check.INTERACTION, action.description() + " outside the world border");
+        }
+        List<BlockHitResult> crosshairHits = start.blockHits();
+        if (crosshairHits.stream().anyMatch(hit -> sentAs(hit, sent))) {
+            return;
+        }
+        String sentFace = "its " + sent.getDirection().getSerializedName() + " face";
+        if (start.pointsAt(pos, sent.getDirection())) {
+            Vec3 point = sent.getLocation();
+            this.rejectUnlessUncertain(action, Check.HITBOX, String.format(Locale.ROOT, "%s at %.4f, %.4f, %.4f of %s, which the crosshair met at %s",
+                    action.description(), point.x - pos.getX(), point.y - pos.getY(), point.z - pos.getZ(), sentFace, describeBlockPoints(crosshairHits, pos)),
+                    this.uncertainBreakOnSight(start));
+        } else {
+            this.rejectBlockMiss(action, player, pos, start, sentFace);
+        }
+    }
+
+    // - Whether the client sends the crosshair's block hit as this one: BlockHitResult.STREAM_CODEC sends the point as -
+    // - floats relative to the block, and decoding adds them to the block's corner -
+    private static boolean sentAs(BlockHitResult crosshair, BlockHitResult sent) {
+        BlockPos pos = crosshair.getBlockPos();
+        Vec3 point = crosshair.getLocation();
+        Vec3 sentPoint = sent.getLocation();
+        return pos.equals(sent.getBlockPos()) && crosshair.getDirection() == sent.getDirection()
+                && crosshair.isInside() == sent.isInside() && crosshair.isWorldBorderHit() == sent.isWorldBorderHit()
+                && pos.getX() + (double) (float) (point.x - pos.getX()) == sentPoint.x
+                && pos.getY() + (double) (float) (point.y - pos.getY()) == sentPoint.y
+                && pos.getZ() + (double) (float) (point.z - pos.getZ()) == sentPoint.z;
+    }
+
+    // - Where the crosshairs met the block, relative to it -
+    private static String describeBlockPoints(List<BlockHitResult> hits, BlockPos pos) {
+        List<String> points = new ArrayList<>(hits.size());
+        for (BlockHitResult hit : hits) {
+            if (hit.getBlockPos().equals(pos)) {
+                Vec3 point = hit.getLocation();
+                points.add(String.format(Locale.ROOT, "%.4f, %.4f, %.4f", point.x - pos.getX(), point.y - pos.getY(), point.z - pos.getZ()));
+            }
+        }
+        return String.join(" or ", points);
+    }
+
+    // - MultiPlayerGameMode.useItem, from Minecraft.startUseItem: with the item in the hand, which is not empty, not as -
+    // - a spectator (useItem sends nothing then), only while the use key acts (see checkHandsFree), the player breaks -
+    // - no block and the hands up to this one hold enabled items, and facing where the player faces: the packet -
+    // - carries the player's rotation of that moment. Nothing turns the player between the key handling and the end -
+    // - of its tick but a boat it rides (turningBoat) and a minecart that may turn it (see passengerTurnUnknown), so -
+    // - the rotation the tick's movement reported (see simulateTick) is that rotation exactly. A boat turns only the -
+    // - yaw, which is decided after the tick (see checkRiderUses) -
+    private void checkUseItem(SandboxLevel level, SandboxPlayer player, ServerboundUseItemPacket useItem, long packet, KeyHandlingStart start) {
+        ItemStack item = player.getItemInHand(useItem.hand());
+        CheckedAction action = new CheckedAction("used " + describeItem(item), packet, predictionOf(useItem.sequence()));
+        this.checkHandsFree(action, "use", start);
+        this.checkNotBreaking(action);
+        if (this.gameMode.isSpectator()) {
+            this.reject(action, Check.INTERACTION, action.description() + " as a spectator, who uses no items");
+        }
+        if (item.isEmpty()) {
+            this.reject(action, Check.INTERACTION, action.description() + ", an empty hand, which a vanilla client does not use");
+        }
+        this.checkItemsEnabled(level, player, useItem.hand(), action);
+        if (passengerTurnUnknown(player)) {
+            this.tickPackets.notes.add("not checked: " + action.description() + " with a rotation the minecart may have turned");
+            return;
+        }
+        AbstractBoat boat = turningBoat(player);
+        // - Entity.setYRot keeps a vanilla client's yaw finite, so a yaw that is not can be rejected right away -
+        boolean yawAfterTick = boat != null && Float.isFinite(useItem.yRot());
+        if (useItem.xRot() != player.getXRot() || !yawAfterTick && useItem.yRot() != player.getYRot()) {
+            this.reject(action, Check.HITBOX, String.format(Locale.ROOT, "%s facing %.3f/%.3f, where the player faced %.3f/%.3f (yaw/pitch)",
+                    action.description(), useItem.yRot(), useItem.xRot(), player.getYRot(), player.getXRot()));
+        } else if (yawAfterTick) {
+            this.riderUses.add(new RiderUse(action, useItem.yRot(), useItem.xRot(), boat));
+        }
+    }
+
+    // - The yaw a boat's rider used items with (see checkUseItem), once the tick has turned the boat: -
+    // - AbstractBoat.positionRider turns the rider by the boat's turn of the tick and clampRotation keeps its yaw -
+    // - within 105 degrees of the boat's, after which the client reports the rider's rotation (LocalPlayer.sendChanges). -
+    // - The sandbox's boat, as the tick left it, turns the yaw the item was used with the same way, and has to arrive -
+    // - where the client's rider did, up to the rounding RIDER_ROTATION_ULPS allows. A boat the client steers has to -
+    // - have turned as the client reported, as it decides the rider's turn; one it does not steer turns neither itself -
+    // - nor its rider during the tick (AbstractBoat.tick) and follows the server like the client's -
+    private void checkRiderUses(SandboxPlayer player) {
+        if (this.riderUses.isEmpty()) {
+            return;
+        }
+        ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
+        ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
+        for (RiderUse use : this.riderUses) {
+            AbstractBoat boat = use.boat();
+            String unchecked = null;
+            if (player.getVehicle() != boat) {
+                unchecked = "the player no longer rode that boat after the tick";
+            } else if (movePacket == null || !movePacket.hasRotation()) {
+                unchecked = "the client reported no rotation after the tick";
+            } else if (boat.isLocalInstanceAuthoritative()
+                    && (boat != player.getRootVehicle() || vehicleMove == null || vehicleMove.movingTo().yRot() != boat.getClientPositionAndRotation().yRot())) {
+                unchecked = "the sandbox did not turn the boat as the client reported";
+            }
+            String described = String.format(Locale.ROOT, "%s facing %.3f/%.3f (yaw/pitch) in a boat", use.action().description(), use.yRot(), use.xRot());
+            if (unchecked != null) {
+                this.tickPackets.notes.add("not checked: " + described + ", since " + unchecked);
+                continue;
+            }
+            float reportedYaw = movePacket.getYRot(player.getYRot());
+            float turnedYaw = riderYawAfterBoatTurn(player, boat, use.yRot());
+            float tolerance = RIDER_ROTATION_ULPS * Math.ulp(Math.max(Math.abs(reportedYaw), Math.abs(boat.getYRot())) + HALF_TURN_DEGREES);
+            if (Math.abs(turnedYaw - reportedYaw) > tolerance) {
+                this.reject(use.action(), Check.HITBOX, String.format(Locale.ROOT, "%s, which the boat turns to a yaw of %.3f, where the client reported %.3f",
+                        described, turnedYaw, reportedYaw));
+            }
+        }
+        this.riderUses.clear();
+    }
+
+    // - The yaw AbstractBoat.positionRider turns the player to from this yaw, run on the boat and the player as the -
+    // - tick left them. Everything positionRider changes on the player is put back afterwards: its yaw, the head and -
+    // - body yaw, and its position, which a piston may have moved after the boat positioned it -
+    private static float riderYawAfterBoatTurn(SandboxPlayer player, AbstractBoat boat, float yaw) {
+        float yRot = player.getYRot();
+        float yHeadRot = player.getYHeadRot();
+        float yBodyRot = player.yBodyRot;
+        Vec3 position = player.position();
+        player.setYRot(yaw);
+        boat.positionRider(player);
+        float turned = player.getYRot();
+        player.setYRot(yRot);
+        player.setYHeadRot(yHeadRot);
+        player.setYBodyRot(yBodyRot);
+        player.setPos(position);
+        return turned;
+    }
+
+    // - MultiPlayerGameMode.piercingAttack, from Minecraft.startAttack: only while the attack key acts (see -
+    // - checkHandsFree), not as a spectator (who spectates instead), and with an enabled piercing weapon charged to its -
+    // - minimum attack charge -
+    private void checkStab(SandboxLevel level, SandboxPlayer player, CheckedAction action, KeyHandlingStart start) {
+        this.checkHandsFree(action, "attack", start);
+        if (this.gameMode.isSpectator()) {
+            this.reject(action, Check.INTERACTION, action.description() + " as a spectator, who spectates instead");
+        }
+        ItemStack weapon = player.getMainHandItem();
+        if (!weapon.isItemEnabled(level.enabledFeatures())) {
+            this.reject(action, Check.INTERACTION, action.description() + " with " + describeItem(weapon) + ", which the level's features do not enable");
+        } else if (!weapon.has(DataComponents.PIERCING_WEAPON)) {
+            this.reject(action, Check.INTERACTION, action.description() + " with " + describeItem(weapon) + ", which is no piercing weapon");
+        } else {
+            this.checkCharge(player, weapon, action);
+        }
+    }
+
+    // - Minecraft.handleKeybinds consumes the attack and use key clicks without acting while the player uses an item, -
+    // - and Minecraft.startAttack and startUseItem do nothing while paddling a boat keeps the player's hands busy -
+    private void checkHandsFree(CheckedAction action, String key, KeyHandlingStart start) {
+        if (start.usingItem()) {
+            this.reject(action, Check.INTERACTION, action.description() + " while using an item, when a vanilla client ignores the " + key + " key");
+        }
+        if (start.handsBusy()) {
+            this.reject(action, Check.INTERACTION, action.description() + " while paddling a boat, which keeps a vanilla client's hands busy");
+        }
+    }
+
+    // - Minecraft.startUseItem does nothing while the player breaks a block -
+    private void checkNotBreaking(CheckedAction action) {
+        if (this.gameMode.isDestroying()) {
+            this.reject(action, Check.INTERACTION, action.description() + " while breaking a block, when a vanilla client ignores the use key");
+        }
+    }
+
+    // - Minecraft.startUseItem tries the hands main hand first, and an item the level's features do not enable ends -
+    // - the key's handling -
+    private void checkItemsEnabled(SandboxLevel level, SandboxPlayer player, InteractionHand hand, CheckedAction action) {
+        for (InteractionHand tried : InteractionHand.values()) {
+            ItemStack held = player.getItemInHand(tried);
+            if (!held.isItemEnabled(level.enabledFeatures())) {
+                this.reject(action, Check.INTERACTION, action.description() + " while holding " + describeItem(held) + ", which the level's features do not enable");
+                return;
+            }
+            if (tried == hand) {
+                return;
+            }
+        }
+    }
+
+    private void rejectOutOfReach(CheckedAction action, double distance, double reach, String reacher) {
+        this.reject(action, Check.REACH, String.format(Locale.ROOT, "%s %.2f blocks away, beyond the %.2f blocks %s reaches",
+                action.description(), distance, reach, reacher));
     }
 
     // - The crosshair did not point at the target, although the target lay within reach: it is an entity the crosshair -
     // - never points at (EntitySelector.CAN_BE_PICKED), or the crosshair pointed at something in front of it or beside -
     // - it. The sight line reaches as far as the action does. Where the player rides a minecart that may have turned -
     // - it (see passengerTurnUnknown), the rotation the player acted with is unknown, and so is where the crosshair -
-    // - pointed -
-    private void rejectCrosshairMiss(String action, SandboxPlayer player, Entity target, KeyHandlingStart start, double reach) {
+    // - pointed; where the client may have broken a block on the sight line otherwise than the sandbox, so is what -
+    // - the crosshair met -
+    private void rejectCrosshairMiss(CheckedAction action, SandboxPlayer player, Entity target, KeyHandlingStart start, double reach) {
         if (passengerTurnUnknown(player)) {
-            this.tickPackets.notes.add("not checked: " + action + " with a rotation the minecart may have turned");
+            this.tickPackets.notes.add("not checked: " + action.description() + " with a rotation the minecart may have turned");
             return;
         }
         HitResult crosshair = start.crosshair();
         if (!EntitySelector.CAN_BE_PICKED.test(target)) {
-            this.tickPackets.reject(Check.HITBOX, action + ", which the crosshair never points at");
+            this.reject(action, Check.HITBOX, action.description() + ", which the crosshair never points at");
             return;
         }
         Vec3 eyes = start.camera().getEyePosition(TICK_PARTIAL_TICK);
         Vec3 sightEnd = eyes.add(start.camera().getViewVector(TICK_PARTIAL_TICK).scale(reach));
         boolean inSight = target.getBoundingBox().inflate(target.getPickRadius()).clip(eyes, sightEnd).isPresent();
+        String uncertainty = this.uncertainBreakOnSight(start);
         if (inSight && crosshair.getType() != HitResult.Type.MISS) {
-            this.tickPackets.reject(Check.HITBOX, action + " behind " + describeCrosshair(start) + ", which the crosshair pointed at");
+            this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + " behind " + describeCrosshair(start, false) + ", which the crosshair pointed at",
+                    uncertainty);
         } else {
-            this.tickPackets.reject(Check.HITBOX, action + ", which the crosshair did not point at: it pointed at " + describeCrosshair(start));
+            this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + ", which the crosshair did not point at: it pointed at "
+                    + describeCrosshair(start, false), uncertainty);
         }
     }
 
+    // - The action's block face was not one the crosshair pointed at: the block lay out of the player's block -
+    // - interaction range (Player.isWithinBlockInteractionRange, which Minecraft.pick's reach matches), or within it but -
+    // - the crosshair pointed elsewhere, which is unknown in a minecart that may have turned the player (see -
+    // - passengerTurnUnknown) and where the client may have broken a block on the sight line otherwise than the -
+    // - sandbox -
+    private void rejectBlockMiss(CheckedAction action, SandboxPlayer player, BlockPos pos, KeyHandlingStart start, String face) {
+        if (!player.isWithinBlockInteractionRange(pos, 0.0)) {
+            this.rejectOutOfReach(action, Math.sqrt(new AABB(pos).distanceToSqr(player.getEyePosition())), player.blockInteractionRange(), "the player");
+        } else if (passengerTurnUnknown(player)) {
+            this.tickPackets.notes.add("not checked: " + action.description() + " with a rotation the minecart may have turned");
+        } else {
+            this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + " at " + face + ", which the crosshair did not point at: it pointed at "
+                    + describeCrosshair(start, true), this.uncertainBreakOnSight(start));
+        }
+    }
+
+    // - A block the client may have broken otherwise than the sandbox (SandboxGameMode.uncertainBreaks) on the -
+    // - camera's sight line as far as the pick looked, so that the client's crosshair may have met another block or -
+    // - entity than the sandbox's; null when there is none. A break takes a second half along (a door, a bed, a tall -
+    // - plant), which lies next to the block -
+    private @Nullable String uncertainBreakOnSight(KeyHandlingStart start) {
+        List<SandboxGameMode.UncertainBreak> uncertainBreaks = this.gameMode.uncertainBreaks();
+        if (uncertainBreaks.isEmpty()) {
+            return null;
+        }
+        Vec3 eyes = start.camera().getEyePosition(TICK_PARTIAL_TICK);
+        Vec3 sightEnd = eyes.add(start.camera().getViewVector(TICK_PARTIAL_TICK).scale(start.pickReach()));
+        for (SandboxGameMode.UncertainBreak uncertain : uncertainBreaks) {
+            AABB around = new AABB(uncertain.pos()).inflate(SECOND_HALF_REACH);
+            if (around.contains(eyes) || around.clip(eyes, sightEnd).isPresent()) {
+                return describeUncertainBreak(uncertain);
+            }
+        }
+        return null;
+    }
+
+    private static String describeUncertainBreak(SandboxGameMode.UncertainBreak uncertain) {
+        return "the client may have broken the block at " + uncertain.pos().toShortString() + " otherwise than the sandbox, starting with another hotbar item";
+    }
+
+    // - How far along the camera's sight line Minecraft.pick looks for a player holding out this item: as far as the -
+    // - block and entity interaction ranges reach, or the item's attack range (SandboxPlayer.raycastHitResult, -
+    // - AttackRange.getClosesetHit) -
+    private static double pickReach(SandboxPlayer player, ItemStack heldOut) {
+        double reach = Math.max(player.blockInteractionRange(), player.entityInteractionRange());
+        AttackRange attackRange = heldOut.get(DataComponents.ATTACK_RANGE);
+        return attackRange == null ? reach : Math.max(reach, attackRange.effectiveMaxRange(player) + attackRange.hitboxMargin());
+    }
+
+    // - The slot the tick's hotbar keys selected, when the key handling reported it after the tick's first packet (see -
+    // - performTickActions): the first report there, unless an action that reports the slot itself came before it, -
+    // - after which no vanilla client reports one (see checkHotbarReport); -1 when there is none -
+    private static int keyHandlingReport(List<Packet<?>> actions) {
+        for (int index = 0; index < actions.size(); index++) {
+            Packet<?> action = actions.get(index);
+            if (index > 0 && action instanceof ServerboundSetCarriedItemPacket) {
+                return index;
+            }
+            if (reportsCarriedItem(action)) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    // - The packets MultiPlayerGameMode sends right after ensureHasSentCarriedItem, which reports a slot the hotbar -
+    // - keys selected before them: dropping and releasing an item, stabbing, finishing or turning while breaking -
+    // - (continueDestroyBlock), attacking, interacting and using an item -
+    private static boolean reportsCarriedItem(Packet<?> packet) {
+        return switch (packet) {
+            case ServerboundPlayerActionPacket playerAction -> switch (playerAction.getAction()) {
+                case DROP_ITEM, DROP_ALL_ITEMS, RELEASE_USE_ITEM, STAB, STOP_DESTROY_BLOCK, CHANGE_DESTROY_DIRECTION -> true;
+                case START_DESTROY_BLOCK, ABORT_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND -> false;
+            };
+            case ServerboundAttackPacket ignored -> true;
+            case ServerboundInteractPacket ignored -> true;
+            case ServerboundUseItemOnPacket ignored -> true;
+            case ServerboundUseItemPacket ignored -> true;
+            default -> false;
+        };
+    }
+
+    // - A hotbar slot the tick reports after its first packet. Only the hotbar keys at the start of -
+    // - Minecraft.handleKeybinds change the slot during a tick, and the first action that reports it does so before -
+    // - itself (see reportsCarriedItem), so a vanilla client reports at most one slot there, and none after such an -
+    // - action -
+    private void checkHotbarReport(ServerboundSetCarriedItemPacket report, int index, long packet) {
+        if (index == 0) {
+            return;
+        }
+        List<Packet<?>> actions = this.tickPackets.actions;
+        String after = null;
+        for (int earlier = 0; earlier < index && after == null; earlier++) {
+            Packet<?> earlierAction = actions.get(earlier);
+            if (earlier > 0 && earlierAction instanceof ServerboundSetCarriedItemPacket earlierReport) {
+                after = "after it had reported slot " + (earlierReport.getSlot() + 1);
+            } else if (reportsCarriedItem(earlierAction)) {
+                after = "after its " + describeAction(earlierAction);
+            }
+        }
+        if (after != null) {
+            CheckedAction selection = new CheckedAction("selected hotbar slot " + (report.getSlot() + 1), packet, Flag.NO_PREDICTION);
+            this.reject(selection, Check.INTERACTION, selection.description() + " " + after + " in the same tick, when a vanilla client's hotbar keys only "
+                    + "change the slot before its actions");
+        }
+    }
+
+    private static String describeAction(Packet<?> action) {
+        return action instanceof ServerboundPlayerActionPacket playerAction
+                ? playerAction.getAction().name().toLowerCase(Locale.ROOT)
+                : action.type().id().getPath();
+    }
+
     // - What the crosshair pointed at, and with the item the client may have switched to already where that one -
-    // - picks differently -
-    private static String describeCrosshair(KeyHandlingStart start) {
+    // - picks differently; with the face of a block when it matters -
+    private static String describeCrosshair(KeyHandlingStart start, boolean withFace) {
         HitResult withSwitchedItem = start.crosshairWithSwitchedItem();
-        String pointedAt = describeHit(start.crosshair());
-        return withSwitchedItem == null ? pointedAt : pointedAt + " (with the item the client switched to: " + describeHit(withSwitchedItem) + ")";
+        String pointedAt = describeHit(start.crosshair(), withFace);
+        return withSwitchedItem == null ? pointedAt : pointedAt + " (with the item the client switched to: " + describeHit(withSwitchedItem, withFace) + ")";
     }
 
     private static String describeEntity(Entity entity) {
@@ -1819,11 +2307,17 @@ final class PlayConnection implements ClientContext {
         return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
     }
 
+    private static String describeBlock(SandboxLevel level, BlockPos pos) {
+        return BuiltInRegistries.BLOCK.getKey(level.getBlockState(pos).getBlock()) + " at " + pos.toShortString();
+    }
+
     // - What Minecraft.pick found -
-    private static String describeHit(HitResult hit) {
+    private static String describeHit(HitResult hit, boolean withFace) {
         return switch (hit) {
             case EntityHitResult entityHit -> describeEntity(entityHit.getEntity());
-            case BlockHitResult blockHit when hit.getType() == HitResult.Type.BLOCK -> "the block at " + blockHit.getBlockPos().toShortString();
+            case BlockHitResult blockHit when hit.getType() == HitResult.Type.BLOCK -> withFace
+                    ? "the " + blockHit.getDirection().getSerializedName() + " face of the block at " + blockHit.getBlockPos().toShortString()
+                    : "the block at " + blockHit.getBlockPos().toShortString();
             default -> "nothing within reach";
         };
     }
@@ -1906,10 +2400,12 @@ final class PlayConnection implements ClientContext {
     }
 
     // - Returns whether the action belongs to a swing, which then needs no further interpretation -
-    private boolean performPlayerAction(ServerboundPlayerActionPacket action, @Nullable Packet<?> next, SandboxLevel level, SandboxPlayer player) {
+    private boolean performPlayerAction(
+            ServerboundPlayerActionPacket action, @Nullable Packet<?> next, boolean keyHandlingSlotKnown, SandboxLevel level, SandboxPlayer player
+    ) {
         switch (action.getAction()) {
             case START_DESTROY_BLOCK -> {
-                this.gameMode.startDestroyBlock(level, player, action.getPos(), action.getSequence(), this.tickPackets);
+                this.gameMode.startDestroyBlock(level, player, action.getPos(), action.getSequence(), keyHandlingSlotKnown, this.tickPackets);
                 return true;
             }
             case STOP_DESTROY_BLOCK -> {
@@ -1947,10 +2443,49 @@ final class PlayConnection implements ClientContext {
         throw new IllegalArgumentException("Unknown player action " + action.getAction());
     }
 
-    private void collectOngoingUncertainties(List<String> uncertainties) {
+    // - What the sandbox cannot know about the tick's movement beyond the tick's own packets: the items, when they -
+    // - differ from the client's, and a block the client may have broken otherwise than the sandbox where the -
+    // - movement went past it, or where ending the prediction of its break may have put the client's player back -
+    // - (see SandboxGameMode.recentUncertainBreaks) -
+    private void collectOngoingUncertainties(
+            List<String> uncertainties, SandboxPlayer player, Vec3 positionBeforeTick, Entity vehicleBeforeTick, Vec3 vehiclePositionBeforeTick
+    ) {
         if (this.unknownInventoryMenu.isPresent()) {
             uncertainties.add("items differ from the client's");
         }
+        List<SandboxGameMode.UncertainBreak> uncertainBreaks = this.gameMode.recentUncertainBreaks();
+        this.gameMode.forgetAcknowledgedUncertainBreaks();
+        if (uncertainBreaks.isEmpty()) {
+            return;
+        }
+        AABB swept = this.tickSweep(player, positionBeforeTick, vehicleBeforeTick, vehiclePositionBeforeTick);
+        for (SandboxGameMode.UncertainBreak uncertain : uncertainBreaks) {
+            if (swept.intersects(new AABB(uncertain.pos()).inflate(SECOND_HALF_REACH))) {
+                uncertainties.add(describeUncertainBreak(uncertain));
+                return;
+            }
+        }
+    }
+
+    // - Where the player and the vehicle it rode went during the tick: their boxes before the tick, after the -
+    // - sandbox's tick and where the client reported them, grown by the blocks beside them that still change a -
+    // - movement -
+    private AABB tickSweep(SandboxPlayer player, Vec3 positionBeforeTick, Entity vehicleBeforeTick, Vec3 vehiclePositionBeforeTick) {
+        EntityDimensions dimensions = player.getDimensions(player.getPose());
+        AABB swept = player.getBoundingBox().minmax(dimensions.makeBoundingBox(positionBeforeTick));
+        ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
+        if (movePacket != null && movePacket.hasPosition()) {
+            swept = swept.minmax(dimensions.makeBoundingBox(movePacket.getX(0.0), movePacket.getY(0.0), movePacket.getZ(0.0)));
+        }
+        if (vehicleBeforeTick != player) {
+            EntityDimensions vehicleDimensions = vehicleBeforeTick.getDimensions(vehicleBeforeTick.getPose());
+            swept = swept.minmax(vehicleBeforeTick.getBoundingBox()).minmax(vehicleDimensions.makeBoundingBox(vehiclePositionBeforeTick));
+            ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
+            if (vehicleMove != null) {
+                swept = swept.minmax(vehicleDimensions.makeBoundingBox(vehicleMove.movingTo().position()));
+            }
+        }
+        return swept.inflate(MOVEMENT_BLOCK_REACH);
     }
 
     // - A tick the client did not simulate its player in; a rejected packet still makes it MISMATCHED -

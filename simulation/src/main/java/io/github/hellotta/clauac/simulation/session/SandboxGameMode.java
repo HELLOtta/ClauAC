@@ -8,7 +8,9 @@ import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.ints.IntSet;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
+import java.util.function.BooleanSupplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.component.DataComponents;
@@ -18,6 +20,7 @@ import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.AnvilMenu;
 import net.minecraft.world.inventory.CrafterMenu;
@@ -38,6 +41,7 @@ import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
+import org.jspecify.annotations.Nullable;
 
 // - Port of the client-only MultiPlayerGameMode: the local game mode and everything the client does on its own -
 // - when the player breaks, uses, attacks, interacts, clicks in a menu or drops an item. The client predicts the -
@@ -49,6 +53,7 @@ final class SandboxGameMode {
 
     // - MultiPlayerGameMode sets destroyDelay to 5 after a finished or creative break -
     private static final int DESTROY_DELAY_TICKS = 5;
+    private static final float PERCENT = 100.0F;
 
     private GameType localPlayerMode = GameType.DEFAULT_MODE;
     // - MultiPlayerGameMode's survival mining state -
@@ -57,6 +62,29 @@ final class SandboxGameMode {
     private ItemStack destroyingItem = ItemStack.EMPTY;
     private float destroyProgress;
     private int destroyDelay;
+    // - Whether destroyingItem is the item the client started breaking with, which a start does not always tell -
+    // - (see startDestroyBlock) until the client goes on breaking with the item it holds -
+    private boolean destroyingItemKnown = true;
+    // - Whether the mining state above is the client's. A start that another hotbar item would have ended at once -
+    // - where the sandbox's did not, or the other way round (see startDestroyBlock), leaves the client breaking -
+    // - another block than the sandbox, and so does a swing whose block the sandbox's crosshair may have missed (see -
+    // - swingAlone). The next start whose outcome is known, or the next finished break, tells the state again -
+    private boolean miningStateKnown = true;
+    // - Blocks the client may have broken otherwise than the sandbox (see startDestroyBlock) until the server -
+    // - acknowledged the start's prediction, and those it acknowledged since the client's last tick: ending a -
+    // - prediction may put the client's player back (SandboxLevel.syncBlockState), which shows in the next tick -
+    private final List<UncertainBreak> uncertainBreaks = new ArrayList<>();
+    private final List<UncertainBreak> acknowledgedUncertainBreaks = new ArrayList<>();
+
+    // - A block the client may have broken at once where the sandbox did not, or the other way round, with the -
+    // - prediction sequence of the start that did or did not break it -
+    record UncertainBreak(BlockPos pos, int sequence) {
+    }
+
+    // - What a start of breaking does with the item held: whether it breaks the block at once rather than start -
+    // - breaking it (in creative mode it always does), and whether that break changes the block (destroyBlock) -
+    private record StartOutcome(boolean breaksAtOnce, boolean changesBlock) {
+    }
 
     GameType localPlayerMode() {
         return this.localPlayerMode;
@@ -71,7 +99,41 @@ final class SandboxGameMode {
         return this.localPlayerMode == GameType.SPECTATOR;
     }
 
-    // - handleLogin creates a new MultiPlayerGameMode -
+    boolean miningStateKnown() {
+        return this.miningStateKnown;
+    }
+
+    // - The blocks the client may have broken otherwise than the sandbox whose start the server has not -
+    // - acknowledged yet -
+    List<UncertainBreak> uncertainBreaks() {
+        return this.uncertainBreaks;
+    }
+
+    // - Those and the ones the server acknowledged since the client's last tick -
+    List<UncertainBreak> recentUncertainBreaks() {
+        List<UncertainBreak> recent = new ArrayList<>(this.uncertainBreaks);
+        recent.addAll(this.acknowledgedUncertainBreaks);
+        return recent;
+    }
+
+    // - ClientboundBlockChangedAckPacket: the server acknowledged the predictions through this sequence, after which -
+    // - the client's blocks are the server's -
+    void onBlockChangedAck(int sequence) {
+        this.uncertainBreaks.removeIf(uncertain -> {
+            if (uncertain.sequence() > sequence) {
+                return false;
+            }
+            this.acknowledgedUncertainBreaks.add(uncertain);
+            return true;
+        });
+    }
+
+    // - A client tick was compared, with the acknowledged uncertain blocks in view -
+    void forgetAcknowledgedUncertainBreaks() {
+        this.acknowledgedUncertainBreaks.clear();
+    }
+
+    // - handleLogin creates a new MultiPlayerGameMode, and the new level's predictions start over -
     void reset() {
         this.localPlayerMode = GameType.DEFAULT_MODE;
         this.isDestroying = false;
@@ -79,6 +141,10 @@ final class SandboxGameMode {
         this.destroyingItem = ItemStack.EMPTY;
         this.destroyProgress = 0.0F;
         this.destroyDelay = 0;
+        this.destroyingItemKnown = true;
+        this.miningStateKnown = true;
+        this.uncertainBreaks.clear();
+        this.acknowledgedUncertainBreaks.clear();
     }
 
     void adjustPlayer(SandboxPlayer player) {
@@ -102,24 +168,12 @@ final class SandboxGameMode {
     }
 
     boolean destroyBlock(SandboxLevel level, SandboxPlayer player, BlockPos pos) {
-        if (player.blockActionRestricted(level, pos, this.localPlayerMode)) {
-            return false;
-        }
-
         BlockState oldState = level.getBlockState(pos);
-        if (!player.getMainHandItem().canDestroyBlock(oldState, level, pos, player)) {
+        if (!this.canDestroyBlock(level, player, pos, oldState)) {
             return false;
         }
 
         Block oldBlock = oldState.getBlock();
-        if (oldBlock instanceof GameMasterBlock && !player.canUseGameMasterBlocks()) {
-            return false;
-        }
-
-        if (oldState.isAir()) {
-            return false;
-        }
-
         oldBlock.playerWillDestroy(level, pos, oldState, player);
         FluidState fluidState = level.getFluidState(pos);
         boolean changed = level.setBlock(pos, fluidState.createLegacyBlock(), 11);
@@ -130,12 +184,40 @@ final class SandboxGameMode {
         return changed;
     }
 
+    // - The checks MultiPlayerGameMode.destroyBlock makes, in its order, before it changes anything -
+    private boolean canDestroyBlock(SandboxLevel level, SandboxPlayer player, BlockPos pos, BlockState state) {
+        if (player.blockActionRestricted(level, pos, this.localPlayerMode)) {
+            return false;
+        }
+
+        if (!player.getMainHandItem().canDestroyBlock(state, level, pos, player)) {
+            return false;
+        }
+
+        if (state.getBlock() instanceof GameMasterBlock && !player.canUseGameMasterBlocks()) {
+            return false;
+        }
+
+        return !state.isAir();
+    }
+
     // - START_DESTROY_BLOCK comes from MultiPlayerGameMode.startDestroyBlock, or from continueDestroyBlock in creative -
     // - mode, which predicts the same break. When the crosshair moved on while mining, the progress on the old block -
-    // - is still set here and keeps the new block from being attacked, as on the client -
-    void startDestroyBlock(SandboxLevel level, SandboxPlayer player, BlockPos pos, int sequence, ClientTickPackets packets) {
+    // - is still set here and keeps the new block from being attacked, as on the client. Minecraft.startAttack sends -
+    // - a start before the tick reports a hotbar key of the same key handling, as startDestroyBlock does not call -
+    // - ensureHasSentCarriedItem; unless itemKnown, the client may have started with any hotbar item, which a later -
+    // - tick reports, or no tick when the slot changed back before. Where another hotbar item would have broken the -
+    // - block at once and the sandbox's does not, or the other way round, the client's block is unknown until the -
+    // - server acknowledges the start, and where that decides whether the client starts breaking, so is its mining -
+    // - state -
+    void startDestroyBlock(SandboxLevel level, SandboxPlayer player, BlockPos pos, int sequence, boolean itemKnown, ClientTickPackets packets) {
         if (player.getAbilities().instabuild) {
-            predict(level, sequence, packets, () -> this.destroyBlock(level, player, pos));
+            predict(level, sequence, packets, () -> {
+                if (!itemKnown) {
+                    this.compareOtherHotbarItems(level, player, pos, level.getBlockState(pos), sequence);
+                }
+                this.destroyBlock(level, player, pos);
+            });
             this.destroyDelay = DESTROY_DELAY_TICKS;
             return;
         }
@@ -146,6 +228,7 @@ final class SandboxGameMode {
                 state.attack(level, pos, player);
             }
 
+            boolean miningOutcomeKnown = itemKnown || this.compareOtherHotbarItems(level, player, pos, state, sequence);
             if (notAir && state.getDestroyProgress(player, player.level(), pos) >= 1.0F) {
                 this.destroyBlock(level, player, pos);
             } else {
@@ -153,15 +236,71 @@ final class SandboxGameMode {
                 this.destroyBlockPos = pos;
                 this.destroyingItem = player.getMainHandItem();
                 this.destroyProgress = 0.0F;
+                this.destroyingItemKnown = itemKnown || !anyOtherHotbarItem(player, () -> true);
+                if (miningOutcomeKnown) {
+                    this.miningStateKnown = true;
+                }
+            }
+            if (!miningOutcomeKnown) {
+                this.miningStateKnown = false;
             }
         });
     }
 
-    // - STOP_DESTROY_BLOCK: continueDestroyBlock found the block broken -
-    void finishDestroyBlock(SandboxLevel level, SandboxPlayer player, BlockPos pos, int sequence, ClientTickPackets packets) {
-        if (!this.isDestroying || !pos.equals(this.destroyBlockPos)) {
-            packets.notes.add("the client finished breaking " + pos.toShortString() + " without having started it");
+    // - What the start does with the item the sandbox holds against every other hotbar item the client may have -
+    // - started with (see startDestroyBlock), which are the ones startDestroyBlock sends a start with: the game mode -
+    // - lets the player break the block with them (Player.blockActionRestricted). A difference in the block keeps the -
+    // - block unknown until the server acknowledges the start. Returns whether all agree on breaking it at once -
+    private boolean compareOtherHotbarItems(SandboxLevel level, SandboxPlayer player, BlockPos pos, BlockState state, int sequence) {
+        StartOutcome held = this.startOutcome(level, player, pos, state);
+        if (anyOtherHotbarItem(player, () -> !player.blockActionRestricted(level, pos, this.localPlayerMode)
+                && this.startOutcome(level, player, pos, state).changesBlock() != held.changesBlock())) {
+            this.uncertainBreaks.add(new UncertainBreak(pos.immutable(), sequence));
         }
+        return !anyOtherHotbarItem(player, () -> !player.blockActionRestricted(level, pos, this.localPlayerMode)
+                && this.startOutcome(level, player, pos, state).breaksAtOnce() != held.breaksAtOnce());
+    }
+
+    // - The state is the one the block had when the start began; destroyBlock checks the block as it is by then -
+    private StartOutcome startOutcome(SandboxLevel level, SandboxPlayer player, BlockPos pos, BlockState state) {
+        boolean breaksAtOnce = player.getAbilities().instabuild || !state.isAir() && state.getDestroyProgress(player, player.level(), pos) >= 1.0F;
+        return new StartOutcome(breaksAtOnce, breaksAtOnce && this.canDestroyBlock(level, player, pos, level.getBlockState(pos)));
+    }
+
+    // - Whether the test holds with any hotbar item other than the one held selected. Selecting a slot only sets the -
+    // - inventory's selected slot; the held slot is selected again afterwards -
+    private static boolean anyOtherHotbarItem(SandboxPlayer player, BooleanSupplier test) {
+        Inventory inventory = player.getInventory();
+        int selected = inventory.getSelectedSlot();
+        ItemStack held = inventory.getItem(selected);
+        try {
+            for (int slot = 0; slot < Inventory.getSelectionSize(); slot++) {
+                if (slot != selected && !ItemStack.isSameItemSameComponents(inventory.getItem(slot), held)) {
+                    inventory.setSelectedSlot(slot);
+                    if (test.getAsBoolean()) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } finally {
+            inventory.setSelectedSlot(selected);
+        }
+    }
+
+    // - Whether any hotbar item the client may have held makes the test true: the one held when itemKnown, otherwise -
+    // - any of them (see startDestroyBlock) -
+    static boolean anyPossibleItem(SandboxPlayer player, boolean itemKnown, BooleanSupplier test) {
+        return test.getAsBoolean() || !itemKnown && anyOtherHotbarItem(player, test);
+    }
+
+    // - STOP_DESTROY_BLOCK: continueDestroyBlock found the block broken (see whyNoFinish). The client was breaking this -
+    // - block with the item it holds, whatever the sandbox thought, and its mining state is known again -
+    void finishDestroyBlock(SandboxLevel level, SandboxPlayer player, BlockPos pos, int sequence, ClientTickPackets packets) {
+        this.destroyBlockPos = pos;
+        this.destroyingItem = player.getMainHandItem();
+        this.destroyingItemKnown = true;
+        this.miningStateKnown = true;
         this.isDestroying = false;
         predict(level, sequence, packets, () -> this.destroyBlock(level, player, pos));
         this.destroyProgress = 0.0F;
@@ -181,17 +320,31 @@ final class SandboxGameMode {
         }
     }
 
-    // - A swing (ServerboundPunchPacket) that no attack or block packet accompanied: Minecraft.startAttack missing, or -
-    // - Minecraft.continueAttack mining on. Which one it was is what the client's crosshair pointed at, which the -
-    // - sandbox computes the way Minecraft.pick does -
-    void swingAlone(SandboxLevel level, SandboxPlayer player, HitResult hitResult) {
+    // - A swing (ServerboundPunchPacket) that no attack or block packet accompanied. Minecraft.startAttack sends one -
+    // - after every click that started nothing: on nothing (or air) it resets the attack strength ticker, on an -
+    // - entity out of a weapon's attack range or on a block it cannot or need not start breaking it does nothing. -
+    // - Minecraft.continueAttack sends one after continueDestroyBlock went on with the block the crosshair points at, -
+    // - once per tick and after everything else the key handling sends, so only a swing that ends the tick's actions -
+    // - can be that one (continuesBreaking): it counts down the delay after a break, or adds the tick's share of the -
+    // - breaking progress when that block is the one being broken with the same item, which shows the client started -
+    // - with the item it holds. What the client's crosshair pointed at is computed the way Minecraft.pick does; where -
+    // - the client may have seen another block (crosshairKnown), the mining state is no longer known -
+    void swingAlone(SandboxLevel level, SandboxPlayer player, HitResult hitResult, boolean continuesBreaking, boolean crosshairKnown) {
         if (hitResult instanceof BlockHitResult blockHit && hitResult.getType() == HitResult.Type.BLOCK && !level.getBlockState(blockHit.getBlockPos()).isAir()) {
+            if (!continuesBreaking) {
+                return;
+            }
+            if (!crosshairKnown) {
+                this.miningStateKnown = false;
+            }
             // - continueDestroyBlock -
             if (this.destroyDelay > 0) {
                 this.destroyDelay--;
             } else if (this.sameDestroyTarget(player, blockHit.getBlockPos())) {
                 BlockState state = level.getBlockState(blockHit.getBlockPos());
                 this.destroyProgress = this.destroyProgress + state.getDestroyProgress(player, player.level(), blockHit.getBlockPos());
+                this.destroyingItem = player.getMainHandItem();
+                this.destroyingItemKnown = true;
             }
         } else if (hitResult.getType() != HitResult.Type.ENTITY) {
             // - startAttack on nothing; an entity out of a weapon's attack range is not attacked and not reset -
@@ -199,9 +352,43 @@ final class SandboxGameMode {
         }
     }
 
-    private boolean sameDestroyTarget(SandboxPlayer player, BlockPos pos) {
+    // - MultiPlayerGameMode.sameDestroyTarget, which does not ask whether the client is still breaking: after a -
+    // - finished break the client goes on breaking a block that comes back at the same place without starting anew. -
+    // - Any item may be the one the client started with while that is unknown -
+    boolean sameDestroyTarget(SandboxPlayer player, BlockPos pos) {
         ItemStack selected = player.getMainHandItem();
-        return this.isDestroying && pos.equals(this.destroyBlockPos) && ItemStack.isSameItemSameComponents(selected, this.destroyingItem);
+        return pos.equals(this.destroyBlockPos) && (!this.destroyingItemKnown || ItemStack.isSameItemSameComponents(selected, this.destroyingItem));
+    }
+
+    // - Why MultiPlayerGameMode.continueDestroyBlock could not have finished breaking the block at pos now, the only -
+    // - place STOP_DESTROY_BLOCK comes from, or null when it could have. It counts down the delay after a finished or -
+    // - creative break first and breaks with START_DESTROY_BLOCK in creative mode inside the world border; otherwise -
+    // - it adds this tick's share of the breaking progress for the block it is breaking with the item it started with, -
+    // - and finishes once the progress reaches the whole block. A block that turned into air ends the breaking -
+    // - without a packet; the crosshair's check finds that one. Only meaningful while the mining state is known -
+    // - (miningStateKnown) -
+    @Nullable String whyNoFinish(SandboxLevel level, SandboxPlayer player, BlockPos pos) {
+        if (this.destroyDelay > 0) {
+            return "within " + DESTROY_DELAY_TICKS + " ticks of its previous break, which a vanilla client waits out";
+        }
+        if (player.getAbilities().instabuild && level.getWorldBorder().isWithinBounds(pos)) {
+            return "in creative mode, where a vanilla client breaks a block as it starts on it";
+        }
+        if (!pos.equals(this.destroyBlockPos)) {
+            return this.isDestroying ? "while it was breaking the block at " + this.destroyBlockPos.toShortString() : "which it had not started breaking";
+        }
+        if (this.destroyingItemKnown && !ItemStack.isSameItemSameComponents(player.getMainHandItem(), this.destroyingItem)) {
+            return "with another item than the one it started breaking it with";
+        }
+        BlockState state = level.getBlockState(pos);
+        if (state.isAir()) {
+            return null;
+        }
+        float progress = this.destroyProgress + state.getDestroyProgress(player, player.level(), pos);
+        if (progress >= 1.0F) {
+            return null;
+        }
+        return String.format(Locale.ROOT, "at %.1f%% of its breaking progress", progress * PERCENT);
     }
 
     void useItemOn(SandboxLevel level, SandboxPlayer player, InteractionHand hand, BlockHitResult blockHit, int sequence, ClientTickPackets packets) {

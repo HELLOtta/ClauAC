@@ -11,10 +11,9 @@ import org.slf4j.Logger;
 
 // - ClauAC's settings from config.yml: who gets alerts, how often and how they look, how long the client's packets -
 // - may wait for their check, and which checks alert and set back. A check of the actions does not move the player: -
-// - its setback keeps the failed tick's attacks and interactions from the server (see Check.concernsActions). Read -
-// - on the server thread when the plugin enables and on /clauac reload; the object never changes, so any thread may -
-// - read it. The config.yml in the plugin jar holds every default: Bukkit falls back to it for a missing or -
-// - unreadable value -
+// - its setback keeps the action that failed it from the server (see Check.concernsActions). Read on the server -
+// - thread when the plugin enables and on /clauac reload; the object never changes, so any thread may read it. The -
+// - config.yml in the plugin jar holds every default: Bukkit falls back to it for a missing or unreadable value -
 public record ClauACSettings(
         boolean alertsOnJoin, long alertIntervalNanos, String alertFormat, long maximumHoldNanos, Set<Check> alertedChecks, Set<Check> setbackChecks
 ) {

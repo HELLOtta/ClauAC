@@ -11,6 +11,7 @@ import com.github.retrooper.packetevents.protocol.player.User;
 import com.github.retrooper.packetevents.protocol.teleport.RelativeFlag;
 import com.github.retrooper.packetevents.util.Vector3d;
 import com.github.retrooper.packetevents.wrapper.PacketWrapper;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerAcknowledgeBlockChanges;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerBundle;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityVelocity;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPing;
@@ -55,9 +56,9 @@ import org.slf4j.Logger;
 // - in one go (ClientPacketListener.handleBundlePacket runs all its packets in one task on the client's main thread) -
 // - and answers the ping right there, so no client tick can fall between a packet and the ping behind it. -
 // -
-// - The client's movement, attacks and interactions with entities reach the server only once the simulation has -
-// - judged their tick (see TickHold). A tick whose attacks and interactions fail a check loses them. A tick -
-// - that is to be set back loses its movement, and so does every tick after it until the client has taken a -
+// - The client's movement and actions reach the server only once the simulation has judged their tick (see -
+// - TickHold). An action that fails a check never reaches it, and the client takes back what it predicted of it. A -
+// - tick that is to be set back loses its movement, and so does every tick after it until the client has taken a -
 // - correction: a teleport to where the server has the player, or, when it steers a vehicle, the vehicle's position -
 // - as the server has it (see Setbacks). The correction goes out in one of the connection's own bundles, so that -
 // - the pong to the ping behind it shows when the client has taken it. -
@@ -167,6 +168,7 @@ final class ConnectionSimulation {
     private volatile long vehicleCorrections;
     private volatile long serverTeleports;
     private volatile long setbacksSkipped;
+    private volatile long predictionsAcknowledged;
 
     private ConnectionSimulation(
             User user, Path reportDirectory, Logger logger, Responses responses, Setbacks setbacks, AtomicLong totalWaitingBytes, State state,
@@ -510,15 +512,15 @@ final class ConnectionSimulation {
     }
 
     // - The tick's packets go on to the server as far as the verdict allows, without their movement when the tick is -
-    // - set back and without its attacks and interactions when those are kept from the server. A tick that fails -
-    // - while a setback is under way needs no setback of its own when the client had not taken the correction yet -
-    // - before the tick: the correction on its way puts the client back anyway. After the correction, the simulation -
-    // - went on from where the correction put the player, so such a tick needs its own setback, which follows the -
-    // - current one. Attacks and interactions that went on unjudged already reached the server -
+    // - set back and without the actions that failed a check. A tick that fails while a setback is under way needs -
+    // - no setback of its own when the client had not taken the correction yet before the tick: the correction on -
+    // - its way puts the client back anyway. After the correction, the simulation went on from where the correction -
+    // - put the player, so such a tick needs its own setback, which follows the current one. Actions that went on -
+    // - unjudged already reached the server, which answers them itself -
     private void judge(ClientTickReport report, TickEnd end, TickResponse response) {
         boolean late = this.hold.wentOnUnjudged();
-        if (response.dropActions()) {
-            this.hold.dropActionsThrough(end.serverboundPackets());
+        if (!response.refusedActions().isEmpty()) {
+            this.refuse(response);
         }
         if (response.setBack()) {
             this.hold.dropMovementThrough(end.serverboundPackets());
@@ -529,6 +531,29 @@ final class ConnectionSimulation {
             }
         }
         this.hold.judged(end.serverboundPackets(), System.nanoTime());
+    }
+
+    // - Keeps the tick's failed actions from the server as far as they are still held; those that went on unjudged -
+    // - reached it, and it answers them itself. The client predicted what the kept ones do to blocks on its own and -
+    // - keeps that until the server acknowledges the prediction (MultiPlayerGameMode's block prediction sequence), -
+    // - which the server never does for an action it never received: the connection acknowledges the latest of their -
+    // - predictions in the server's stead, in one of its own bundles, and the client takes back what it predicted -
+    // - (ClientPacketListener.handleBlockChangedAck). The client uses up or changes the item of an interaction or item -
+    // - use on its own as well, so the server sends it its inventory once one of those is kept from it -
+    private void refuse(TickResponse response) {
+        TickHold.Refusal refusal = this.hold.refuse(response.refusedActions().keySet());
+        int acknowledgedSequence = Flag.NO_PREDICTION;
+        for (long packet : refusal.packets()) {
+            acknowledgedSequence = Math.max(acknowledgedSequence, response.refusedActions().get(packet));
+        }
+        if (acknowledgedSequence != Flag.NO_PREDICTION && this.user.getEncoderState() == ConnectionState.PLAY) {
+            this.writeCorrection(PacketType.Play.Server.ACKNOWLEDGE_BLOCK_CHANGES, new WrapperPlayServerAcknowledgeBlockChanges(acknowledgedSequence));
+            this.predictionsAcknowledged++;
+        }
+        TickReporter currentReporter = this.reporter;
+        if (refusal.itemRefused() && currentReporter != null) {
+            currentReporter.onInventoryResyncNeeded();
+        }
     }
 
     // - The client's movement stops reaching the server now, and the server thread decides how to put the client back -
@@ -616,7 +641,8 @@ final class ConnectionSimulation {
         return true;
     }
 
-    // - A correction goes into one of the connection's own bundles like any packet the simulation needs -
+    // - A correction goes into one of the connection's own bundles like any packet the simulation needs, so that the -
+    // - simulation sees where among the client's ticks the client took it -
     private void writeCorrection(PacketTypeCommon type, PacketWrapper<?> correction) {
         this.beforeWrite(type, true);
         this.writeOwnPacket(correction);
@@ -677,11 +703,11 @@ final class ConnectionSimulation {
         double averageMillis = held.releasedPackets() > 0L ? held.holdNanos() / NANOS_PER_MILLISECOND / held.releasedPackets() : 0.0;
         return String.format(Locale.ROOT,
                 "%s: %d packets held now, %d held so far for %.2f ms on average and at most %.1f ms, %d movement packets and "
-                        + "%d attacks and interactions kept from the server, %d times let go unjudged; %d setbacks: %d teleports, "
-                        + "%d vehicle corrections, %d teleports on the server, %d skipped",
+                        + "%d actions kept from the server, %d block predictions taken back, %d times let go unjudged; %d setbacks: "
+                        + "%d teleports, %d vehicle corrections, %d teleports on the server, %d skipped",
                 this.user.getName(), held.heldNow(), held.releasedPackets(), averageMillis, held.longestHoldNanos() / NANOS_PER_MILLISECOND,
-                held.droppedMovement(), held.droppedActions(), held.unjudgedReleases(), this.setbacksRequested, this.positionCorrections,
-                this.vehicleCorrections, this.serverTeleports, this.setbacksSkipped);
+                held.droppedMovement(), held.droppedActions(), this.predictionsAcknowledged, held.unjudgedReleases(), this.setbacksRequested,
+                this.positionCorrections, this.vehicleCorrections, this.serverTeleports, this.setbacksSkipped);
     }
 
     private void keepWaiting(WaitingPacket packet) {

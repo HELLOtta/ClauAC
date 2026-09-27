@@ -431,7 +431,7 @@ public final class ClientSession implements PlayerSimulation {
             // - What the client did during a tick with its keys and mouse; replayed at the tick's end -
             case ServerboundSetCarriedItemPacket _, ServerboundPlayerActionPacket _, ServerboundUseItemOnPacket _, ServerboundUseItemPacket _,
                  ServerboundAttackPacket _, ServerboundInteractPacket _, ServerboundPunchPacket _ ->
-                    this.requirePlay().tickPackets().actions.add(packet);
+                    this.requirePlay().tickPackets().addAction(packet, this.serverboundPackets);
             // - What the client did on a screen, between its ticks -
             case ServerboundContainerClickPacket click -> this.requirePlay().onContainerClick(click);
             case ServerboundContainerClosePacket close -> this.requirePlay().onContainerClose(close.getContainerId());
