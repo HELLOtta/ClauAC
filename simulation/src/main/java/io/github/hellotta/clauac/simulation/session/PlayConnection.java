@@ -170,6 +170,7 @@ final class PlayConnection implements ClientContext {
     // - ClientPacketListener.decoratedHashOpsGenerator, which hashes items for container clicks -
     private final HashedPatchMap.HashGenerator hashGenerator;
     private final Runnable inventoryResyncRequest;
+    private final ProblemLog problemLog;
     private final SandboxClockManager clockManager = new SandboxClockManager();
     private final Scoreboard scoreboard = new Scoreboard();
     private final Map<UUID, SandboxPlayerInfo> playerInfoMap = new HashMap<>();
@@ -201,11 +202,14 @@ final class PlayConnection implements ClientContext {
     private final ClientTickPackets tickPackets = new ClientTickPackets();
     private final LastSentState lastSent = new LastSentState();
 
-    PlayConnection(GameProfile localGameProfile, ReceivedRegistries registries, FeatureFlagSet enabledFeatures, Runnable inventoryResyncRequest) {
+    PlayConnection(
+            GameProfile localGameProfile, ReceivedRegistries registries, FeatureFlagSet enabledFeatures, Runnable inventoryResyncRequest, ProblemLog problemLog
+    ) {
         this.localGameProfile = localGameProfile;
         this.registries = registries;
         this.enabledFeatures = enabledFeatures;
         this.inventoryResyncRequest = inventoryResyncRequest;
+        this.problemLog = problemLog;
         RegistryOps<HashCode> hashOps = registries.access().createSerializationContext(HashOps.CRC32C_INSTANCE);
         this.hashGenerator = component -> component.encodeValue(hashOps)
                 .getOrThrow(message -> new IllegalArgumentException("Failed to hash " + component + ": " + message))
@@ -804,16 +808,48 @@ final class PlayConnection implements ClientContext {
     }
 
     // - Minecraft.tick for one client tick, then the comparison of LocalPlayer.sendChanges with what the client sent. -
-    // - Returns the reports that are final, in the order of the client's ticks: a report may be held back for one tick -
+    // - Returns the reports that are final, in the order of the client's ticks: a report may be held back for one tick. -
+    // - A failure of the simulation makes the tick MISMATCHED instead of ending the simulation, so that no packet a -
+    // - client sends can switch it off -
     List<ClientTickReport> tick(long clientTick) {
+        List<ClientTickReport> reports = new ArrayList<>(2);
+        try {
+            ClientTickReport report = this.simulateTick(clientTick, reports);
+            if (report != null) {
+                reports.add(report);
+            }
+        } catch (RuntimeException problem) {
+            this.problemLog.log("failed to simulate client tick " + clientTick, problem);
+            reports.add(this.failedTick(clientTick, problem));
+        }
+        // - ClientLevel.tick, after the player sent its movement; a failure here shows in the next tick -
+        String levelTickFailure = null;
+        SandboxLevel tickLevel = this.level;
+        if (tickLevel != null) {
+            try {
+                tickLevel.tick();
+            } catch (RuntimeException problem) {
+                this.problemLog.log("failed to tick its level after client tick " + clientTick, problem);
+                levelTickFailure = "the level's tick after the previous client tick failed (" + problem + ")";
+            }
+        }
+        this.tickPackets.reset();
+        if (levelTickFailure != null) {
+            this.tickPackets.rejections.add(levelTickFailure);
+        }
+        return reports;
+    }
+
+    // - Everything of a client tick up to the comparison. Returns the tick's report, or null when it is held back; a -
+    // - report released from the previous tick goes to reports first -
+    private @Nullable ClientTickReport simulateTick(long clientTick, List<ClientTickReport> reports) {
         Input reportedKeys = this.lastSent.input;
         boolean reportedSprinting = this.lastSent.sprinting;
         SandboxLevel tickLevel = this.level;
         SandboxPlayer tickPlayer = this.player;
         if (tickLevel == null || tickPlayer == null) {
-            throw new IllegalStateException("The client ended a tick before it joined a level");
+            throw new IllegalStateException("the client ended a tick before it joined a level, which a vanilla client never does");
         }
-        List<ClientTickReport> reports = new ArrayList<>(2);
         this.releaseHeldReport(tickPlayer, reports);
         tickLevel.tickRateManager().tick();
         // - The rotation of the whole tick, which the client's key and mouse actions already used -
@@ -830,37 +866,73 @@ final class PlayConnection implements ClientContext {
             tickLevel.tickBlockEntities();
             List<String> notes = new ArrayList<>(this.tickPackets.notes);
             notes.add(this.clientLoaded ? "player removed" : "client has not loaded the level");
-            reports.add(this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes));
-        } else if (tickPlayer.isPassenger()) {
+            return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
+        }
+        if (tickPlayer.isPassenger()) {
             tickLevel.tickEntities();
             tickLevel.tickBlockEntities();
             this.followReportedVehicle(tickPlayer);
             this.positionNeedsResync = true;
             List<String> notes = new ArrayList<>(this.tickPackets.notes);
             notes.add("riding " + tickPlayer.getRootVehicle().typeHolder().getRegisteredName());
-            reports.add(this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes));
-        } else {
-            List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
-            this.collectOngoingUncertainties(uncertainties);
-            // - LivingEntity.updatingUsingItem, at the start of the player's tick, stops the use once the used hand -
-            // - holds another item -
-            ItemStack usedMainHandItem = tickPlayer.isUsingItem() && tickPlayer.getUsedItemHand() == InteractionHand.MAIN_HAND
-                    ? tickPlayer.getUseItem().copy()
-                    : ItemStack.EMPTY;
-            Vec3 positionBeforeTick = tickPlayer.position();
-            tickLevel.tickEntities();
-            tickLevel.tickBlockEntities();
-            ClientTickReport report = this.compareWithClient(clientTick, tickPlayer, positionBeforeTick, reportedSprinting, uncertainties, new ArrayList<>(this.tickPackets.notes));
-            if (report.outcome() == TickOutcome.MISMATCHED && !usedMainHandItem.isEmpty()) {
-                this.heldReport = report;
-                this.heldReportUsedItem = usedMainHandItem;
-            } else {
-                reports.add(report);
-            }
+            return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
         }
-        tickLevel.tick();
-        this.tickPackets.reset();
-        return reports;
+        List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
+        this.collectOngoingUncertainties(uncertainties);
+        // - LivingEntity.updatingUsingItem, at the start of the player's tick, stops the use once the used hand holds -
+        // - another item -
+        ItemStack usedMainHandItem = tickPlayer.isUsingItem() && tickPlayer.getUsedItemHand() == InteractionHand.MAIN_HAND
+                ? tickPlayer.getUseItem().copy()
+                : ItemStack.EMPTY;
+        Vec3 positionBeforeTick = tickPlayer.position();
+        tickLevel.tickEntities();
+        tickLevel.tickBlockEntities();
+        ClientTickReport report = this.compareWithClient(clientTick, tickPlayer, positionBeforeTick, reportedSprinting, uncertainties, new ArrayList<>(this.tickPackets.notes));
+        if (report.outcome() == TickOutcome.MISMATCHED && this.tickPackets.rejections.isEmpty() && !usedMainHandItem.isEmpty()) {
+            this.heldReport = report;
+            this.heldReportUsedItem = usedMainHandItem;
+            return null;
+        }
+        return report;
+    }
+
+    // - A tick whose simulation failed partway. Nothing the client sent can be checked any more, so the tick is -
+    // - MISMATCHED, and the sandbox takes over what the client reported, as after a mismatch, so that the next tick -
+    // - starts from where the client is -
+    private ClientTickReport failedTick(long clientTick, RuntimeException problem) {
+        ClientTickPackets packets = this.tickPackets;
+        ReportedState reported = this.reportedState();
+        boolean reportedSprinting = this.lastSent.sprinting;
+        List<String> rejections = new ArrayList<>(packets.rejections);
+        rejections.add("the simulation of this tick failed (" + problem + ")");
+        List<String> notes = new ArrayList<>(packets.notes);
+        notes.add("rejected: " + String.join(", ", rejections));
+        double predictedX = Double.NaN;
+        double predictedY = Double.NaN;
+        double predictedZ = Double.NaN;
+        boolean predictedOnGround = false;
+        boolean predictedHorizontalCollision = false;
+        boolean predictedSprinting = false;
+        SandboxPlayer failedPlayer = this.player;
+        if (failedPlayer != null) {
+            predictedX = failedPlayer.getX();
+            predictedY = failedPlayer.getY();
+            predictedZ = failedPlayer.getZ();
+            predictedOnGround = failedPlayer.onGround();
+            predictedHorizontalCollision = failedPlayer.horizontalCollision;
+            predictedSprinting = failedPlayer.isSprinting();
+            adoptReportedState(failedPlayer, reported, reportedSprinting, packets);
+        }
+        if (this.isCameraOnPlayer()) {
+            this.lastSent.positionReminder++;
+        }
+        this.advanceLastSent(reported);
+        return new ClientTickReport(
+                clientTick, TickOutcome.MISMATCHED,
+                predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
+                reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
+                Double.NaN, notes
+        );
     }
 
     // - The first thing the client does in a tick is MultiPlayerGameMode.tick, which reports the hotbar slot once it -
@@ -906,7 +978,8 @@ final class PlayConnection implements ClientContext {
         return held;
     }
 
-    // - Replays Minecraft.handleKeybinds and MultiPlayerGameMode.tick for this tick from the packets they sent -
+    // - Replays Minecraft.handleKeybinds and MultiPlayerGameMode.tick for this tick from the packets they sent. An -
+    // - action the sandbox's vanilla code cannot perform is rejected, and the others go on -
     private void performTickActions(SandboxLevel level, SandboxPlayer player) {
         List<Packet<?>> actions = this.tickPackets.actions;
         if (actions.isEmpty()) {
@@ -919,54 +992,74 @@ final class PlayConnection implements ClientContext {
         boolean swingAccompanied = false;
         for (int index = 0; index < actions.size(); index++) {
             Packet<?> action = actions.get(index);
-            switch (action) {
-                case ServerboundSetCarriedItemPacket carriedItem -> this.selectHotbarSlot(player, carriedItem.getSlot(), carriedItem == leadingSwitch);
-                case ServerboundPlayerActionPacket playerAction -> {
-                    Packet<?> next = index + 1 < actions.size() ? actions.get(index + 1) : null;
-                    swingAccompanied |= this.performPlayerAction(playerAction, next, level, player);
-                }
-                case ServerboundUseItemOnPacket useItemOn ->
-                        this.gameMode.useItemOn(level, player, useItemOn.hand(), useItemOn.hitResult(), useItemOn.sequence(), this.tickPackets);
-                case ServerboundUseItemPacket useItem -> {
-                    player.setYRot(useItem.yRot());
-                    player.setXRot(useItem.xRot());
-                    this.gameMode.useItem(level, player, useItem.hand(), useItem.sequence(), this.tickPackets);
-                }
-                case ServerboundAttackPacket attack -> {
-                    Entity target = level.getEntity(attack.entityId());
-                    if (target == null) {
-                        this.tickPackets.uncertainties.add("attacked an entity the client knows but the sandbox does not");
-                    } else {
-                        if (player.attackDependsOnHotbarSwitchTiming()) {
-                            this.tickPackets.uncertainties.add("attack strength depends on when the client switched its hotbar slot");
-                        }
-                        this.gameMode.attack(player, target);
-                    }
-                    swingAccompanied = true;
-                }
-                case ServerboundInteractPacket interact -> {
-                    Entity target = level.getEntity(interact.entityId());
-                    if (target == null) {
-                        this.tickPackets.uncertainties.add("interacted with an entity the client knows but the sandbox does not");
-                    } else {
-                        this.gameMode.interact(player, target, interact.hand(), interact.location());
-                    }
-                }
-                case ServerboundPunchPacket ignored -> {
-                    if (!swingAccompanied) {
-                        this.gameMode.swingAlone(level, player, crosshair);
-                    }
-                    swingAccompanied = false;
-                }
-                default -> throw new IllegalArgumentException("No handler for the action " + action.type());
+            try {
+                swingAccompanied = this.performTickAction(action, index, leadingSwitch, crosshair, swingAccompanied, level, player);
+            } catch (RuntimeException problem) {
+                this.problemLog.log("rejected " + action.type() + " replayed at the end of a client tick", problem);
+                this.tickPackets.rejections.add(action.type() + " could not be performed (" + problem + ")");
             }
         }
+    }
+
+    // - Performs one action of the tick; returns whether a swing that follows is part of an attack or a block action -
+    private boolean performTickAction(
+            Packet<?> action,
+            int index,
+            @Nullable ServerboundSetCarriedItemPacket leadingSwitch,
+            HitResult crosshair,
+            boolean swingAccompanied,
+            SandboxLevel level,
+            SandboxPlayer player
+    ) {
+        List<Packet<?>> actions = this.tickPackets.actions;
+        switch (action) {
+            case ServerboundSetCarriedItemPacket carriedItem -> this.selectHotbarSlot(player, carriedItem.getSlot(), carriedItem == leadingSwitch);
+            case ServerboundPlayerActionPacket playerAction -> {
+                Packet<?> next = index + 1 < actions.size() ? actions.get(index + 1) : null;
+                return this.performPlayerAction(playerAction, next, level, player) || swingAccompanied;
+            }
+            case ServerboundUseItemOnPacket useItemOn ->
+                    this.gameMode.useItemOn(level, player, useItemOn.hand(), useItemOn.hitResult(), useItemOn.sequence(), this.tickPackets);
+            case ServerboundUseItemPacket useItem -> {
+                player.setYRot(useItem.yRot());
+                player.setXRot(useItem.xRot());
+                this.gameMode.useItem(level, player, useItem.hand(), useItem.sequence(), this.tickPackets);
+            }
+            case ServerboundAttackPacket attack -> {
+                Entity target = level.getEntity(attack.entityId());
+                if (target == null) {
+                    this.tickPackets.uncertainties.add("attacked an entity the client knows but the sandbox does not");
+                } else {
+                    if (player.attackDependsOnHotbarSwitchTiming()) {
+                        this.tickPackets.uncertainties.add("attack strength depends on when the client switched its hotbar slot");
+                    }
+                    this.gameMode.attack(player, target);
+                }
+                return true;
+            }
+            case ServerboundInteractPacket interact -> {
+                Entity target = level.getEntity(interact.entityId());
+                if (target == null) {
+                    this.tickPackets.uncertainties.add("interacted with an entity the client knows but the sandbox does not");
+                } else {
+                    this.gameMode.interact(player, target, interact.hand(), interact.location());
+                }
+            }
+            case ServerboundPunchPacket ignored -> {
+                if (!swingAccompanied) {
+                    this.gameMode.swingAlone(level, player, crosshair);
+                }
+                return false;
+            }
+            default -> throw new IllegalArgumentException("No handler for the action " + action.type());
+        }
+        return swingAccompanied;
     }
 
     // - The server ignores a slot outside the hotbar, which a vanilla client never selects -
     private void selectHotbarSlot(SandboxPlayer player, int slot, boolean mayHaveChangedEarlier) {
         if (!Inventory.isHotbarSlot(slot)) {
-            this.tickPackets.notes.add("the client selected hotbar slot " + slot + ", which does not exist");
+            this.tickPackets.rejections.add("the client selected hotbar slot " + slot + ", which does not exist");
             return;
         }
         player.getInventory().setSelectedSlot(slot);
@@ -1039,20 +1132,62 @@ final class PlayConnection implements ClientContext {
         }
     }
 
+    // - A tick the client did not simulate its player in; a rejected packet still makes it MISMATCHED -
     private ClientTickReport notSimulated(long clientTick, SandboxPlayer tickPlayer, boolean reportedSprinting, List<String> notes) {
-        ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
-        boolean positionReported = movePacket != null && movePacket.hasPosition();
-        double reportedX = positionReported ? movePacket.getX(0.0) : this.lastSent.x;
-        double reportedY = positionReported ? movePacket.getY(0.0) : this.lastSent.y;
-        double reportedZ = positionReported ? movePacket.getZ(0.0) : this.lastSent.z;
-        boolean reportedOnGround = movePacket != null ? movePacket.isOnGround() : this.lastSent.onGround;
-        boolean reportedHorizontalCollision = movePacket != null ? movePacket.horizontalCollision() : this.lastSent.horizontalCollision;
+        ReportedState reported = this.reportedState();
+        Set<String> rejections = this.tickPackets.rejections;
+        if (!rejections.isEmpty()) {
+            notes.add("rejected: " + String.join(", ", rejections));
+        }
         return new ClientTickReport(
-                clientTick, TickOutcome.NOT_SIMULATED,
+                clientTick, rejections.isEmpty() ? TickOutcome.NOT_SIMULATED : TickOutcome.MISMATCHED,
                 tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), tickPlayer.onGround(), tickPlayer.horizontalCollision, tickPlayer.isSprinting(),
-                positionReported, reportedX, reportedY, reportedZ, reportedOnGround, reportedHorizontalCollision, reportedSprinting,
+                reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
                 Double.NaN, notes
         );
+    }
+
+    // - What the client reported for the tick: the values of its movement packet, or what it sent last when it sent -
+    // - none this tick -
+    private record ReportedState(boolean positionReported, double x, double y, double z, boolean onGround, boolean horizontalCollision) {
+    }
+
+    private ReportedState reportedState() {
+        ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
+        boolean positionReported = movePacket != null && movePacket.hasPosition();
+        return new ReportedState(
+                positionReported,
+                positionReported ? movePacket.getX(0.0) : this.lastSent.x,
+                positionReported ? movePacket.getY(0.0) : this.lastSent.y,
+                positionReported ? movePacket.getZ(0.0) : this.lastSent.z,
+                movePacket != null ? movePacket.isOnGround() : this.lastSent.onGround,
+                movePacket != null ? movePacket.horizontalCollision() : this.lastSent.horizontalCollision
+        );
+    }
+
+    // - Advances the mirror of LocalPlayer's last sent state with what the client actually sent -
+    private void advanceLastSent(ReportedState reported) {
+        if (this.isCameraOnPlayer()) {
+            if (reported.positionReported()) {
+                this.lastSent.x = reported.x();
+                this.lastSent.y = reported.y();
+                this.lastSent.z = reported.z();
+                this.lastSent.positionReminder = 0;
+            }
+            this.lastSent.onGround = reported.onGround();
+            this.lastSent.horizontalCollision = reported.horizontalCollision();
+        }
+    }
+
+    // - Continues from the client's state after a tick whose result differs from the client's -
+    private static void adoptReportedState(SandboxPlayer player, ReportedState reported, boolean reportedSprinting, ClientTickPackets packets) {
+        player.setPos(reported.x(), reported.y(), reported.z());
+        player.setOnGround(reported.onGround());
+        player.horizontalCollision = reported.horizontalCollision();
+        player.setSprinting(reportedSprinting);
+        if (packets.abilitiesReported) {
+            player.getAbilities().flying = packets.reportedFlying;
+        }
     }
 
     // - Mirrors LocalPlayer.sendPosition for the simulated player and compares the result with what the client -
@@ -1062,7 +1197,6 @@ final class PlayConnection implements ClientContext {
             long clientTick, SandboxPlayer tickPlayer, Vec3 positionBeforeTick, boolean reportedSprinting, List<String> uncertainties, List<String> notes
     ) {
         ClientTickPackets packets = this.tickPackets;
-        ServerboundMovePlayerPacket movePacket = packets.movePacket;
         double predictedX = tickPlayer.getX();
         double predictedY = tickPlayer.getY();
         double predictedZ = tickPlayer.getZ();
@@ -1076,12 +1210,13 @@ final class PlayConnection implements ClientContext {
         boolean predictedPositionSent = sendsMovement
                 && (Mth.lengthSquared(predictedX - this.lastSent.x, predictedY - this.lastSent.y, predictedZ - this.lastSent.z) > Mth.square(MINIMUM_REPORTED_MOVEMENT)
                 || this.lastSent.positionReminder >= POSITION_REMINDER_INTERVAL);
-        boolean positionReported = movePacket != null && movePacket.hasPosition();
-        double reportedX = positionReported ? movePacket.getX(0.0) : this.lastSent.x;
-        double reportedY = positionReported ? movePacket.getY(0.0) : this.lastSent.y;
-        double reportedZ = positionReported ? movePacket.getZ(0.0) : this.lastSent.z;
-        boolean reportedOnGround = movePacket != null ? movePacket.isOnGround() : this.lastSent.onGround;
-        boolean reportedHorizontalCollision = movePacket != null ? movePacket.horizontalCollision() : this.lastSent.horizontalCollision;
+        ReportedState reported = this.reportedState();
+        boolean positionReported = reported.positionReported();
+        double reportedX = reported.x();
+        double reportedY = reported.y();
+        double reportedZ = reported.z();
+        boolean reportedOnGround = reported.onGround();
+        boolean reportedHorizontalCollision = reported.horizontalCollision();
         double offset = Math.sqrt(Mth.lengthSquared(predictedX - reportedX, predictedY - reportedY, predictedZ - reportedZ));
 
         if (predictedPositionSent != positionReported) {
@@ -1119,30 +1254,30 @@ final class PlayConnection implements ClientContext {
             uncertainties.add("the velocity estimated after the previous tick's unverified difference");
         }
 
-        // - Advance the mirror of LocalPlayer's last sent state with what the client actually sent -
-        if (sendsMovement) {
-            if (positionReported) {
-                this.lastSent.x = reportedX;
-                this.lastSent.y = reportedY;
-                this.lastSent.z = reportedZ;
-                this.lastSent.positionReminder = 0;
-            }
-            this.lastSent.onGround = reportedOnGround;
-            this.lastSent.horizontalCollision = reportedHorizontalCollision;
-        }
+        this.advanceLastSent(reported);
 
+        // - A rejected packet makes the tick MISMATCHED even when everything else matched: no uncertainty explains a -
+        // - packet no vanilla client sends -
+        boolean rejected = !packets.rejections.isEmpty();
         TickOutcome outcome;
-        if (differences.isEmpty()) {
+        if (differences.isEmpty() && !rejected) {
             outcome = TickOutcome.MATCHED;
             if (!uncertainties.isEmpty()) {
                 notes.add("matched despite: " + String.join(", ", uncertainties));
             }
         } else {
-            outcome = uncertainties.isEmpty() ? TickOutcome.MISMATCHED : TickOutcome.UNVERIFIED;
-            notes.add("differs in: " + String.join(", ", differences));
-            if (!uncertainties.isEmpty()) {
-                notes.add("not simulated: " + String.join(", ", uncertainties));
+            outcome = uncertainties.isEmpty() || rejected ? TickOutcome.MISMATCHED : TickOutcome.UNVERIFIED;
+            if (!differences.isEmpty()) {
+                notes.add("differs in: " + String.join(", ", differences));
             }
+            if (rejected) {
+                notes.add("rejected: " + String.join(", ", packets.rejections));
+            }
+            if (!uncertainties.isEmpty()) {
+                notes.add((differences.isEmpty() ? "matched despite: " : "not simulated: ") + String.join(", ", uncertainties));
+            }
+        }
+        if (!differences.isEmpty()) {
             // - Continue from the client's state -
             if (positionReported) {
                 correctHorizontalVelocity(tickPlayer, positionBeforeTick, new Vec3(reportedX, reportedY, reportedZ));
@@ -1150,13 +1285,7 @@ final class PlayConnection implements ClientContext {
                 this.estimatedAfterOffset = offset;
                 this.estimatedAfterOutcome = outcome;
             }
-            tickPlayer.setPos(reportedX, reportedY, reportedZ);
-            tickPlayer.setOnGround(reportedOnGround);
-            tickPlayer.horizontalCollision = reportedHorizontalCollision;
-            tickPlayer.setSprinting(reportedSprinting);
-            if (packets.abilitiesReported) {
-                tickPlayer.getAbilities().flying = packets.reportedFlying;
-            }
+            adoptReportedState(tickPlayer, reported, reportedSprinting, packets);
         }
         this.positionNeedsResync = false;
         this.ticksSinceVelocityEstimate = Math.min(this.ticksSinceVelocityEstimate + 1, VELOCITY_ESTIMATE_TICKS);

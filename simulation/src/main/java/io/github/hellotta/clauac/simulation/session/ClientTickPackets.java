@@ -32,6 +32,9 @@ final class ClientTickPackets {
     boolean predictedAbilitiesSent;
     boolean predictedFallFlyingStart;
     final Set<String> uncertainties = new LinkedHashSet<>();
+    // - What the sandbox rejected during this tick: packets no vanilla client sends in the sandbox's situation, and -
+    // - steps of the simulation that failed. Any of them makes the tick MISMATCHED, whatever the comparison finds -
+    final Set<String> rejections = new LinkedHashSet<>();
     final List<String> notes = new ArrayList<>();
 
     void reset() {
@@ -45,6 +48,7 @@ final class ClientTickPackets {
         this.predictedAbilitiesSent = false;
         this.predictedFallFlyingStart = false;
         this.uncertainties.clear();
+        this.rejections.clear();
         this.notes.clear();
     }
 }

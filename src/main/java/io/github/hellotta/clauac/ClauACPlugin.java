@@ -49,6 +49,7 @@ public final class ClauACPlugin extends JavaPlugin implements Listener {
         Objects.requireNonNull(this.runtimeLoading).whenComplete((loaded, failure) -> {
             if (failure != null) {
                 this.getSLF4JLogger().error("The vanilla runtime could not be started; no connection is simulated", failure);
+                simulationBridge.setRuntimeFailure("the vanilla runtime could not be started (" + failure + ")");
             } else {
                 simulationBridge.setRuntime(loaded.runtime());
             }

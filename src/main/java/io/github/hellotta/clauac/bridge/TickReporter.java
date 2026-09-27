@@ -40,6 +40,8 @@ final class TickReporter implements SimulationListener {
     private volatile boolean actionBarEnabled;
     private volatile boolean entityNearby;
     private final AtomicBoolean inventoryResyncRequested = new AtomicBoolean();
+    // - Why the simulation stopped, once it has -
+    private @Nullable String stopReason;
 
     TickReporter(User user, String playerName, Path csvFile, Logger logger) throws IOException {
         this.user = user;
@@ -156,18 +158,22 @@ final class TickReporter implements SimulationListener {
 
     @Override
     public void onSimulationFailure(String message, Throwable cause) {
+        synchronized (this) {
+            this.stopReason = message + ": " + cause;
+        }
         this.logger.error("Simulation of {} stopped: {}", this.playerName, message, cause);
     }
 
     synchronized String summary() {
         long total = this.outcomeCounts.values().stream().mapToLong(Long::longValue).sum();
-        return String.format(Locale.ROOT, "%s: %d client ticks, matched %d, mismatched %d (largest offset %.6f), unverified %d, not simulated %d",
+        String summary = String.format(Locale.ROOT, "%s: %d client ticks, matched %d, mismatched %d (largest offset %.6f), unverified %d, not simulated %d",
                 this.playerName, total,
                 this.outcomeCounts.getOrDefault(TickOutcome.MATCHED, 0L),
                 this.outcomeCounts.getOrDefault(TickOutcome.MISMATCHED, 0L),
                 this.largestMismatch,
                 this.outcomeCounts.getOrDefault(TickOutcome.UNVERIFIED, 0L),
                 this.outcomeCounts.getOrDefault(TickOutcome.NOT_SIMULATED, 0L));
+        return this.stopReason != null ? summary + ", stopped (" + this.stopReason + ")" : summary;
     }
 
     synchronized void close() {

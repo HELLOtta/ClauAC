@@ -71,9 +71,10 @@ the `simulation-api` package and the logging APIs (SLF4J, Log4j) are shared with
 On startup ClauAC takes the vanilla server bundler from Paperclip's cache (`cache/mojang_26.3.jar` in the server
 directory), or downloads it from Mojang when it is missing, verifies it against the hashes recorded at build time and
 extracts the server jar and its libraries to `plugins/ClauAC/runtime/`. The runtime then runs Minecraft's bootstrap on
-its own thread, which takes about 6-7 seconds; connections that start before it is ready are not simulated. The movement
-code the sandbox runs is the common code the client runs as well: in 26.3 it is identical between the client jar and
-the server jar.
+its own thread, which takes about 6-7 seconds. The packets of a connection that starts before it is ready are kept in
+order and handed to the simulation once it is, up to 32 MiB per connection and 256 MiB for all waiting connections
+together; a connection beyond either limit is not simulated. The movement code the sandbox runs is the common code the
+client runs as well: in 26.3 it is identical between the client jar and the server jar.
 
 The client-only parts the simulation depends on are ported from the client jar and cite their original class:
 `ClientLevel` (including its block prediction handling), `ClientChunkCache`, `LocalPlayer`, `KeyboardInput`,
@@ -89,8 +90,12 @@ The client processes the server's packets between its ticks, so the sandbox must
 tick the client applied it before. ClauAC keeps the server's packets pending until a packet from the client proves it
 processed them:
 
-- Every relevant play packet is followed by a ping, queued on the connection's event loop right behind it; the client
-  answers each ping with a pong when it processes it. One ping covers everything written before it.
+- Every relevant play packet goes to the client inside a bundle that ends with a ping. The client handles all packets
+  of a bundle in one go, in one task on its main thread (`ClientPacketListener.handleBundlePacket`), and answers the
+  ping right there, so none of its ticks can fall between a packet and the ping behind it. A bundle collects
+  everything the connection's event loop writes before it gets to end it; vanilla's own bundles become part of it.
+  The start of a configuration phase and a disconnect end the bundle before them: the client refuses the former inside
+  a bundle and would never handle the latter in a bundle the closed connection cannot end any more.
 - A teleport is answered with the teleport acceptance, a rotation packet with a rotation, and the start of a
   configuration phase with its acknowledgement.
 
@@ -114,7 +119,8 @@ Each client tick gets one outcome:
 | Outcome         | Meaning                                                                                    |
 |-----------------|--------------------------------------------------------------------------------------------|
 | `MATCHED`       | The simulation produced exactly what the client sent                                       |
-| `MISMATCHED`    | It did not, and nothing outside the simulation's reach was involved                        |
+| `MISMATCHED`    | It did not, and nothing outside the simulation's reach was involved; or the client sent a  |
+|                 | packet no vanilla client sends in that situation                                           |
 | `UNVERIFIED`    | It did not, but something the simulation cannot know was involved (see the notes)          |
 | `NOT_SIMULATED` | The client did not move its player (loading screen, dead, riding)                          |
 
@@ -124,6 +130,15 @@ Each client tick gets one outcome:
   inventory resend.
 - `/clauac debug` shows the outcome of every tick in your action bar, `/clauac status` summarises all connections
   (permission `clauac.admin`, operators by default).
+
+A packet from the client that the sandbox cannot decode or apply, or that no vanilla client sends in the situation
+the sandbox is in (a pong or a teleport acceptance for something the server never sent, a tick outside the play phase,
+a hotbar slot that does not exist), is rejected: its tick is `MISMATCHED` with the reason in the notes, and the
+simulation goes on, so that no packet can switch it off. An accepted teleport the server never sent tells nothing about
+where the client is and is not taken over. A failure of the simulation itself during a tick makes that tick
+`MISMATCHED` as well. Each distinct problem is logged once with its stack trace. A server packet the sandbox cannot
+apply would make the real client fail too, since the sandbox runs the client's own handlers; it stops the simulation
+of the connection, and `/clauac status` shows why.
 
 ### What the simulation cannot know
 
@@ -148,12 +163,10 @@ Known limits:
 - The client opens its own inventory screen without telling the server, and its creative inventory screen ignores
   cursor updates and keeps its own menu when the game mode changes. The sandbox cannot follow those; the differences
   show up in the next checked click and are resolved by the inventory resend.
-- A ping is queued right behind the packets it covers, but the client can still start a tick between receiving a
-  packet and receiving the ping behind it; the sandbox then applies that packet one tick late.
 - A relative rotation packet whose answer the client computed from a rotation the sandbox has not seen yet is applied
   at the next pong instead.
-- A packet no vanilla client sends can make the vanilla code in the sandbox fail. That stops the simulation of the
-  connection and is logged as an error, but nothing acts on it yet.
+- A connection that was already playing when ClauAC started watching it (after a plugin reload) is not simulated:
+  the simulation has to see a connection from its first configuration packet on.
 - Not verified yet: pistons moving blocks and entities, and equipment effects such as leather boots on powder snow.
 
 ### Verified so far

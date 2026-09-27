@@ -6,6 +6,7 @@ import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationListener;
+import io.github.hellotta.clauac.simulation.api.TickOutcome;
 import io.github.hellotta.clauac.simulation.registry.ConfigurationSession;
 import io.github.hellotta.clauac.simulation.registry.ReceivedRegistries;
 import io.github.hellotta.clauac.simulation.registry.ServerRegistryCache;
@@ -67,8 +68,10 @@ public final class ClientSession implements PlayerSimulation {
     private final SerialExecutor executor;
     private final ProtocolDecoders decoders = new ProtocolDecoders();
     private final PendingClientbound pending = new PendingClientbound();
-    // - Notes for the next tick report that arrive while no play connection exists -
+    private final ProblemLog problemLog;
+    // - Notes and rejections for the next tick report that arrive while no play connection exists -
     private final List<String> pendingNotes = new ArrayList<>();
+    private final List<String> pendingRejections = new ArrayList<>();
     private volatile boolean closed;
     private boolean failed;
     private ReceivedRegistries registries;
@@ -80,6 +83,7 @@ public final class ClientSession implements PlayerSimulation {
     public ClientSession(UUID profileId, String profileName, SimulationListener listener, ServerRegistryCache registryCache, Executor simulationThreads) {
         this.profile = new GameProfile(profileId, profileName);
         this.listener = listener;
+        this.problemLog = new ProblemLog(profileName);
         this.registryCache = registryCache;
         this.executor = new SerialExecutor(simulationThreads);
         this.registries = ConfigurationSession.initialRegistries();
@@ -104,6 +108,7 @@ public final class ClientSession implements PlayerSimulation {
         this.endPlay();
         this.pending.clear();
         this.pendingNotes.clear();
+        this.pendingRejections.clear();
         this.configuration = null;
     }
 
@@ -119,6 +124,10 @@ public final class ClientSession implements PlayerSimulation {
         }
     }
 
+    // - A packet from the client that the sandbox cannot decode or apply is one no vanilla client sends in the -
+    // - sandbox's situation: it is rejected, which makes its tick MISMATCHED, and the simulation goes on, so that such -
+    // - packets cannot switch it off. A server packet the sandbox cannot apply would make the real client fail as -
+    // - well, since the sandbox runs the client's own handlers; it stops the simulation -
     private void process(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket) {
         if (this.closed || this.failed) {
             return;
@@ -133,6 +142,11 @@ public final class ClientSession implements PlayerSimulation {
             }
         } catch (Throwable throwable) {
             String packetDescription = packet != null ? packet.type().toString() : phase + " " + direction + " packet id " + packetId(encodedPacket);
+            if (direction == PacketDirection.SERVERBOUND && throwable instanceof RuntimeException problem) {
+                this.problemLog.log("rejected " + packetDescription + " after client tick " + this.clientTick, problem);
+                this.reject(packetDescription + " could not be applied (" + problem + ")");
+                return;
+            }
             this.fail("Could not process " + packetDescription + " at client tick " + this.clientTick, throwable);
             if (throwable instanceof Error error) {
                 throw error;
@@ -168,6 +182,15 @@ public final class ClientSession implements PlayerSimulation {
         }
     }
 
+    // - Something the client sent that the sandbox rejected; it makes the next tick report MISMATCHED -
+    private void reject(String rejection) {
+        if (this.play != null) {
+            this.play.tickPackets().rejections.add(rejection);
+        } else {
+            this.pendingRejections.add(rejection);
+        }
+    }
+
     private void onClientbound(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket) {
         this.pending.add(new PendingClientbound.PendingPacket(phase, packet, encodedPacket));
         if (phase == ProtocolPhase.CONFIGURATION) {
@@ -183,16 +206,19 @@ public final class ClientSession implements PlayerSimulation {
         }
     }
 
-    // - Applies everything the client provably processed, up to and including the answered packet -
-    private void applyThrough(Predicate<Packet<?>> answeredPacket, String answer) {
+    // - Applies everything the client provably processed, up to and including the answered packet. Returns false -
+    // - when no pending packet is the answered one -
+    private boolean applyThrough(Predicate<Packet<?>> answeredPacket, String answer) {
         List<PendingClientbound.PendingPacket> released = this.pending.takeThrough(answeredPacket);
         if (released.isEmpty()) {
-            this.note("the client sent " + answer + " for a packet the server never sent");
-            return;
+            // - Every packet a client can answer reaches the sandbox, so a vanilla client never does this -
+            this.reject("the client sent " + answer + " for a packet the server never sent");
+            return false;
         }
         for (PendingClientbound.PendingPacket packet : released) {
             this.apply(packet);
         }
+        return true;
     }
 
     private void apply(PendingClientbound.PendingPacket released) {
@@ -244,9 +270,11 @@ public final class ClientSession implements PlayerSimulation {
         this.enabledFeatures = session.enabledFeatures();
         this.configuration = null;
         this.decoders.bindPlay(this.registries.access());
-        PlayConnection newPlay = new PlayConnection(this.profile, this.registries, this.enabledFeatures, this.listener::onInventoryResyncNeeded);
+        PlayConnection newPlay = new PlayConnection(this.profile, this.registries, this.enabledFeatures, this.listener::onInventoryResyncNeeded, this.problemLog);
         newPlay.tickPackets().notes.addAll(this.pendingNotes);
+        newPlay.tickPackets().rejections.addAll(this.pendingRejections);
         this.pendingNotes.clear();
+        this.pendingRejections.clear();
         this.play = newPlay;
     }
 
@@ -266,9 +294,11 @@ public final class ClientSession implements PlayerSimulation {
             case ServerboundPongPacket pong ->
                     this.applyThrough(pending -> pending instanceof ClientboundPingPacket ping && ping.getId() == pong.getId(), "pong " + pong.getId());
             case ServerboundAcceptTeleportationPacket accept -> {
-                this.applyThrough(pending -> pending instanceof ClientboundPlayerPositionPacket position && position.id() == accept.id(),
-                        "teleport acceptance " + accept.id());
-                this.requirePlay().verifyTeleportAnswer(accept);
+                // - The answer to a teleport the server never sent tells nothing about where the client is -
+                if (this.applyThrough(pending -> pending instanceof ClientboundPlayerPositionPacket position && position.id() == accept.id(),
+                        "teleport acceptance " + accept.id())) {
+                    this.requirePlay().verifyTeleportAnswer(accept);
+                }
             }
             case ServerboundConfigurationAcknowledgedPacket ignored -> {
                 this.applyThrough(pending -> pending instanceof ClientboundStartConfigurationPacket, "configuration acknowledgement");
@@ -328,10 +358,30 @@ public final class ClientSession implements PlayerSimulation {
     }
 
     private void endClientTick() {
-        PlayConnection connection = this.requirePlay();
         this.clientTick++;
+        PlayConnection connection = this.play;
+        if (connection == null) {
+            this.listener.onClientTick(this.tickOutsidePlay());
+            return;
+        }
         for (ClientTickReport report : connection.tick(this.clientTick)) {
             this.listener.onClientTick(report);
         }
+    }
+
+    // - A vanilla client only ends its ticks while it is in a level; there is nothing to simulate or compare -
+    private ClientTickReport tickOutsidePlay() {
+        List<String> rejections = new ArrayList<>(this.pendingRejections);
+        rejections.add("the client ended a tick outside the play phase, which a vanilla client never does");
+        List<String> notes = new ArrayList<>(this.pendingNotes);
+        notes.add("rejected: " + String.join(", ", rejections));
+        this.pendingNotes.clear();
+        this.pendingRejections.clear();
+        return new ClientTickReport(
+                this.clientTick, TickOutcome.MISMATCHED,
+                Double.NaN, Double.NaN, Double.NaN, false, false, false,
+                false, Double.NaN, Double.NaN, Double.NaN, false, false, false,
+                Double.NaN, notes
+        );
     }
 }
