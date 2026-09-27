@@ -2,7 +2,9 @@ package io.github.hellotta.clauac.simulation.session;
 
 import io.github.hellotta.clauac.simulation.api.Check;
 import io.github.hellotta.clauac.simulation.api.Flag;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.OptionalInt;
@@ -18,7 +20,10 @@ final class ClientTickPackets {
 
     // - The movement packet LocalPlayer.sendPosition sent; it is sent at most once per tick -
     @Nullable ServerboundMovePlayerPacket movePacket;
-    // - The vehicle position LocalPlayer.sendChanges sent while the player steers its vehicle -
+    // - The vehicle positions the client sent since the tick began, oldest first, without those that answered a -
+    // - correction of the vehicle (see takeCorrectionAnswer) -
+    private final Deque<ServerboundMoveVehiclePacket> vehicleMoves = new ArrayDeque<>();
+    // - The vehicle position LocalPlayer.sendChanges sent while the player steers its vehicle: the last of those -
     @Nullable ServerboundMoveVehiclePacket vehicleMove;
     // - What the client did with its keys and mouse during this tick (Minecraft.handleKeybinds and -
     // - MultiPlayerGameMode.tick), in order. These happen inside the tick, after the client processed the server's -
@@ -64,6 +69,22 @@ final class ClientTickPackets {
         this.actionPackets.add(packet);
     }
 
+    void addVehicleMove(ServerboundMoveVehiclePacket move) {
+        this.vehicleMoves.addLast(move);
+        this.vehicleMove = move;
+    }
+
+    // - The client answers a correction of the vehicle it steers right away with the vehicle's position -
+    // - (ClientPacketListener.handleMoveVehicle), while it handles the server's packets: before it answers the ping -
+    // - behind the correction and before the ticks it runs afterwards, each of which sends its own position after -
+    // - that. The answer is therefore the oldest vehicle position of the tick that did not answer an earlier -
+    // - correction. It is taken out of the tick's positions and returned; null when the client sent none -
+    @Nullable ServerboundMoveVehiclePacket takeCorrectionAnswer() {
+        ServerboundMoveVehiclePacket answer = this.vehicleMoves.pollFirst();
+        this.vehicleMove = this.vehicleMoves.peekLast();
+        return answer;
+    }
+
     // - The note that lists what was rejected -
     static String rejectionNote(Iterable<Flag> rejections) {
         List<String> details = new ArrayList<>();
@@ -75,6 +96,7 @@ final class ClientTickPackets {
 
     void reset() {
         this.movePacket = null;
+        this.vehicleMoves.clear();
         this.vehicleMove = null;
         this.actions.clear();
         this.actionPackets.clear();

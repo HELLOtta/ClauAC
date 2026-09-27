@@ -408,7 +408,7 @@ public final class ClientSession implements PlayerSimulation {
             case ServerboundMovePlayerPacket.Rot rotation when this.isRotationAnswer(rotation) ->
                     this.applyThrough(pending -> pending instanceof ClientboundPlayerRotationPacket, "rotation answer");
             case ServerboundMovePlayerPacket move -> this.requirePlay().tickPackets().movePacket = move;
-            case ServerboundMoveVehiclePacket vehicleMove -> this.requirePlay().tickPackets().vehicleMove = vehicleMove;
+            case ServerboundMoveVehiclePacket vehicleMove -> this.requirePlay().tickPackets().addVehicleMove(vehicleMove);
             case ServerboundPlayerInputPacket input -> this.requirePlay().onInputReported(input.input());
             case ServerboundPlayerCommandPacket command -> {
                 switch (command.getAction()) {

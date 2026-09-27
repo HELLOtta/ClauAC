@@ -482,7 +482,7 @@ final class PlayConnection implements ClientContext {
             case ClientboundUpdateAttributesPacket attributes -> EntityHandlers.handleUpdateAttributes(attributes, level);
             case ClientboundUpdateMobEffectPacket effect -> EntityHandlers.handleUpdateMobEffect(effect, level);
             case ClientboundRemoveMobEffectPacket effect -> EntityHandlers.handleRemoveMobEffect(effect, level);
-            case ClientboundMoveVehiclePacket moveVehicle -> EntityHandlers.handleMoveVehicle(moveVehicle, player);
+            case ClientboundMoveVehiclePacket moveVehicle -> this.checkVehicleCorrectionAnswer(EntityHandlers.handleMoveVehicle(moveVehicle, player));
             case ClientboundProjectilePowerPacket projectilePower -> EntityHandlers.handleProjectilePowerPacket(projectilePower, level);
             // - Inventory and menus -
             case ClientboundContainerSetContentPacket content -> this.handleContainerContent(content, player);
@@ -717,6 +717,43 @@ final class PlayConnection implements ClientContext {
             current.setPos(answer.x(), answer.y(), answer.z());
             current.setYRot(answer.yRot());
             current.setXRot(answer.xRot());
+        }
+    }
+
+    // - The client answered the server's correction of the vehicle it steers right away (see -
+    // - EntityHandlers.handleMoveVehicle, which gives the answer a vanilla client sends). The answer is no position of -
+    // - the tick's own and leaves the tick's positions: it would otherwise pass for the steering of a tick in which -
+    // - the player lets go of the vehicle or leaves it, which sends no position of its own (see inferHotbarSwitch). -
+    // - It has to carry the vehicle's position, rotation and ground state right after the correction, which the -
+    // - sandbox's vehicle has as well. A client that sent none did not steer the vehicle then; the tick's own packets -
+    // - show that, and whether it took the correction -
+    private void checkVehicleCorrectionAnswer(@Nullable ServerboundMoveVehiclePacket expected) {
+        if (expected == null) {
+            return;
+        }
+        ServerboundMoveVehiclePacket answer = this.tickPackets.takeCorrectionAnswer();
+        if (answer == null) {
+            this.tickPackets.notes.add("the client did not answer a correction of the vehicle the sandbox steers");
+            return;
+        }
+        PositionAndRotation answered = answer.movingTo();
+        PositionAndRotation corrected = expected.movingTo();
+        Vec3 answeredPosition = answered.position();
+        Vec3 correctedPosition = corrected.position();
+        List<String> differences = new ArrayList<>();
+        if (answeredPosition.x != correctedPosition.x || answeredPosition.y != correctedPosition.y || answeredPosition.z != correctedPosition.z) {
+            differences.add(String.format(Locale.ROOT, "vehicle position %.4g blocks off", correctedPosition.distanceTo(answeredPosition)));
+        }
+        if (answered.yRot() != corrected.yRot() || answered.xRot() != corrected.xRot()) {
+            differences.add("vehicle rotation");
+        }
+        if (answer.onGround() != expected.onGround()) {
+            differences.add("vehicle on ground");
+        }
+        if (differences.isEmpty()) {
+            this.tickPackets.notes.add("the client answered a correction of the vehicle");
+        } else {
+            this.tickPackets.reject(Check.VEHICLE, "the answer to the correction of the vehicle differs in: " + String.join(", ", differences));
         }
     }
 

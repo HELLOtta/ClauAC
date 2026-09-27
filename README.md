@@ -132,7 +132,7 @@ A riding player sends a rotation with its ground and collision state every tick 
 vehicle (a boat, a saddled horse or camel, a pig or strider with its item on a stick, a happy ghast with a harness, a
 saddled nautilus), the vehicle's position, rotation and ground state, its sprinting and the power of a vehicle jump.
 The sandbox moves the vehicle with the same vanilla code and keys and compares all of it exactly; a vehicle the player
-does not steer moves as the server says, which the sandbox follows like the client. Two things need care:
+does not steer moves as the server says, which the sandbox follows like the client. Three things need care:
 
 - A boat turns its rider during the tick, so the rotation the client reports is the one after that turn. The sandbox
   starts the tick with the reported rotation minus the turn the client reported for the boat, and ends it with the
@@ -142,6 +142,13 @@ does not steer moves as the server says, which the sandbox follows like the clie
   client sends the vehicle's position exactly while it steers. When they contradict the held item, the sandbox selects
   the first hotbar slot that explains them and holds the tick's result until the next tick reports the slot; a switch
   the next tick does not report makes the tick `MISMATCHED`.
+- The client answers the server's correction of the vehicle it steers right away with the vehicle's new position
+  (`ClientPacketListener.handleMoveVehicle`), while it handles the server's packets and so before its next tick sends
+  a position of its own. The sandbox checks that answer against its own vehicle after the correction and keeps it
+  apart from the tick's positions; otherwise it would pass for steering in a tick in which the player lets go of the
+  vehicle. That happened at a round trip of 2 s: the first position of a pig the player took over with a hotbar key
+  reaches the server before the new slot, Paper corrected the pig (`was expected to be controlling vehicle`, then
+  `moved wrongly`), and the last correction arrived in the tick the player handed the pig back.
 
 Menu clicks happen on screens between the client's ticks and are applied right away. The client sends the slots a
 click changed as hashes, so every click is checked: when the sandbox's items turn out to differ from the client's, it
