@@ -104,8 +104,10 @@ final class StateSnapshot {
 
     // - Far more objects than a player's state holds; a walk that gets here went into state the player only uses -
     private static final int MAX_OBJECTS = 200_000;
-    // - The instance fields of each class, its superclasses' included, that a snapshot saves -
-    private static final Map<Class<?>, List<Field>> FIELDS = new ConcurrentHashMap<>();
+    // - A player's state holds about 300 objects; the snapshot's maps start large enough for them -
+    private static final int EXPECTED_OBJECTS = 512;
+    // - The instance fields of each class and its superclasses, and what a snapshot does with each (see layoutOf) -
+    private static final Map<Class<?>, ClassLayout> LAYOUTS = new ConcurrentHashMap<>();
     // - Types whose instances never change once made, or that belong to the registries every entity shares -
     private static final List<Class<?>> VALUE_TYPES = List.of(
             Integer.class, Long.class, Float.class, Double.class, Short.class, Byte.class, BigInteger.class, BigDecimal.class,
@@ -133,7 +135,7 @@ final class StateSnapshot {
             "io.github.hellotta.clauac.simulation.world.",
             "io.github.hellotta.clauac.simulation.registry."
     );
-    // - Superclasses of the JDK whose fields do not matter to a snapshot of a subclass (see fieldsOf) -
+    // - Superclasses of the JDK whose fields do not matter to a snapshot of a subclass (see layoutOf) -
     private static final Set<Class<?>> STATELESS_JDK_SUPERCLASSES = Set.of(
             AbstractCollection.class, AbstractList.class, AbstractSequentialList.class, AbstractSet.class, AbstractQueue.class, AbstractMap.class
     );
@@ -144,34 +146,42 @@ final class StateSnapshot {
             "java.util.Collections$Empty",
             "java.util.Collections$Singleton"
     );
+    // - How a snapshot treats the objects of each class, worked out once per class (see classify) -
+    private static final ClassValue<ClassKind> CLASS_KINDS = new ClassValue<>() {
+        @Override
+        protected ClassKind computeValue(Class<?> type) {
+            return classify(type);
+        }
+    };
 
     private final Set<Object> roots;
-    private final Map<Object, SavedState> states = new IdentityHashMap<>();
-    // - How each saved object was reached, to name it when something goes wrong -
-    private final Map<Object, Origin> origins = new IdentityHashMap<>();
+    private final Map<Object, SavedState> states = new IdentityHashMap<>(EXPECTED_OBJECTS);
+    // - How each object the snapshot queued was reached, to name it when something goes wrong -
+    private final Map<Object, Origin> origins = new IdentityHashMap<>(EXPECTED_OBJECTS);
+    // - The class this snapshot looked up last, since the elements of a collection tend to share their class -
+    private @Nullable ClassKind lastLookup;
 
     private StateSnapshot(Collection<?> roots) {
         this.roots = Collections.newSetFromMap(new IdentityHashMap<>());
         this.roots.addAll(roots);
     }
 
-    // - Saves everything the roots own -
+    // - Saves everything the roots own. Every object is queued once, with the kind it was found to have -
     static StateSnapshot capture(Collection<?> roots) throws SnapshotException {
         StateSnapshot snapshot = new StateSnapshot(roots);
-        Deque<Object> pending = new ArrayDeque<>();
+        Deque<Queued> pending = new ArrayDeque<>();
         for (Object root : roots) {
-            snapshot.origins.put(root, new Origin(null, root.getClass().getSimpleName()));
-            pending.add(root);
+            if (!snapshot.origins.containsKey(root)) {
+                snapshot.origins.put(root, new Origin(null, Step.ROOT, null, 0));
+                pending.add(new Queued(root, snapshot.kindOf(root)));
+            }
         }
         while (!pending.isEmpty()) {
-            Object object = pending.poll();
-            if (snapshot.states.containsKey(object)) {
-                continue;
-            }
+            Queued queued = pending.poll();
             if (snapshot.states.size() >= MAX_OBJECTS) {
-                throw new SnapshotException("more than " + MAX_OBJECTS + " objects, the last at " + snapshot.pathOf(object));
+                throw new SnapshotException("more than " + MAX_OBJECTS + " objects, the last at " + snapshot.pathOf(queued.object()));
             }
-            snapshot.states.put(object, snapshot.save(object, pending));
+            snapshot.states.put(queued.object(), snapshot.save(queued.object(), queued.kind(), pending));
         }
         return snapshot;
     }
@@ -269,13 +279,13 @@ final class StateSnapshot {
             }
             return true;
         }
-        if (isJdkClass(type) || type.isHidden() || type.isSynthetic() || this.kindOf(earlier) == Kind.SHARED) {
+        if (CLASS_KINDS.get(type).jdk() || type.isHidden() || type.isSynthetic() || this.kindOf(earlier) == Kind.SHARED) {
             return false;
         }
         if (!comparing.add(earlier)) {
             return true;
         }
-        for (Field field : fieldsOf(type)) {
+        for (Field field : layoutOf(type).fields()) {
             try {
                 if (!this.sameValue(field.get(earlier), field.get(later), comparing)) {
                     return false;
@@ -287,8 +297,7 @@ final class StateSnapshot {
         return true;
     }
 
-    private SavedState save(Object object, Deque<Object> pending) throws SnapshotException {
-        Kind kind = this.kindOf(object);
+    private SavedState save(Object object, Kind kind, Deque<Queued> pending) throws SnapshotException {
         return switch (kind) {
             case ARRAY -> this.saveArray(object, pending);
             case LIST -> this.saveList((List<?>) object, pending);
@@ -296,28 +305,38 @@ final class StateSnapshot {
             case MAP -> this.saveMap((Map<?, ?>) object, pending);
             case ATOMIC -> saveAtomic(object);
             case OBJECT -> this.saveFields(object, pending);
+            case UNSUPPORTED -> throw new SnapshotException("cannot save the " + object.getClass().getName() + " at " + this.pathOf(object));
             case VALUE, SHARED -> throw new SnapshotException("a " + kind + " at " + this.pathOf(object) + " was queued to be saved");
         };
     }
 
-    // - Queues a referenced object when the roots own it -
-    private void follow(Object owner, String step, @Nullable Object value, Deque<Object> pending) throws SnapshotException {
-        if (value == null || this.states.containsKey(value) || this.origins.containsKey(value)) {
+    // - Queues a referenced object when the roots own it; every queued object has its origin, so that is all there is -
+    // - to check. The kind is looked up unless the declared type of a field decided it already. An object of a class -
+    // - the snapshot cannot save is queued as well, and fails with its whole path -
+    private void follow(@Nullable Object value, @Nullable Kind knownKind, Deque<Queued> pending, Object owner, Step step, @Nullable Field field, int index) {
+        if (value == null) {
             return;
         }
-        Kind kind = this.kindOf(value);
-        if (kind == Kind.VALUE || kind == Kind.SHARED) {
+        Kind kind = knownKind != null ? knownKind : this.kindOf(value);
+        if (kind == Kind.VALUE || kind == Kind.SHARED || this.origins.containsKey(value)) {
             return;
         }
-        this.origins.put(value, new Origin(owner, step));
-        pending.add(value);
+        this.origins.put(value, new Origin(owner, step, field, index));
+        pending.add(new Queued(value, kind));
     }
 
-    private SavedState saveFields(Object object, Deque<Object> pending) throws SnapshotException {
-        List<Field> fields = fieldsOf(object.getClass());
-        Object[] values = new Object[fields.size()];
-        for (int index = 0; index < fields.size(); index++) {
-            Field field = fields.get(index);
+    private SavedState saveFields(Object object, Deque<Queued> pending) throws SnapshotException {
+        ClassLayout layout = layoutOf(object.getClass());
+        Field[] fields = layout.fields();
+        FieldUse[] uses = layout.uses();
+        Kind[] declaredKinds = layout.declaredKinds();
+        Object[] values = new Object[fields.length];
+        for (int index = 0; index < fields.length; index++) {
+            FieldUse use = uses[index];
+            if (use == FieldUse.SKIP) {
+                continue;
+            }
+            Field field = fields[index];
             Object value;
             try {
                 value = field.get(object);
@@ -325,44 +344,45 @@ final class StateSnapshot {
                 throw new SnapshotException("cannot read " + field + " at " + this.pathOf(object) + ": " + exception);
             }
             values[index] = value;
-            if (!field.getType().isPrimitive()) {
-                this.follow(object, field.getName(), value, pending);
+            if (use == FieldUse.FOLLOW && value != null) {
+                Kind kind = declaredKinds[index] != null ? declaredKinds[index] : this.kindOfFieldValue(value, layout, index);
+                this.follow(value, kind, pending, object, Step.FIELD, field, index);
             }
         }
-        return new FieldState(object, fields, values);
+        return new FieldState(object, layout, values);
     }
 
-    private SavedState saveArray(Object array, Deque<Object> pending) throws SnapshotException {
+    private SavedState saveArray(Object array, Deque<Queued> pending) {
         int length = Array.getLength(array);
         Object copy = Array.newInstance(array.getClass().getComponentType(), length);
         System.arraycopy(array, 0, copy, 0, length);
         if (!array.getClass().getComponentType().isPrimitive()) {
             Object[] elements = (Object[]) copy;
             for (int index = 0; index < length; index++) {
-                this.follow(array, "[" + index + "]", elements[index], pending);
+                this.follow(elements[index], null, pending, array, Step.ELEMENT, null, index);
             }
         }
         return new ArrayState(array, copy);
     }
 
     // - The collections below are saved with their own element types, so that restoring them needs no unchecked cast -
-    private <E> SavedState saveList(List<E> list, Deque<Object> pending) throws SnapshotException {
+    private <E> SavedState saveList(List<E> list, Deque<Queued> pending) {
         List<E> elements = new ArrayList<>(list);
         for (int index = 0; index < elements.size(); index++) {
-            this.follow(list, "[" + index + "]", elements.get(index), pending);
+            this.follow(elements.get(index), null, pending, list, Step.ELEMENT, null, index);
         }
         return new ListState<>(list, elements);
     }
 
-    private <E> SavedState saveCollection(Collection<E> collection, Deque<Object> pending) throws SnapshotException {
+    private <E> SavedState saveCollection(Collection<E> collection, Deque<Queued> pending) {
         List<E> elements = new ArrayList<>(collection);
         for (int index = 0; index < elements.size(); index++) {
-            this.follow(collection, "{" + index + "}", elements.get(index), pending);
+            this.follow(elements.get(index), null, pending, collection, Step.MEMBER, null, index);
         }
         return new CollectionState<>(collection, elements);
     }
 
-    private <K, V> SavedState saveMap(Map<K, V> map, Deque<Object> pending) throws SnapshotException {
+    private <K, V> SavedState saveMap(Map<K, V> map, Deque<Queued> pending) throws SnapshotException {
         int size = map.size();
         List<K> keys = new ArrayList<>(size);
         List<V> values = new ArrayList<>(size);
@@ -370,8 +390,8 @@ final class StateSnapshot {
             if (keys.size() == size) {
                 throw new SnapshotException("the map at " + this.pathOf(map) + " changed while it was saved");
             }
-            this.follow(map, "key " + keys.size(), entry.getKey(), pending);
-            this.follow(map, "value of " + entry.getKey(), entry.getValue(), pending);
+            this.follow(entry.getKey(), null, pending, map, Step.KEY, null, keys.size());
+            this.follow(entry.getValue(), null, pending, map, Step.VALUE, null, keys.size());
             keys.add(entry.getKey());
             values.add(entry.getValue());
         }
@@ -395,42 +415,78 @@ final class StateSnapshot {
         return new AtomicReferenceState<>(reference, reference.get());
     }
 
-    private Kind kindOf(Object value) throws SnapshotException {
+    // - The kind of an object -
+    private Kind kindOf(Object value) {
         Class<?> type = value.getClass();
+        ClassKind last = this.lastLookup;
+        ClassKind classKind = last != null && last.type() == type ? last : CLASS_KINDS.get(type);
+        this.lastLookup = classKind;
+        return this.kindOf(value, classKind);
+    }
+
+    // - The kind of a value a field holds, through the class that field held last: most fields always hold objects of -
+    // - one class. The layout is shared by all snapshots and the remembered class replaced as a whole, so two -
+    // - snapshots racing on it cost at most a lookup -
+    private Kind kindOfFieldValue(Object value, ClassLayout layout, int index) {
+        Class<?> type = value.getClass();
+        ClassKind seen = layout.seenClasses()[index];
+        if (seen == null || seen.type() != type) {
+            seen = CLASS_KINDS.get(type);
+            layout.seenClasses()[index] = seen;
+        }
+        return this.kindOf(value, seen);
+    }
+
+    // - Only for an entity it matters whether it is one of the roots -
+    private Kind kindOf(Object value, ClassKind classKind) {
+        return classKind.kind() != classKind.rootKind() && this.roots.contains(value) ? classKind.rootKind() : classKind.kind();
+    }
+
+    private static ClassKind classify(Class<?> type) {
+        boolean jdk = isJdkClass(type);
+        return new ClassKind(type, kindOfClass(type, jdk, false), kindOfClass(type, jdk, true), jdk);
+    }
+
+    // - The kind of the objects of a class: arrays, atomic values, values, objects the roots only use (another entity -
+    // - than a root among them), objects of other classes outside the JDK, and the collections and maps of the JDK. -
+    // - Any other class of the JDK cannot be saved -
+    private static Kind kindOfClass(Class<?> type, boolean jdk, boolean root) {
         if (type.isArray()) {
             return Kind.ARRAY;
         }
-        if (value instanceof AtomicLong || value instanceof AtomicInteger || value instanceof AtomicBoolean || value instanceof AtomicReference<?>) {
+        if (AtomicLong.class.isAssignableFrom(type) || AtomicInteger.class.isAssignableFrom(type) || AtomicBoolean.class.isAssignableFrom(type)
+                || AtomicReference.class.isAssignableFrom(type)) {
             return Kind.ATOMIC;
         }
-        if (type.isHidden() || type.isSynthetic() || isInstanceOfAny(value, VALUE_TYPES)
-                || value instanceof BlockPos && !(value instanceof BlockPos.MutableBlockPos)
-                || value instanceof DataComponentMap && !(value instanceof PatchedDataComponentMap)
+        if (type.isHidden() || type.isSynthetic() || isSubclassOfAny(type, VALUE_TYPES)
+                || BlockPos.class.isAssignableFrom(type) && !BlockPos.MutableBlockPos.class.isAssignableFrom(type)
+                || DataComponentMap.class.isAssignableFrom(type) && !PatchedDataComponentMap.class.isAssignableFrom(type)
                 || startsWithAny(type.getName(), IMMUTABLE_JDK_COLLECTIONS)) {
             return Kind.VALUE;
         }
-        if (value instanceof Entity && !this.roots.contains(value) || isInstanceOfAny(value, SHARED_TYPES) || startsWithAny(type.getName(), SHARED_PACKAGES)) {
+        if (Entity.class.isAssignableFrom(type) && !root || isSubclassOfAny(type, SHARED_TYPES) || startsWithAny(type.getName(), SHARED_PACKAGES)) {
             return Kind.SHARED;
         }
-        if (!isJdkClass(type)) {
+        if (!jdk) {
             return Kind.OBJECT;
         }
-        if (value instanceof List<?>) {
+        if (List.class.isAssignableFrom(type)) {
             return Kind.LIST;
         }
-        if (value instanceof Collection<?>) {
+        if (Collection.class.isAssignableFrom(type)) {
             return Kind.COLLECTION;
         }
-        if (value instanceof Map<?, ?>) {
+        if (Map.class.isAssignableFrom(type)) {
             return Kind.MAP;
         }
-        throw new SnapshotException("cannot save the " + type.getName() + " at " + this.pathOf(value));
+        return Kind.UNSUPPORTED;
     }
 
-    // - The instance fields of a class and its superclasses. Of the JDK only the abstract collections may be -
-    // - superclasses: their only fields count modifications for failing iterators and cache views -
-    private static List<Field> fieldsOf(Class<?> type) throws SnapshotException {
-        List<Field> cached = FIELDS.get(type);
+    // - The instance fields of a class and its superclasses, and what a snapshot does with each (see FieldUse). Of the -
+    // - JDK only the abstract collections may be superclasses: their only fields count modifications for failing -
+    // - iterators and cache views -
+    private static ClassLayout layoutOf(Class<?> type) throws SnapshotException {
+        ClassLayout cached = LAYOUTS.get(type);
         if (cached != null) {
             return cached;
         }
@@ -454,9 +510,47 @@ final class StateSnapshot {
                 fields.add(field);
             }
         }
-        List<Field> saved = List.copyOf(fields);
-        FIELDS.put(type, saved);
-        return saved;
+        FieldUse[] uses = new FieldUse[fields.size()];
+        Kind[] declaredKinds = new Kind[fields.size()];
+        List<Integer> restored = new ArrayList<>();
+        for (int index = 0; index < uses.length; index++) {
+            Field field = fields.get(index);
+            Kind declaredKind = field.getType().isPrimitive() ? null : declaredKind(field.getType());
+            uses[index] = useOf(field, declaredKind);
+            declaredKinds[index] = declaredKind;
+            if (!Modifier.isFinal(field.getModifiers())) {
+                restored.add(index);
+            }
+        }
+        ClassLayout layout = new ClassLayout(fields.toArray(Field[]::new), uses, declaredKinds, new ClassKind[fields.size()],
+                restored.stream().mapToInt(Integer::intValue).toArray());
+        LAYOUTS.put(type, layout);
+        return layout;
+    }
+
+    // - The kind every value of a field with this declared type has, or null when it depends on the value: any array -
+    // - is an array, and a final class other than an entity is the class of every value. An entity's kind depends on -
+    // - whether it is a root -
+    private static @Nullable Kind declaredKind(Class<?> declared) {
+        if (declared.isArray()) {
+            return Kind.ARRAY;
+        }
+        if (Modifier.isFinal(declared.getModifiers()) && !Entity.class.isAssignableFrom(declared)) {
+            return CLASS_KINDS.get(declared).kind();
+        }
+        return null;
+    }
+
+    // - A field holding a primitive, or by its declared type only values or objects the roots only use, owns nothing: -
+    // - it is read but not followed, and when it is final as well it cannot change and is not even read. A subclass of -
+    // - one of the value or shared types is one of them too, while any other field may hold something the roots own -
+    private static FieldUse useOf(Field field, @Nullable Kind declaredKind) {
+        Class<?> declared = field.getType();
+        if (declared.isPrimitive() || declaredKind == Kind.VALUE || declaredKind == Kind.SHARED
+                || isSubclassOfAny(declared, VALUE_TYPES) || isSubclassOfAny(declared, SHARED_TYPES)) {
+            return Modifier.isFinal(field.getModifiers()) ? FieldUse.SKIP : FieldUse.READ;
+        }
+        return FieldUse.FOLLOW;
     }
 
     private static boolean isJdkClass(Class<?> type) {
@@ -464,9 +558,9 @@ final class StateSnapshot {
         return name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.") || name.startsWith("sun.") || name.startsWith("com.sun.");
     }
 
-    private static boolean isInstanceOfAny(Object value, List<Class<?>> types) {
-        for (Class<?> type : types) {
-            if (type.isInstance(value)) {
+    private static boolean isSubclassOfAny(Class<?> type, List<Class<?>> supertypes) {
+        for (Class<?> supertype : supertypes) {
+            if (supertype.isAssignableFrom(type)) {
                 return true;
             }
         }
@@ -492,7 +586,7 @@ final class StateSnapshot {
                 steps.add(current.getClass().getName());
                 break;
             }
-            steps.add(origin.step());
+            steps.add(origin.describe(current));
             current = origin.owner();
         }
         Collections.reverse(steps);
@@ -500,10 +594,48 @@ final class StateSnapshot {
     }
 
     private enum Kind {
-        VALUE, SHARED, OBJECT, ARRAY, LIST, COLLECTION, MAP, ATOMIC
+        VALUE, SHARED, OBJECT, ARRAY, LIST, COLLECTION, MAP, ATOMIC, UNSUPPORTED
     }
 
-    private record Origin(@Nullable Object owner, String step) {
+    // - A class, the kind of its objects, the kind of one that is a root (they differ for entities only), and whether -
+    // - the class belongs to the JDK -
+    private record ClassKind(Class<?> type, Kind kind, Kind rootKind, boolean jdk) {
+    }
+
+    // - What a snapshot does with a field: nothing, read its value, or read it and follow it to what it owns -
+    private enum FieldUse {
+        SKIP, READ, FOLLOW
+    }
+
+    // - The fields of a class, their uses, the kind their declared types decide (null where the value decides it), the -
+    // - class each field held last (see kindOfFieldValue), and the indexes of the fields a restore sets, those that are -
+    // - not final -
+    private record ClassLayout(Field[] fields, FieldUse[] uses, @Nullable Kind[] declaredKinds, @Nullable ClassKind[] seenClasses, int[] restored) {
+    }
+
+    // - An object waiting to be saved, with its kind -
+    private record Queued(Object object, Kind kind) {
+    }
+
+    // - How an object was reached: as a root, through a field of its owner, or at an index of its owner: an element of -
+    // - an array or a list, a member of another collection, or a key or the value of the key at that index of a map -
+    private enum Step {
+        ROOT, FIELD, ELEMENT, MEMBER, KEY, VALUE
+    }
+
+    // - The origin of a queued object; its name is only put together when a report needs it -
+    private record Origin(@Nullable Object owner, Step step, @Nullable Field field, int index) {
+
+        String describe(Object object) {
+            return switch (this.step) {
+                case ROOT -> object.getClass().getSimpleName();
+                case FIELD -> Objects.requireNonNull(this.field, "a field step names its field").getName();
+                case ELEMENT -> "[" + this.index + "]";
+                case MEMBER -> "{" + this.index + "}";
+                case KEY -> "key " + this.index;
+                case VALUE -> "value " + this.index;
+            };
+        }
     }
 
     // - The saved state of one object -
@@ -518,26 +650,24 @@ final class StateSnapshot {
         String nameOf(int index);
     }
 
-    private record FieldState(Object target, List<Field> fields, Object[] values) implements SavedState {
+    // - A field the layout skips keeps null here, in both snapshots a comparison looks at -
+    private record FieldState(Object target, ClassLayout layout, Object[] values) implements SavedState {
 
         @Override
         public void restore() throws SnapshotException {
-            for (int index = 0; index < this.fields.size(); index++) {
-                Field field = this.fields.get(index);
-                if (Modifier.isFinal(field.getModifiers())) {
-                    continue;
-                }
+            Field[] fields = this.layout.fields();
+            for (int index : this.layout.restored()) {
                 try {
-                    field.set(this.target, this.values[index]);
+                    fields[index].set(this.target, this.values[index]);
                 } catch (IllegalAccessException exception) {
-                    throw new SnapshotException("cannot restore " + field + ": " + exception);
+                    throw new SnapshotException("cannot restore " + fields[index] + ": " + exception);
                 }
             }
         }
 
         @Override
         public String nameOf(int index) {
-            return this.fields.get(index).getName();
+            return this.layout.fields()[index].getName();
         }
     }
 
