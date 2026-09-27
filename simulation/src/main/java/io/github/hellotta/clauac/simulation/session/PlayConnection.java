@@ -13,6 +13,7 @@ import io.github.hellotta.clauac.simulation.world.SandboxClockManager;
 import io.github.hellotta.clauac.simulation.world.SandboxLevel;
 import io.github.hellotta.clauac.simulation.world.SandboxLevelData;
 import io.github.hellotta.clauac.simulation.world.SandboxRecipeContainer;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -23,6 +24,7 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.core.PositionAndRotation;
 import net.minecraft.network.HashedPatchMap;
 import net.minecraft.network.protocol.Packet;
@@ -122,9 +124,12 @@ import net.minecraft.world.Difficulty;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.TickRateManager;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.Relative;
+import net.minecraft.world.entity.ai.attributes.Attribute;
 import net.minecraft.world.entity.ai.attributes.AttributeMap;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.vehicle.boat.AbstractBoat;
@@ -137,7 +142,9 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.border.WorldBorder;
+import net.minecraft.world.level.entity.EntityInLevelCallback;
 import net.minecraft.world.level.storage.TagValueInput;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.scores.PlayerTeam;
@@ -159,6 +166,28 @@ final class PlayConnection implements ClientContext {
     private static final double MINIMUM_REPORTED_MOVEMENT = 2.0E-4;
     // - Minecraft.tick picks what the crosshair points at with a partial tick of 1 -
     private static final float TICK_PARTIAL_TICK = 1.0F;
+    // - Every tick of the player on foot runs a second time from a snapshot, which has to give the same result: a -
+    // - development check that the snapshot holds everything a tick changes, on with -Dclauac.verifyRepeatedTicks=true -
+    private static final boolean VERIFY_REPEATED_TICKS = Boolean.getBoolean("clauac.verifyRepeatedTicks");
+    // - A block entity this far from the player's box can still move the player when the block entities tick -
+    private static final double MOVING_BLOCK_REACH = 2.0;
+    // - The player pushes the entities its box touches during its tick; its movement can carry the box this far -
+    private static final double PUSH_REACH = 1.0;
+    // - The difference in the reported position itself, which a velocity estimate can explain (see compareWithClient) -
+    private static final String POSITION_DIFFERENCE = "position";
+    // - Attributes that do not change how the local player moves within a tick: they count for attacks, mining, reach, -
+    // - damage the server deals, health and what is only shown -
+    private static final Set<Holder<Attribute>> ATTRIBUTES_BESIDE_MOVEMENT = Set.of(
+            Attributes.ARMOR, Attributes.ARMOR_TOUGHNESS, Attributes.ATTACK_DAMAGE, Attributes.ATTACK_KNOCKBACK, Attributes.ATTACK_SPEED,
+            Attributes.BELOW_NAME_DISTANCE, Attributes.BLOCK_BREAK_SPEED, Attributes.BLOCK_INTERACTION_RANGE, Attributes.BURNING_TIME,
+            Attributes.CAMERA_DISTANCE, Attributes.ENTITY_INTERACTION_RANGE, Attributes.EXPLOSION_KNOCKBACK_RESISTANCE,
+            Attributes.FALL_DAMAGE_MULTIPLIER, Attributes.FOLLOW_RANGE, Attributes.KNOCKBACK_RESISTANCE, Attributes.LUCK,
+            Attributes.MAX_ABSORPTION, Attributes.MAX_HEALTH, Attributes.MINING_EFFICIENCY, Attributes.NAME_TAG_DISTANCE,
+            Attributes.OXYGEN_BONUS, Attributes.SAFE_FALL_DISTANCE, Attributes.SPAWN_REINFORCEMENTS_CHANCE, Attributes.SUBMERGED_MINING_SPEED,
+            Attributes.SWEEPING_DAMAGE_RATIO, Attributes.TEMPT_RANGE, Attributes.WAYPOINT_TRANSMIT_RANGE, Attributes.WAYPOINT_RECEIVE_RANGE
+    );
+    // - Entity.levelCallback, whose onMove files an entity in the section of the level's entity storage it moved to -
+    private static final Field LEVEL_CALLBACK = levelCallbackField();
     // - ClientboundBlockUpdatePacket and ClientboundSectionBlocksUpdatePacket apply with these update flags -
     private static final int SERVER_BLOCK_UPDATE_FLAGS = 19;
     // - After the sandbox estimated the player's velocity from a reported movement (see correctHorizontalVelocity), -
@@ -200,6 +229,16 @@ final class PlayConnection implements ClientContext {
     private @Nullable ClientTickReport heldReport;
     private ItemStack heldReportUsedItem = ItemStack.EMPTY;
     private @Nullable InferredHotbarSwitch heldReportInferredSwitch;
+    // - Whether the alternative that stops the held tick's item use was tried there without matching -
+    private boolean heldReportUseStopTried;
+    // - The item whose use an alternative stopped to match the held tick; the next tick has to report the hotbar -
+    // - switch that stops it -
+    private ItemStack heldReportStoppedItem = ItemStack.EMPTY;
+    // - Why the tick alternatives are no longer tried on this connection: a snapshot failed, or a tick repeated from -
+    // - one came out differently (see tickLocalPlayer) -
+    private @Nullable String alternativesDisabled;
+    // - What trying the tick's alternatives at the player's tick found, for the comparison after the tick -
+    private @Nullable AlternativeResult alternativeResult;
     private int ticksSinceVelocityEstimate = VELOCITY_ESTIMATE_TICKS;
     // - The difference and the outcome of the tick whose resync estimated the velocity last -
     private double estimatedAfterOffset;
@@ -610,9 +649,14 @@ final class PlayConnection implements ClientContext {
         if (current == null || current.isPassenger()) {
             return;
         }
-        if (current.getX() != answer.x() || current.getY() != answer.y() || current.getZ() != answer.z()
-                || current.getYRot() != answer.yRot() || current.getXRot() != answer.xRot()) {
-            this.tickPackets.uncertainties.add("teleport result differed");
+        boolean positionDiffers = current.getX() != answer.x() || current.getY() != answer.y() || current.getZ() != answer.z();
+        if (positionDiffers || current.getYRot() != answer.yRot() || current.getXRot() != answer.xRot()) {
+            // - The rotation is the client's input and may have turned since its last tick; the sandbox takes it over -
+            // - like the tick's own rotation. A position that differs shows the player was elsewhere than the sandbox -
+            // - thought, with a velocity the sandbox cannot know either -
+            if (positionDiffers) {
+                this.tickPackets.uncertainties.add("teleport result differed");
+            }
             this.tickPackets.notes.add(String.format(
                     "teleport %d: sandbox %.6f %.6f %.6f %.3f %.3f, client %.6f %.6f %.6f %.3f %.3f",
                     answer.id(), current.getX(), current.getY(), current.getZ(), current.getYRot(), current.getXRot(),
@@ -880,8 +924,6 @@ final class PlayConnection implements ClientContext {
             return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
         }
         InferredHotbarSwitch inferredSwitch = this.inferHotbarSwitch(tickPlayer);
-        List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
-        this.collectOngoingUncertainties(uncertainties);
         // - LivingEntity.updatingUsingItem, at the start of the player's tick, stops the use once the used hand holds -
         // - another item -
         ItemStack usedMainHandItem = tickPlayer.isUsingItem() && tickPlayer.getUsedItemHand() == InteractionHand.MAIN_HAND
@@ -890,27 +932,241 @@ final class PlayConnection implements ClientContext {
         Vec3 positionBeforeTick = tickPlayer.position();
         Entity vehicleBeforeTick = tickPlayer.getRootVehicle();
         Vec3 vehiclePositionBeforeTick = vehicleBeforeTick.position();
-        tickLevel.tickEntities();
+        this.alternativeResult = null;
+        tickLevel.setLocalPlayerTick(entity -> this.tickLocalPlayer(tickLevel, tickPlayer));
+        try {
+            tickLevel.tickEntities();
+        } finally {
+            tickLevel.setLocalPlayerTick(null);
+        }
         tickLevel.tickBlockEntities();
+        List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
+        this.collectOngoingUncertainties(uncertainties);
+        List<String> notes = new ArrayList<>(this.tickPackets.notes);
+        this.judgeAlternatives(uncertainties, notes);
         ClientTickReport report;
         ItemStack heldUsedItem = ItemStack.EMPTY;
+        ItemStack heldStoppedItem = ItemStack.EMPTY;
         // - LocalPlayer.sendChanges decides after the tick whether the player rides -
         if (tickPlayer.isPassenger()) {
             Vec3 steeredVehicleBeforeTick = tickPlayer.getRootVehicle() == vehicleBeforeTick ? vehiclePositionBeforeTick : null;
-            report = this.compareRiding(clientTick, tickPlayer, steeredVehicleBeforeTick, reportedSprinting, uncertainties, new ArrayList<>(this.tickPackets.notes));
+            report = this.compareRiding(clientTick, tickPlayer, steeredVehicleBeforeTick, reportedSprinting, uncertainties, notes);
         } else {
-            report = this.compareWithClient(clientTick, tickPlayer, positionBeforeTick, reportedSprinting, uncertainties, new ArrayList<>(this.tickPackets.notes));
-            if (report.outcome() == TickOutcome.MISMATCHED && this.tickPackets.rejections.isEmpty()) {
+            report = this.compareWithClient(clientTick, tickPlayer, positionBeforeTick, reportedSprinting, uncertainties, notes);
+            if (this.alternativeResult instanceof AlternativeResult.Matched matched) {
+                for (TickAlternative alternative : matched.combination()) {
+                    if (!alternative.stoppedItem().isEmpty()) {
+                        heldStoppedItem = alternative.stoppedItem();
+                    }
+                }
+            } else if (report.outcome() == TickOutcome.MISMATCHED && this.tickPackets.rejections.isEmpty()) {
                 heldUsedItem = usedMainHandItem;
             }
         }
-        if (inferredSwitch != null || !heldUsedItem.isEmpty()) {
+        if (inferredSwitch != null || !heldUsedItem.isEmpty() || !heldStoppedItem.isEmpty()) {
             this.heldReport = report;
             this.heldReportUsedItem = heldUsedItem;
+            this.heldReportUseStopTried = this.alternativeResult instanceof AlternativeResult.NoneMatched;
+            this.heldReportStoppedItem = heldStoppedItem;
             this.heldReportInferredSwitch = inferredSwitch;
             return null;
         }
         return report;
+    }
+
+    // - ClientLevel.tickEntities reaching the local player while it rides nothing (see SandboxLevel.setLocalPlayerTick). -
+    // - A tick with alternatives runs from a snapshot: when the simulated tick differs from what the client reported, -
+    // - the alternatives and their combinations run from the same start, and the first that matches stays. When none -
+    // - matches, the simulated tick runs again and has to come out as the first time, which shows that the snapshot -
+    // - held everything the tick changed. Blocks moving next to the player (pistons, shulker boxes) only move it -
+    // - after this point, so the tick is not judged here then; neither is it once snapshots failed on this connection -
+    private void tickLocalPlayer(SandboxLevel level, SandboxPlayer player) {
+        List<TickAlternative> alternatives = this.tickPackets.alternatives;
+        if (player.isUsingItem() && player.getUsedItemHand() == InteractionHand.MAIN_HAND) {
+            alternatives.add(stoppedItemUse(player));
+        }
+        if (alternatives.isEmpty() && !VERIFY_REPEATED_TICKS) {
+            level.tickNonPassenger(player);
+            return;
+        }
+        String unavailable = this.alternativesDisabled;
+        if (unavailable == null && level.hasEntityMovingBlockEntityNear(player.getBoundingBox().inflate(MOVING_BLOCK_REACH))) {
+            unavailable = "blocks move next to the player";
+        }
+        TickStart start = null;
+        if (unavailable == null) {
+            try {
+                start = this.saveTickStart(level, player);
+            } catch (StateSnapshot.SnapshotException problem) {
+                unavailable = this.disableAlternatives("the player's state could not be saved", problem);
+            }
+        }
+        if (start == null) {
+            level.tickNonPassenger(player);
+            if (!alternatives.isEmpty()) {
+                this.alternativeResult = new AlternativeResult.Untried(unavailable);
+            }
+            return;
+        }
+        try {
+            level.tickNonPassenger(player);
+            if (player.isRemoved()) {
+                // - The tick removed the player from the level (LivingEntity.tickDeath), which the level's entity -
+                // - storage records outside the player: running the tick again would remove it a second time -
+                if (!alternatives.isEmpty()) {
+                    this.alternativeResult = new AlternativeResult.Untried("the player's tick removed it from the level");
+                }
+                return;
+            }
+            if (alternatives.isEmpty() || this.slotDifferences(player).isEmpty()) {
+                if (!alternatives.isEmpty()) {
+                    this.alternativeResult = new AlternativeResult.SimulatedMatched();
+                }
+                if (VERIFY_REPEATED_TICKS) {
+                    String difference = this.repeatTick(level, player, start, StateSnapshot.capture(start.roots()));
+                    if (difference != null) {
+                        this.disableAlternatives("a repeated tick came out differently", new StateSnapshot.SnapshotException(difference));
+                    }
+                }
+                return;
+            }
+            StateSnapshot simulatedEnd = StateSnapshot.capture(start.roots());
+            for (List<TickAlternative> combination : combinationsOf(alternatives)) {
+                this.restoreTickStart(start, player);
+                for (TickAlternative alternative : combination) {
+                    alternative.change().apply(player);
+                }
+                level.tickNonPassenger(player);
+                if (this.slotDifferences(player).isEmpty()) {
+                    this.alternativeResult = new AlternativeResult.Matched(combination);
+                    return;
+                }
+            }
+            String difference = this.repeatTick(level, player, start, simulatedEnd);
+            if (difference != null) {
+                this.alternativeResult = new AlternativeResult.Untried(
+                        this.disableAlternatives("a repeated tick came out differently", new StateSnapshot.SnapshotException(difference)));
+            } else {
+                this.alternativeResult = new AlternativeResult.NoneMatched();
+            }
+        } catch (StateSnapshot.SnapshotException problem) {
+            this.disableAlternatives("the player's state could not be restored", problem);
+            throw new IllegalStateException("the player's state could not be restored to try the tick's alternatives", problem);
+        }
+    }
+
+    // - Runs the simulated tick again from its start and returns where the result differs from the first run's, or -
+    // - null -
+    private @Nullable String repeatTick(SandboxLevel level, SandboxPlayer player, TickStart start, StateSnapshot firstEnd) throws StateSnapshot.SnapshotException {
+        this.restoreTickStart(start, player);
+        level.tickNonPassenger(player);
+        return firstEnd.firstDifference(StateSnapshot.capture(start.roots()));
+    }
+
+    // - What the player's tick starts from: the player with the level's random, which its tick may draw from, what the -
+    // - tick reports through ClientContext, and the motion of the entities it may push -
+    private TickStart saveTickStart(SandboxLevel level, SandboxPlayer player) throws StateSnapshot.SnapshotException {
+        List<Object> roots = List.of(player, level.getRandom());
+        AABB pushArea = player.getBoundingBox().expandTowards(player.getDeltaMovement()).inflate(PUSH_REACH);
+        List<EntityMotion> pushable = new ArrayList<>();
+        for (Entity entity : level.getEntities(player, pushArea)) {
+            pushable.add(new EntityMotion(entity, entity.getDeltaMovement(), entity.needsSync));
+        }
+        ClientTickPackets packets = this.tickPackets;
+        return new TickStart(roots, StateSnapshot.capture(roots), packets.predictedAbilitiesSent, packets.predictedFallFlyingStart,
+                packets.predictedRidingJump, pushable);
+    }
+
+    private void restoreTickStart(TickStart start, SandboxPlayer player) throws StateSnapshot.SnapshotException {
+        start.snapshot().restore();
+        ClientTickPackets packets = this.tickPackets;
+        packets.predictedAbilitiesSent = start.predictedAbilitiesSent();
+        packets.predictedFallFlyingStart = start.predictedFallFlyingStart();
+        packets.predictedRidingJump = start.predictedRidingJump();
+        for (EntityMotion motion : start.pushable()) {
+            motion.entity().setDeltaMovement(motion.deltaMovement());
+            motion.entity().needsSync = motion.needsSync();
+        }
+        // - The level's entity storage files the player by the section it moved into last -
+        notifyMoved(player);
+    }
+
+    // - The alternative that the tick's key handling switched the hotbar slot away from the item in use, which -
+    // - LivingEntity.updatingUsingItem answers with stopUsingItem at the start of the player's tick. The client -
+    // - reports such a switch only at the start of its next tick, which then has to confirm it -
+    private static TickAlternative stoppedItemUse(SandboxPlayer player) {
+        return new TickAlternative(
+                "a hotbar switch may have stopped the item use in this tick",
+                "the item use a hotbar switch in this tick stopped",
+                player.getUseItem().copy(),
+                SandboxPlayer::stopUsingItem
+        );
+    }
+
+    // - Every non-empty combination of the alternatives, the smaller ones first, each in the order of the list -
+    private static List<List<TickAlternative>> combinationsOf(List<TickAlternative> alternatives) {
+        List<List<TickAlternative>> combinations = new ArrayList<>();
+        int count = alternatives.size();
+        for (int size = 1; size <= count; size++) {
+            for (int mask = 1; mask < 1 << count; mask++) {
+                if (Integer.bitCount(mask) != size) {
+                    continue;
+                }
+                List<TickAlternative> combination = new ArrayList<>();
+                for (int index = 0; index < count; index++) {
+                    if ((mask & 1 << index) != 0) {
+                        combination.add(alternatives.get(index));
+                    }
+                }
+                combinations.add(List.copyOf(combination));
+            }
+        }
+        return combinations;
+    }
+
+    // - Stops trying alternatives on this connection; returns the reason, which the problem log shows once -
+    private String disableAlternatives(String what, StateSnapshot.SnapshotException problem) {
+        this.problemLog.log("stopped trying the alternatives of uncertain ticks: " + what, problem);
+        String reason = what + " (" + problem.getMessage() + ")";
+        this.alternativesDisabled = reason;
+        return reason;
+    }
+
+    // - The tick's alternatives in its notes and uncertainties: those that could not be tried leave their -
+    // - uncertainty, as they always did; the others a note on what trying them found. The alternative that stops an -
+    // - item use only counts once the next tick reports the hotbar switch; until then the held report stands in for -
+    // - its uncertainty (see releaseHeldReport), and a tick that needed none of them tells nothing about it -
+    private void judgeAlternatives(List<String> uncertainties, List<String> notes) {
+        List<TickAlternative> alternatives = this.tickPackets.alternatives;
+        List<TickAlternative> uncertain = alternatives.stream().filter(alternative -> alternative.stoppedItem().isEmpty()).toList();
+        switch (this.alternativeResult) {
+            case null -> addUncertainties(uncertainties, uncertain);
+            case AlternativeResult.Untried untried -> {
+                addUncertainties(uncertainties, uncertain);
+                if (!uncertain.isEmpty()) {
+                    notes.add("alternatives not tried: " + untried.reason());
+                }
+            }
+            case AlternativeResult.SimulatedMatched ignored -> {
+                if (!uncertain.isEmpty()) {
+                    notes.add("matched as simulated, not needing: " + descriptionsOf(uncertain));
+                }
+            }
+            case AlternativeResult.Matched matched -> notes.add("matched with: " + descriptionsOf(matched.combination()));
+            case AlternativeResult.NoneMatched ignored -> notes.add("no alternative matched: " + descriptionsOf(alternatives));
+        }
+    }
+
+    private static void addUncertainties(List<String> uncertainties, List<TickAlternative> alternatives) {
+        for (TickAlternative alternative : alternatives) {
+            if (!uncertainties.contains(alternative.uncertainty())) {
+                uncertainties.add(alternative.uncertainty());
+            }
+        }
+    }
+
+    private static String descriptionsOf(List<TickAlternative> alternatives) {
+        return String.join(", ", alternatives.stream().map(TickAlternative::description).toList());
     }
 
     // - A hotbar key pressed during the tick's key handling (Minecraft.handleKeybinds, before any other key) changes -
@@ -1036,9 +1292,10 @@ final class PlayConnection implements ClientContext {
     }
 
     // - Decides on the report held back from the previous tick, before this tick's actions. A hotbar switch the -
-    // - sandbox inferred for that tick has to be reported now. A held mismatch may come from a hotbar switch that -
-    // - stopped the player's item use during that tick: if this tick reports such a switch, the held tick is -
-    // - unverified; otherwise its mismatch stands -
+    // - sandbox inferred for that tick has to be reported now, and so has the one an alternative assumed when it -
+    // - stopped the item use in that tick. A held mismatch may come from a hotbar switch that stopped the item use -
+    // - as well; when that alternative was tried and did not match either, only the new item's attributes can still -
+    // - explain it. If this tick reports such a switch, the held tick is unverified; otherwise its mismatch stands -
     private void releaseHeldReport(SandboxPlayer player, List<ClientTickReport> reports) {
         ClientTickReport held = this.heldReport;
         if (held == null) {
@@ -1047,21 +1304,51 @@ final class PlayConnection implements ClientContext {
         this.heldReport = null;
         ItemStack usedItem = this.heldReportUsedItem;
         this.heldReportUsedItem = ItemStack.EMPTY;
+        boolean useStopTried = this.heldReportUseStopTried;
+        this.heldReportUseStopTried = false;
+        ItemStack stoppedItem = this.heldReportStoppedItem;
+        this.heldReportStoppedItem = ItemStack.EMPTY;
         InferredHotbarSwitch inferredSwitch = this.heldReportInferredSwitch;
         this.heldReportInferredSwitch = null;
         if (inferredSwitch != null) {
             held = this.confirmInferredHotbarSwitch(held, inferredSwitch, player);
         }
         ServerboundSetCarriedItemPacket leadingSwitch = this.leadingHotbarSwitch(player);
-        if (!usedItem.isEmpty() && leadingSwitch != null && !ItemStack.isSameItem(player.getInventory().getItem(leadingSwitch.getSlot()), usedItem)) {
-            held = held.withOutcome(TickOutcome.UNVERIFIED,
-                    "not simulated: the hotbar switch the client reported with its next tick may have stopped the item use in this tick");
-            // - The held tick was the last one to estimate the velocity, and its difference is now unverified -
-            if (this.ticksSinceVelocityEstimate == 0) {
-                this.estimatedAfterOutcome = TickOutcome.UNVERIFIED;
+        ItemStack switchedTo = leadingSwitch != null ? player.getInventory().getItem(leadingSwitch.getSlot()) : null;
+        if (!stoppedItem.isEmpty()) {
+            if (switchedTo != null && !ItemStack.isSameItem(switchedTo, stoppedItem)) {
+                held = held.withOutcome(held.outcome(), "the hotbar switch the client reported with its next tick stopped the item use in this tick");
+            } else {
+                held = held.withOutcome(TickOutcome.MISMATCHED,
+                        "differs in: the item use stopped in this tick, which only a hotbar switch explains, and the client reported none with its next tick");
+            }
+        }
+        if (!usedItem.isEmpty() && switchedTo != null && !ItemStack.isSameItem(switchedTo, usedItem)) {
+            if (!useStopTried || changesMovementAttributes(switchedTo)) {
+                held = held.withOutcome(TickOutcome.UNVERIFIED,
+                        "not simulated: the hotbar switch the client reported with its next tick may have stopped the item use in this tick");
+                // - The held tick was the last one to estimate the velocity, and its difference is now unverified -
+                if (this.ticksSinceVelocityEstimate == 0) {
+                    this.estimatedAfterOutcome = TickOutcome.UNVERIFIED;
+                }
+            } else {
+                held = held.withOutcome(held.outcome(),
+                        "the item use the hotbar switch reported with the next tick would have stopped does not explain the difference either");
             }
         }
         reports.add(held);
+    }
+
+    // - Whether an item in the main hand changes an attribute that may change how the player moves in a tick, which -
+    // - an alternative that only stopped the item use leaves out -
+    private static boolean changesMovementAttributes(ItemStack item) {
+        boolean[] changes = {false};
+        item.forEachModifier(EquipmentSlot.MAINHAND, (attribute, modifier) -> {
+            if (!ATTRIBUTES_BESIDE_MOVEMENT.contains(attribute)) {
+                changes[0] = true;
+            }
+        });
+        return changes[0];
     }
 
     // - The client reports a slot it selected with a hotbar key at the start of its next tick (MultiPlayerGameMode.tick), -
@@ -1112,12 +1399,15 @@ final class PlayConnection implements ClientContext {
     @Nullable ClientTickReport takeHeldReport() {
         ClientTickReport held = this.heldReport;
         InferredHotbarSwitch inferredSwitch = this.heldReportInferredSwitch;
+        ItemStack stoppedItem = this.heldReportStoppedItem;
         this.heldReport = null;
         this.heldReportUsedItem = ItemStack.EMPTY;
+        this.heldReportUseStopTried = false;
+        this.heldReportStoppedItem = ItemStack.EMPTY;
         this.heldReportInferredSwitch = null;
-        if (held != null && inferredSwitch != null) {
+        if (held != null && (inferredSwitch != null || !stoppedItem.isEmpty())) {
             return held.withOutcome(TickOutcome.UNVERIFIED,
-                    "not simulated: the play phase ended before the client reported the hotbar slot inferred for this tick");
+                    "not simulated: the play phase ended before the client reported the hotbar switch this tick assumed");
         }
         return held;
     }
@@ -1125,6 +1415,56 @@ final class PlayConnection implements ClientContext {
     // - A hotbar key the tick's packets showed the client pressing (see inferHotbarSwitch): the slot selected before, -
     // - the one the sandbox selected, the vehicle, and whether the client steers it since -
     private record InferredHotbarSwitch(int previousSlot, int slot, Entity vehicle, boolean steers) {
+    }
+
+    // - What the player's tick starts from (see saveTickStart) -
+    private record TickStart(
+            List<Object> roots, StateSnapshot snapshot, boolean predictedAbilitiesSent, boolean predictedFallFlyingStart,
+            OptionalInt predictedRidingJump, List<EntityMotion> pushable
+    ) {
+    }
+
+    // - An entity's velocity and sync flag, which Entity.push changes when the player pushes it -
+    private record EntityMotion(Entity entity, Vec3 deltaMovement, boolean needsSync) {
+    }
+
+    // - What trying the tick's alternatives at the player's tick found -
+    private sealed interface AlternativeResult {
+
+        // - The tick matched as simulated and needed none of them -
+        record SimulatedMatched() implements AlternativeResult {
+        }
+
+        // - This combination of alternatives matched what the client reported -
+        record Matched(List<TickAlternative> combination) implements AlternativeResult {
+        }
+
+        // - Every combination was tried and none matched -
+        record NoneMatched() implements AlternativeResult {
+        }
+
+        // - They could not be tried, for this reason -
+        record Untried(String reason) implements AlternativeResult {
+        }
+    }
+
+    // - Tells the level's entity storage that the player moved, after its fields were restored behind its back -
+    private static void notifyMoved(SandboxPlayer player) throws StateSnapshot.SnapshotException {
+        try {
+            ((EntityInLevelCallback) LEVEL_CALLBACK.get(player)).onMove();
+        } catch (IllegalAccessException exception) {
+            throw new StateSnapshot.SnapshotException("cannot reach the player's level callback: " + exception);
+        }
+    }
+
+    private static Field levelCallbackField() {
+        try {
+            Field field = Entity.class.getDeclaredField("levelCallback");
+            field.setAccessible(true);
+            return field;
+        } catch (NoSuchFieldException exception) {
+            throw new IllegalStateException("Entity.levelCallback is missing in this Minecraft version", exception);
+        }
     }
 
     // - Replays Minecraft.handleKeybinds and MultiPlayerGameMode.tick for this tick from the packets they sent. An -
@@ -1180,19 +1520,19 @@ final class PlayConnection implements ClientContext {
             case ServerboundAttackPacket attack -> {
                 Entity target = level.getEntity(attack.entityId());
                 if (target == null) {
-                    this.tickPackets.uncertainties.add("attacked an entity the client knows but the sandbox does not");
+                    this.attackUnknownEntity(player, this.onlySwingsFollow(index));
                 } else {
-                    if (player.attackDependsOnHotbarSwitchTiming()) {
-                        this.tickPackets.uncertainties.add("attack strength depends on when the client switched its hotbar slot");
-                    }
-                    this.gameMode.attack(player, target);
+                    this.attackEntity(level, player, target, this.onlySwingsFollow(index));
                 }
                 return true;
             }
             case ServerboundInteractPacket interact -> {
                 Entity target = level.getEntity(interact.entityId());
                 if (target == null) {
-                    this.tickPackets.uncertainties.add("interacted with an entity the client knows but the sandbox does not");
+                    // - What interacting does on the client never moves the player, but it may use up or fill the -
+                    // - held item -
+                    this.tickPackets.notes.add("interacted with entity " + interact.entityId() + ", which the sandbox does not know");
+                    this.markInventoryUnknown(InventoryMenu.CONTAINER_ID);
                 } else {
                     this.gameMode.interact(player, target, interact.hand(), interact.location());
                 }
@@ -1208,6 +1548,71 @@ final class PlayConnection implements ClientContext {
             default -> throw new IllegalArgumentException("No handler for the action " + action.type());
         }
         return swingAccompanied;
+    }
+
+    // - Whether nothing after this action of the tick changes the player: only swings follow, which belong to it or -
+    // - only reset the attack strength ticker -
+    private boolean onlySwingsFollow(int index) {
+        List<Packet<?>> actions = this.tickPackets.actions;
+        for (int later = index + 1; later < actions.size(); later++) {
+            if (!(actions.get(later) instanceof ServerboundPunchPacket)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // - MultiPlayerGameMode.attack on an entity the sandbox knows. The client's player may have held its main hand -
+    // - item one tick longer (see SandboxPlayer.considerEarlierHotbarSwitch); with the attack strength that left, the -
+    // - attack may have slowed the player down where the sandbox's did not, or the other way round. That attack is -
+    // - the alternative, made again with the other ticker from a snapshot of the player taken before the attack. It -
+    // - needs the attack to be the last thing of the tick that changes the player -
+    private void attackEntity(SandboxLevel level, SandboxPlayer player, Entity target, boolean lastChange) {
+        StateSnapshot beforeAttack = null;
+        if (lastChange && player.isSprinting() && player.hasAlternativeAttackStrengths() && this.alternativesDisabled == null) {
+            try {
+                beforeAttack = StateSnapshot.capture(List.of(player, level.getRandom()));
+            } catch (StateSnapshot.SnapshotException problem) {
+                this.disableAlternatives("the player's state before an attack could not be saved", problem);
+            }
+        }
+        this.gameMode.attack(player, target);
+        OptionalInt otherTicker = player.tickerForOtherAttackSlowdown();
+        if (otherTicker.isEmpty()) {
+            return;
+        }
+        String uncertainty = "attack strength depends on when the client switched its hotbar slot";
+        if (beforeAttack == null) {
+            this.tickPackets.uncertainties.add(uncertainty);
+            return;
+        }
+        StateSnapshot savedBeforeAttack = beforeAttack;
+        int ticker = otherTicker.getAsInt();
+        this.tickPackets.alternatives.add(new TickAlternative(uncertainty, "the attack strength a hotbar switch in the previous tick left", ItemStack.EMPTY,
+                attacking -> {
+                    savedBeforeAttack.restore();
+                    attacking.useAttackStrengthTicker(ticker);
+                    this.gameMode.attack(attacking, target);
+                }));
+    }
+
+    // - MultiPlayerGameMode.attack on an entity the client knows but the sandbox does not, which no vanilla client -
+    // - does. Player.attack then did to the player what the entity allowed: an attack that hurt it with a positive -
+    // - knockback slowed the player down, which is the alternative to it doing nothing -
+    private void attackUnknownEntity(SandboxPlayer player, boolean lastChange) {
+        boolean couldSlowDown = player.attackCouldSlowDown();
+        this.gameMode.finishAttack(player);
+        this.tickPackets.notes.add("attacked an entity the sandbox does not know");
+        if (!couldSlowDown) {
+            return;
+        }
+        String uncertainty = "attacked an entity the client knows but the sandbox does not";
+        if (lastChange) {
+            this.tickPackets.alternatives.add(new TickAlternative(uncertainty, "the attack on the unknown entity slowing the player down", ItemStack.EMPTY,
+                    SandboxPlayer::slowDownAfterAttack));
+        } else {
+            this.tickPackets.uncertainties.add(uncertainty);
+        }
     }
 
     // - The server ignores a slot outside the hotbar, which a vanilla client never selects -
@@ -1341,13 +1746,8 @@ final class PlayConnection implements ClientContext {
         boolean predictedOnGround = tickPlayer.onGround();
         boolean predictedHorizontalCollision = tickPlayer.horizontalCollision;
         boolean predictedSprinting = tickPlayer.isSprinting();
-        List<String> differences = new ArrayList<>();
 
-        boolean sendsMovement = this.isCameraOnPlayer();
-        this.lastSent.positionReminder += sendsMovement ? 1 : 0;
-        boolean predictedPositionSent = sendsMovement
-                && (Mth.lengthSquared(predictedX - this.lastSent.x, predictedY - this.lastSent.y, predictedZ - this.lastSent.z) > Mth.square(MINIMUM_REPORTED_MOVEMENT)
-                || this.lastSent.positionReminder >= POSITION_REMINDER_INTERVAL);
+        this.lastSent.positionReminder += this.isCameraOnPlayer() ? 1 : 0;
         ReportedState reported = this.reportedState();
         boolean positionReported = reported.positionReported();
         double reportedX = reported.x();
@@ -1356,27 +1756,8 @@ final class PlayConnection implements ClientContext {
         boolean reportedOnGround = reported.onGround();
         boolean reportedHorizontalCollision = reported.horizontalCollision();
         double offset = Math.sqrt(Mth.lengthSquared(predictedX - reportedX, predictedY - reportedY, predictedZ - reportedZ));
-
-        if (predictedPositionSent != positionReported) {
-            differences.add(predictedPositionSent ? "expected a position, none was sent" : "a position was sent, none was expected");
-        }
-        boolean positionDiffers = positionReported && (predictedX != reportedX || predictedY != reportedY || predictedZ != reportedZ);
-        if (positionDiffers) {
-            differences.add("position");
-        }
-        if (predictedOnGround != reportedOnGround) {
-            differences.add("on ground");
-        }
-        if (predictedHorizontalCollision != reportedHorizontalCollision) {
-            differences.add("horizontal collision");
-        }
-        if (predictedSprinting != reportedSprinting) {
-            differences.add("sprinting");
-        }
-        this.addPlayerCommandDifferences(differences, tickPlayer);
-        if (packets.vehicleMove != null) {
-            differences.add("a vehicle position was sent while not riding");
-        }
+        List<String> differences = this.movementDifferences(tickPlayer, reported, reportedSprinting, this.lastSent.positionReminder);
+        boolean positionDiffers = differences.contains(POSITION_DIFFERENCE);
         boolean onlyPositionDiffers = positionDiffers && differences.size() == 1;
         double roundingOfEstimate = VELOCITY_ESTIMATE_ULPS * Math.ulp(Math.max(Math.abs(reportedX), Math.max(Math.abs(reportedY), Math.abs(reportedZ))));
         if (onlyPositionDiffers && this.ticksSinceVelocityEstimate < VELOCITY_ESTIMATE_TICKS && offset <= roundingOfEstimate) {
@@ -1410,6 +1791,43 @@ final class PlayConnection implements ClientContext {
                 positionReported, reportedX, reportedY, reportedZ, reportedOnGround, reportedHorizontalCollision, reportedSprinting,
                 offset, null, notes
         );
+    }
+
+    // - How the player now differs from what the client reported for the tick on foot: whether LocalPlayer.sendPosition -
+    // - had to send a position (with the position reminder counted up for this tick), the position itself, the ground, -
+    // - collision and sprinting state, and the packets the player sends while it ticks. Only reads -
+    private List<String> movementDifferences(SandboxPlayer player, ReportedState reported, boolean reportedSprinting, int positionReminder) {
+        List<String> differences = new ArrayList<>();
+        boolean predictedPositionSent = this.isCameraOnPlayer()
+                && (Mth.lengthSquared(player.getX() - this.lastSent.x, player.getY() - this.lastSent.y, player.getZ() - this.lastSent.z) > Mth.square(MINIMUM_REPORTED_MOVEMENT)
+                || positionReminder >= POSITION_REMINDER_INTERVAL);
+        if (predictedPositionSent != reported.positionReported()) {
+            differences.add(predictedPositionSent ? "expected a position, none was sent" : "a position was sent, none was expected");
+        }
+        if (reported.positionReported() && (player.getX() != reported.x() || player.getY() != reported.y() || player.getZ() != reported.z())) {
+            differences.add(POSITION_DIFFERENCE);
+        }
+        if (player.onGround() != reported.onGround()) {
+            differences.add("on ground");
+        }
+        if (player.horizontalCollision != reported.horizontalCollision()) {
+            differences.add("horizontal collision");
+        }
+        if (player.isSprinting() != reportedSprinting) {
+            differences.add("sprinting");
+        }
+        this.addPlayerCommandDifferences(differences, player);
+        if (this.tickPackets.vehicleMove != null) {
+            differences.add("a vehicle position was sent while not riding");
+        }
+        return differences;
+    }
+
+    // - movementDifferences right after the player's tick, before compareWithClient counts the position reminder up. -
+    // - The entities after the player only push it, which changes its velocity, not its position or state -
+    private List<String> slotDifferences(SandboxPlayer player) {
+        return this.movementDifferences(player, this.reportedState(), this.lastSent.sprinting,
+                this.lastSent.positionReminder + (this.isCameraOnPlayer() ? 1 : 0));
     }
 
     // - What the player itself sends while it ticks, on foot and riding: its abilities (flying), the start of gliding and -

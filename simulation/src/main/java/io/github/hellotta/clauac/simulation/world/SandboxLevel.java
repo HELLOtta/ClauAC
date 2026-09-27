@@ -3,6 +3,7 @@ package io.github.hellotta.clauac.simulation.world;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
@@ -31,6 +32,9 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
+import net.minecraft.world.level.block.piston.PistonMovingBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.border.WorldBorder;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -76,6 +80,8 @@ public final class SandboxLevel extends Level {
     private final int seaLevel;
     private int serverSimulationDistance;
     private @Nullable Player localPlayer;
+    // - Ticks the local player at its place among the entities instead of tickNonPassenger (see setLocalPlayerTick) -
+    private @Nullable Consumer<Entity> localPlayerTick;
 
     // - clockManager and scoreboard belong to the connection and outlive levels, like on the client -
     public SandboxLevel(
@@ -112,6 +118,12 @@ public final class SandboxLevel extends Level {
         this.localPlayer = localPlayer;
     }
 
+    // - Hands the local player's tick to the connection while the player rides nothing, so that it can run the tick -
+    // - again from a saved start before the entities after the player tick; null goes back to tickNonPassenger -
+    public void setLocalPlayerTick(@Nullable Consumer<Entity> localPlayerTick) {
+        this.localPlayerTick = localPlayerTick;
+    }
+
     // - ClientLevel.tick without the renderer's sky, particle and sound handling -
     public void tick() {
         if (this.tickRateManager().runsNormally()) {
@@ -134,9 +146,25 @@ public final class SandboxLevel extends Level {
     public void tickEntities() {
         this.tickingEntities.forEach(entity -> {
             if (!entity.isRemoved() && !entity.isPassenger() && !this.tickRateManager.isEntityFrozen(entity)) {
-                this.guardEntityTick(this::tickNonPassenger, entity);
+                Consumer<Entity> localTick = this.localPlayerTick;
+                this.guardEntityTick(entity == this.localPlayer && localTick != null ? localTick : this::tickNonPassenger, entity);
             }
         });
+    }
+
+    // - Whether a block entity next to this area moves entities when the block entities tick after the entities: a -
+    // - piston's moving block, or a shulker box whose lid is moving -
+    public boolean hasEntityMovingBlockEntityNear(AABB area) {
+        for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(area.minX, area.minY, area.minZ), BlockPos.containing(area.maxX, area.maxY, area.maxZ))) {
+            BlockEntity blockEntity = this.getBlockEntity(pos);
+            if (blockEntity instanceof PistonMovingBlockEntity
+                    || blockEntity instanceof ShulkerBoxBlockEntity shulkerBox
+                    && shulkerBox.getAnimationStatus() != ShulkerBoxBlockEntity.AnimationStatus.CLOSED
+                    && shulkerBox.getAnimationStatus() != ShulkerBoxBlockEntity.AnimationStatus.OPENED) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public boolean isTickingEntity(Entity entity) {

@@ -46,6 +46,11 @@ one automatically when none is installed.
 plugin and starts the server in `run/` (ignored by Git). On the first start the server stops and asks you to accept
 the Minecraft EULA in `run/eula.txt`.
 
+The alternatives of uncertain ticks (see below) rely on a snapshot of the player that holds everything a tick
+changes. To check that it does, start the server with the system property `clauac.verifyRepeatedTicks=true`, for
+example `JAVA_TOOL_OPTIONS=-Dclauac.verifyRepeatedTicks=true ./gradlew runServer`: every tick of a player on foot then
+runs a second time from the snapshot, and a second run that ends differently is logged with the field it differs in.
+
 ## How the simulation works
 
 Instead of re-implementing movement rules, ClauAC runs the vanilla game code itself: for every player it keeps a
@@ -158,26 +163,41 @@ of the connection, and `/clauac status` shows why.
 
 ### What the simulation cannot know
 
-The client's packets do not tell everything it did. Where the difference that follows can come from such a gap,
-the tick is `UNVERIFIED` instead of `MISMATCHED`:
+The client's packets do not tell everything it did. Where such a gap decides how the player moves, the sandbox
+simulates the alternatives: at the player's place in the tick it saves the player's whole state, runs the tick as
+simulated and compares it with what the client reported. When they differ, every alternative and every combination
+of them runs from the saved state, and the first that matches what the client reported stays; the tick is then
+`MATCHED`, with the alternative in its notes. When none matches, the tick is `MISMATCHED`. The alternatives are:
 
 - A hotbar switch the client reports at the start of a tick may have happened during the previous tick's key handling
-  instead, when that tick's player already held the new item. A tick whose difference can come from the item use that
-  switch stopped is reported one tick late, as `UNVERIFIED`; an attack whose knockback depends on when the attack
-  strength was reset that way is `UNVERIFIED` as well.
+  instead, when that tick's player already held the new item. That switch may have stopped the item use of the
+  previous tick, which is then held back until the next tick reports the switch; an alternative that matched this way
+  and gets no switch reported is `MISMATCHED`. With the attack strength that earlier switch left, an attack may have
+  slowed the player down (a knockback attack) where the sandbox's did not, or the other way round: that attack runs
+  again with the other strength.
+- An attack on an entity the sandbox does not know, which no vanilla client makes, may have slowed the player down or
+  not, depending on the entity.
+
+What cannot be tried that way leaves the tick `UNVERIFIED` instead of `MISMATCHED`:
+
+- The alternatives above while the player rides, while blocks move next to it (a piston, a shulker box), which move
+  it only after its tick, and in a tick whose actions after the attack changed the player.
 - The client's velocity is never reported. After a difference the sandbox estimates it from the reported movement;
   the rounding of that estimate can move later positions by a few units in the last place, and after an `UNVERIFIED`
   tick, a difference that keeps shrinking in the ticks right after it stays `UNVERIFIED`.
-- Items the sandbox had to mark unknown, attacks on or interactions with entities the sandbox does not know, and
-  teleports whose result differs from the sandbox's.
+- A switch that stopped an item use when the new item changes an attribute that moves the player (speed, gravity,
+  scale, step height and the like), which the alternative leaves out.
+- Items the sandbox had to mark unknown, until the server's resend arrives, and teleports whose resulting position
+  differs from the sandbox's. A rotation that differs is the client's input and is taken over. Interacting with an
+  entity the sandbox does not know never moves the player, but may use up or fill the held item, so the sandbox then
+  marks its items unknown and has them resent.
 - With the experimental minecart movement, a minecart turns its rider only while the client's "rotate with minecart"
   option is on, which the server never learns. Placing a block or swinging at what the crosshair points at in such a
   minecart depends on the rotation the client had.
 
 Known limits:
 
-- An `UNVERIFIED` tick accepts any difference; the alternatives are not simulated yet, so a tick that is uncertain is
-  not bounded either.
+- An `UNVERIFIED` tick accepts any difference; only what the alternatives cannot cover (see above) is left to it.
 - The rotation a boat's rider starts a tick with is exact up to the rounding of the float rotations it is computed
   from; the client's own boat adds such rounding at every frame (`AbstractBoat.clampRotation`), and no packet reports
   it. Only a rotation-dependent action within that rounding of a boundary could differ.
@@ -209,8 +229,11 @@ Menu clicks matched the client's hashes in chests, the player's inventory (craft
 anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.
 A switch from the creative inventory screen straight to survival made the client click in a menu the sandbox did not
 have; the next click showed the difference and the inventory resend brought both back in line. Switching the hotbar
-slot while eating produced `UNVERIFIED` for the tick the switch was ambiguous for, as intended. While the player was
-dead the sandbox, like the client, did not move it (`NOT_SIMULATED`), and matching resumed after the respawn.
+slot while eating matched through the alternative that the switch stopped the item use a tick before the client
+reported it, which the next tick confirmed; a sprint attack right after a hotbar switch matched through the attack
+strength that switch left, and an attack on an entity id the sandbox did not know, injected into the connection,
+matched without slowing the player down. While the player was dead the sandbox, like the client, did not move it
+(`NOT_SIMULATED`), and matching resumed after the respawn.
 
 ## How PacketEvents is bundled
 

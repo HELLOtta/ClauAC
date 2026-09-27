@@ -277,6 +277,12 @@ final class SandboxGameMode {
 
     void attack(SandboxPlayer player, Entity entity) {
         player.attack(entity);
+        this.finishAttack(player);
+    }
+
+    // - The rest of MultiPlayerGameMode.attack after Player.attack, which is all the sandbox can do for an entity it -
+    // - does not know -
+    void finishAttack(SandboxPlayer player) {
         player.resetAttackStrengthTicker();
         if (player.getAbilities().instabuild) {
             this.destroyDelay = DESTROY_DELAY_TICKS;

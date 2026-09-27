@@ -36,6 +36,9 @@ final class ClientTickPackets {
     boolean predictedFallFlyingStart;
     OptionalInt predictedRidingJump = OptionalInt.empty();
     final Set<String> uncertainties = new LinkedHashSet<>();
+    // - What the client may have done instead where its packets leave gaps, tried at the player's tick when the -
+    // - tick as simulated differs from what the client reported (see PlayConnection.tickLocalPlayer) -
+    final List<TickAlternative> alternatives = new ArrayList<>();
     // - What the sandbox rejected during this tick: packets no vanilla client sends in the sandbox's situation, and -
     // - steps of the simulation that failed. Any of them makes the tick MISMATCHED, whatever the comparison finds -
     final Set<String> rejections = new LinkedHashSet<>();
@@ -54,6 +57,7 @@ final class ClientTickPackets {
         this.predictedFallFlyingStart = false;
         this.predictedRidingJump = OptionalInt.empty();
         this.uncertainties.clear();
+        this.alternatives.clear();
         this.rejections.clear();
         this.notes.clear();
     }

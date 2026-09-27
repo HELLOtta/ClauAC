@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.OptionalInt;
 import java.util.Set;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -14,6 +15,7 @@ import net.minecraft.server.permissions.LevelBasedPermissionSet;
 import net.minecraft.server.permissions.PermissionSet;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityEvent;
 import net.minecraft.world.entity.EntitySelector;
@@ -50,6 +52,8 @@ public final class SandboxPlayer extends Player {
     private static final float ATTACK_STRENGTH_PARTIAL_TICK = 0.5F;
     // - Player.attack only makes a knockback attack, the one that slows the attacker down, above this strength -
     private static final float FULL_ATTACK_STRENGTH = 0.9F;
+    // - The knockback Player.attack adds for a knockback attack -
+    private static final float KNOCKBACK_ATTACK_BONUS = 0.5F;
 
     private final ClientContext client;
     private final CachedPlayerInfo playerInfo;
@@ -74,6 +78,9 @@ public final class SandboxPlayer extends Player {
     // - the player's last tick, and its value now -
     private ItemStack mainHandItemBeforeLastTick = ItemStack.EMPTY;
     private ItemStack mainHandItemAfterLastTick = ItemStack.EMPTY;
+    // - What the last Player.attack did to the player itself, recorded while it ran (see attack) -
+    private @Nullable AttackRecord lastAttack;
+    private boolean attacking;
 
     public SandboxPlayer(Level level, GameProfile profile, ClientContext client) {
         super(level, profile);
@@ -219,18 +226,100 @@ public final class SandboxPlayer extends Player {
         }
     }
 
-    // - Whether an attack now would be a knockback attack for one possible ticker and not for another -
-    public boolean attackDependsOnHotbarSwitchTiming() {
-        if (!this.isSprinting()) {
+    // - Player.attack decides at its start whether the attack is a knockback attack, one made sprinting at full -
+    // - strength. The decision is recorded for this player's ticker and for every alternative one before -
+    // - Player.onAttack resets them all -
+    @Override
+    public void attack(Entity entity) {
+        boolean sprinting = this.isSprinting();
+        boolean knockbackAttack = sprinting && this.isFullStrengthAttack(this.attackStrengthTicker);
+        List<Integer> tickersWithOtherKnockbackAttack = new ArrayList<>();
+        for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
+            if ((sprinting && this.isFullStrengthAttack(alternative.ticker)) != knockbackAttack) {
+                tickersWithOtherKnockbackAttack.add(alternative.ticker);
+            }
+        }
+        this.lastAttack = new AttackRecord(knockbackAttack, List.copyOf(tickersWithOtherKnockbackAttack));
+        this.attacking = true;
+        try {
+            super.attack(entity);
+        } finally {
+            this.attacking = false;
+        }
+    }
+
+    // - Player.attack adds the attack's knockback to this one once the attack hurt its target. On the client it only -
+    // - comes from the attack knockback attribute: the enchantments count on the server (LivingEntity.getKnockback) -
+    @Override
+    protected float getKnockback(Entity target, DamageSource damageSource) {
+        float knockback = super.getKnockback(target, damageSource);
+        if (this.attacking && this.lastAttack != null) {
+            this.lastAttack.baseKnockback = knockback;
+        }
+        return knockback;
+    }
+
+    // - Player.attack calls this exactly when the attack hurt its target; a positive knockback slows the attacker -
+    @Override
+    public void causeExtraKnockback(Entity entity, float knockbackAmount, Vec3 oldMovement, DamageSource damageSource, float damage, boolean comesFromEffect) {
+        if (this.attacking && this.lastAttack != null) {
+            this.lastAttack.hurtTarget = true;
+            this.lastAttack.knockback = knockbackAmount;
+        }
+        super.causeExtraKnockback(entity, knockbackAmount, oldMovement, damageSource, damage, comesFromEffect);
+    }
+
+    // - An attack strength ticker the client may have had instead (see alternativeAttackStrengths) under which the -
+    // - last attack would have slowed the player down when this player's did not, or not when it did. Whether an -
+    // - attack hurts does not depend on its strength on the client, since Entity.hurtClient takes no damage -
+    public OptionalInt tickerForOtherAttackSlowdown() {
+        AttackRecord attack = this.lastAttack;
+        if (attack == null || !attack.hurtTarget || attack.tickersWithOtherKnockbackAttack.isEmpty()) {
+            return OptionalInt.empty();
+        }
+        float otherKnockback = attack.baseKnockback + (attack.knockbackAttack ? 0.0F : KNOCKBACK_ATTACK_BONUS);
+        if (otherKnockback > 0.0F == attack.knockback > 0.0F) {
+            return OptionalInt.empty();
+        }
+        return OptionalInt.of(attack.tickersWithOtherKnockbackAttack.getFirst());
+    }
+
+    // - Whether an attack now would slow the player down if it hurt its target, under this player's ticker or an -
+    // - alternative one (Player.attack and causeExtraKnockback) -
+    public boolean attackCouldSlowDown() {
+        float baseKnockback = super.getKnockback(this, this.damageSources().playerAttack(this));
+        if (baseKnockback > 0.0F) {
+            return true;
+        }
+        if (!this.isSprinting() || baseKnockback + KNOCKBACK_ATTACK_BONUS <= 0.0F) {
             return false;
         }
-        boolean fullStrength = this.isFullStrengthAttack(this.attackStrengthTicker);
+        if (this.isFullStrengthAttack(this.attackStrengthTicker)) {
+            return true;
+        }
         for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
-            if (this.isFullStrengthAttack(alternative.ticker) != fullStrength) {
+            if (this.isFullStrengthAttack(alternative.ticker)) {
                 return true;
             }
         }
         return false;
+    }
+
+    // - The part of Player.causeExtraKnockback that acts on the attacker, for an attack whose target the sandbox does -
+    // - not know: an attack that hurt its target with a positive knockback slows the attacker and stops its sprint -
+    public void slowDownAfterAttack() {
+        this.setDeltaMovement(this.getDeltaMovement().multiply(0.6, 1.0, 0.6));
+        this.setSprinting(false);
+    }
+
+    // - Whether the client's attack strength ticker may differ from this player's (see alternativeAttackStrengths) -
+    public boolean hasAlternativeAttackStrengths() {
+        return !this.alternativeAttackStrengths.isEmpty();
+    }
+
+    // - Gives the player the attack strength ticker the client may have had instead, before its attack runs again -
+    public void useAttackStrengthTicker(int ticker) {
+        this.attackStrengthTicker = ticker;
     }
 
     // - Player.getAttackStrengthScale as Player.attack uses it, for any ticker -
@@ -712,5 +801,20 @@ public final class SandboxPlayer extends Player {
     private static final class AlternativeAttackStrength {
         private int ticker;
         private boolean heldMainHandItem = true;
+    }
+
+    // - An attack as Player.attack made it: whether it was a knockback attack, the alternative tickers that would -
+    // - have decided otherwise, and once it hurt its target, the base knockback and the knockback in total -
+    private static final class AttackRecord {
+        private final boolean knockbackAttack;
+        private final List<Integer> tickersWithOtherKnockbackAttack;
+        private boolean hurtTarget;
+        private float baseKnockback;
+        private float knockback;
+
+        private AttackRecord(boolean knockbackAttack, List<Integer> tickersWithOtherKnockbackAttack) {
+            this.knockbackAttack = knockbackAttack;
+            this.tickersWithOtherKnockbackAttack = tickersWithOtherKnockbackAttack;
+        }
     }
 }
