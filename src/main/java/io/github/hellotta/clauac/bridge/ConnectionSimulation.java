@@ -113,7 +113,8 @@ final class ConnectionSimulation {
     private static final int VARINT_CONTINUE_BIT = 0x80;
     private static final double NANOS_PER_MILLISECOND = 1.0E6;
 
-    private record WaitingPacket(ProtocolPhase phase, PacketDirection direction, int packetId, byte[] encodedPacket) {
+    // - handedInNanos is when the packet was sent or received, which the simulation measures the client's ticks by -
+    private record WaitingPacket(ProtocolPhase phase, PacketDirection direction, int packetId, byte[] encodedPacket, long handedInNanos) {
     }
 
     // - A tick that is to be set back, with what its setback needs -
@@ -496,9 +497,9 @@ final class ConnectionSimulation {
                 if (direction == PacketDirection.SERVERBOUND) {
                     this.hold.countHandedOver();
                 }
-                Objects.requireNonNull(this.simulation).handlePacket(phase, direction, encodedPacket);
+                Objects.requireNonNull(this.simulation).handlePacket(phase, direction, encodedPacket, System.nanoTime());
             }
-            case WAITING -> this.keepWaiting(new WaitingPacket(phase, direction, packetId, encodedPacket));
+            case WAITING -> this.keepWaiting(new WaitingPacket(phase, direction, packetId, encodedPacket, System.nanoTime()));
             case NOT_SIMULATED -> {
             }
         }
@@ -707,7 +708,7 @@ final class ConnectionSimulation {
         if (started != null) {
             for (WaitingPacket packet : this.waitingPackets) {
                 if (currentRuntime.isRelevant(packet.phase(), packet.direction(), packet.packetId())) {
-                    started.handlePacket(packet.phase(), packet.direction(), packet.encodedPacket());
+                    started.handlePacket(packet.phase(), packet.direction(), packet.encodedPacket(), packet.handedInNanos());
                 }
             }
         }

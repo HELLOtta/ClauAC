@@ -13,6 +13,9 @@ public enum Check {
     BAD_PACKETS("BadPackets"),
     // - The client ended more ticks than the simulation takes on (see the tick budget) -
     TICK_RATE("TickRate"),
+    // - The client ended its ticks faster than the timer of a vanilla client runs: its ticks got further ahead of the -
+    // - real time since it last answered one of the server's packets than a vanilla client's get when it catches up -
+    TIMER("Timer"),
     // - The client held back its answers to the server's packets until the older half was applied without them -
     PINGS("Pings"),
     // - The simulation itself failed during the tick; nothing the client sent could be checked -

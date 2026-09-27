@@ -292,10 +292,9 @@ Known limits:
   at the next pong instead.
 - A connection that was already playing when ClauAC started watching it (after a plugin reload) is not simulated:
   the simulation has to see a connection from its first configuration packet on.
-- The tick budget (see "Cost and limits") bounds what the simulation costs; it is not a timer check. A client that
-  ends fewer ticks than real time allows for a while may end that many more later, up to the ticks of 60 seconds at
-  once, and 1% more than real time allows all along. Those ticks are simulated and checked like any other, so each of
-  them still has to move the player as vanilla would.
+- The tick budget (see "Cost and limits") only bounds what the simulation costs; the `Timer` check (see "Responses")
+  finds a client that ends its ticks faster than its timer allows. A client whose timer runs up to 1% fast passes
+  both, since clocks drift that far apart in neither's view.
 
 ### Verified so far
 
@@ -353,12 +352,30 @@ Every `MISMATCHED` tick names the checks it failed, each with what exactly faile
 | `BadPackets`        | The client sent a packet no vanilla client sends in its situation, or one the sandbox could  |
 |                     | not decode or apply (see "Results")                                                          |
 | `TickRate`          | The client ended more ticks than the tick budget holds (see "Cost and limits")               |
+| `Timer`             | The client ended its ticks faster than the timer of a vanilla client runs (see below)        |
 | `Pings`             | The client left so many of the server's packets unconfirmed that the older half was applied  |
 |                     | without its answers (see "Cost and limits")                                                  |
 | `SimulationFailure` | The simulation itself failed during the tick, so nothing the client sent in it was checked   |
 
 Something the simulation cannot know (see "What the simulation cannot know") only ever explains a difference in the
 movement: the tick is `UNVERIFIED` instead of failing `Simulation` or `Vehicle`. The other checks fail regardless.
+
+`Timer` follows the least real time the client's timer can have reached. When the client answers one of the server's
+packets (a pong, the acceptance of a teleport, a rotation, the acknowledgement of a configuration phase), it has
+processed that packet, so its timer is at least at the time the server sent it; every tick it ends afterwards advances
+the timer by a tick target (50 ms, or the server's slower tick rate while its level runs normally), less 1% for clocks
+that run fast. A tick end cannot arrive before the client ended the tick, and a vanilla client never gets ahead of
+real time: after a pause it runs at most 10 ticks at once and drops the rest (`Minecraft.runTick`,
+`DeltaTracker.Timer`), so that its ticks get at most 11 tick targets ahead of the real time between them. A tick end
+that arrives more than 12 tick targets (600 ms) earlier than the timer can have reached therefore fails `Timer`, and the
+timer is put back to that limit, so that only a tick further ahead fails next. A connection that stalls only makes the
+tick ends arrive later, and a client that holds back its answers only keeps the timer from being moved up.
+
+In game, with the player walking back and forth through a proxy, no tick failed `Timer` in normal play, nor while the
+proxy held the client's packets for 25 seconds and then sent them at once, nor in the 1644 ticks of the flight test
+course. One extra tick end injected every 250 ms, a client about 20% fast, failed `Timer` from 72 ticks (3.6 seconds)
+on, 67 times in 15 seconds, and once more right after it stopped. 1500 tick ends injected at once failed it 1503
+times.
 
 ### Setbacks
 

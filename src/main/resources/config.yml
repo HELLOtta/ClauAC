@@ -38,6 +38,10 @@ checks:
   TickRate:
     alert: true
     setback: true
+  # - The client ended its ticks faster than the timer of a vanilla client runs -
+  Timer:
+    alert: true
+    setback: true
   # - The client held back its answers to the server's packets -
   Pings:
     alert: true

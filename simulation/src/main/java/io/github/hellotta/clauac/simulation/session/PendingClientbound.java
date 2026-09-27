@@ -16,7 +16,8 @@ import org.jspecify.annotations.Nullable;
 // - its size and bytes may be read from any thread -
 final class PendingClientbound {
 
-    record PendingPacket(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket) {
+    // - sentAt is when the packet was handed to the simulation (System.nanoTime), right before it was written -
+    record PendingPacket(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket, long sentAt) {
     }
 
     private final Deque<PendingPacket> packets = new ArrayDeque<>();

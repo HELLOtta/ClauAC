@@ -70,6 +70,7 @@ import org.jspecify.annotations.Nullable;
 public final class ClientSession implements PlayerSimulation {
 
     private static final double NANOS_PER_SECOND = 1.0E9;
+    private static final double NANOS_PER_MILLISECOND = 1.0E6;
 
     private final GameProfile profile;
     private final SimulationListener listener;
@@ -77,6 +78,7 @@ public final class ClientSession implements PlayerSimulation {
     private final SimulationLimits limits;
     private final SimulationCost cost = new SimulationCost();
     private final TickBudget tickBudget;
+    private final ClientClock clientClock = new ClientClock();
     private final SerialExecutor executor;
     private final ProtocolDecoders decoders = new ProtocolDecoders();
     private final PendingClientbound pending = new PendingClientbound();
@@ -115,14 +117,14 @@ public final class ClientSession implements PlayerSimulation {
         this.configuration = new ConfigurationSession(registryCache, this.registries.access(), this.enabledFeatures);
     }
 
-    // - The time a packet was handed in is the time it arrived, which the tick budget measures the client's ticks by -
+    // - The time a packet was handed in with is the time it was sent or arrived, which the tick budget and the -
+    // - client's clock measure the client's ticks by -
     @Override
-    public void handlePacket(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket) {
+    public void handlePacket(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket, long handedInNanos) {
         if (this.closed || this.fellBehind) {
             return;
         }
-        long arrivedAt = System.nanoTime();
-        this.executor.execute(() -> this.process(phase, direction, encodedPacket, arrivedAt), encodedPacket.length);
+        this.executor.execute(() -> this.process(phase, direction, encodedPacket, handedInNanos), encodedPacket.length);
         this.checkKeepingUp();
     }
 
@@ -213,7 +215,7 @@ public final class ClientSession implements PlayerSimulation {
         try {
             packet = this.decoders.decode(phase, direction, encodedPacket);
             if (direction == PacketDirection.CLIENTBOUND) {
-                this.onClientbound(phase, packet, encodedPacket);
+                this.onClientbound(phase, packet, encodedPacket, arrivedAt);
             } else {
                 this.onServerbound(phase, packet, arrivedAt);
             }
@@ -269,8 +271,8 @@ public final class ClientSession implements PlayerSimulation {
         }
     }
 
-    private void onClientbound(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket) {
-        this.pending.add(new PendingClientbound.PendingPacket(phase, packet, encodedPacket));
+    private void onClientbound(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket, long sentAt) {
+        this.pending.add(new PendingClientbound.PendingPacket(phase, packet, encodedPacket, sentAt));
         if (phase == ProtocolPhase.CONFIGURATION) {
             this.applyLeadingConfigurationPackets();
         }
@@ -303,8 +305,8 @@ public final class ClientSession implements PlayerSimulation {
         }
     }
 
-    // - Applies everything the client provably processed, up to and including the answered packet. Returns false -
-    // - when no pending packet is the answered one -
+    // - Applies everything the client provably processed, up to and including the answered packet, which also tells -
+    // - the client's clock how far the client has come. Returns false when no pending packet is the answered one -
     private boolean applyThrough(Predicate<Packet<?>> answeredPacket, String answer) {
         List<PendingClientbound.PendingPacket> released = this.pending.takeThrough(answeredPacket);
         if (released.isEmpty()) {
@@ -312,6 +314,7 @@ public final class ClientSession implements PlayerSimulation {
             this.reject(Check.BAD_PACKETS, "the client sent " + answer + " for a packet the server never sent");
             return false;
         }
+        this.clientClock.reached(released.getLast().sentAt());
         for (PendingClientbound.PendingPacket packet : released) {
             this.apply(packet);
         }
@@ -468,6 +471,12 @@ public final class ClientSession implements PlayerSimulation {
         PlayConnection connection = this.play;
         float millisPerTick = connection != null ? connection.clientTickMillis() : PlayConnection.DEFAULT_TICK_MILLIS;
         boolean inBudget = this.tickBudget.take(arrivedAt, millisPerTick);
+        long timerAhead = this.clientClock.tick(arrivedAt, millisPerTick);
+        if (timerAhead > 0L) {
+            this.reject(Check.TIMER, String.format(Locale.ROOT,
+                    "the client's ticks ran %.0f ms ahead of real time since it last answered a packet, where a vanilla client's get %.0f ms ahead at most",
+                    timerAhead / NANOS_PER_MILLISECOND, ClientClock.slackNanos(millisPerTick) / NANOS_PER_MILLISECOND));
+        }
         if (connection == null) {
             ClientTickReport report = this.tickOutsidePlay(repositionPending);
             this.listener.onClientTick(report, this.cost.endTick(System.nanoTime()), end);
