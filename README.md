@@ -376,11 +376,13 @@ use began a frame after the sandbox's in one of three runs, and the alternative 
 A round trip through a nether portal matched, with the player walking out of the portal it arrived in and back; the
 ticks while the client loaded the terrain after each change of dimension are `NOT_SIMULATED`, as the client does not
 tick its player then. With the client's auto-jump option on, the player walked onto a single block, up a staircase of
-three steps and against a wall two blocks high without jumping at it, jumped onto a block while sprinting, and not
-while sneaking: the client decides an auto-jump on its own (`LocalPlayer.updateAutoJump`) and reports only the jump
-in its input. Levitation and slow falling are part of the fourth test course, over a connection with latency. With
-these four courses added, the thirteen test courses matched in all of their 19 727 simulated ticks; the other 67 were
-the loading of the terrain after the portal's changes of dimension.
+three steps and against a wall two blocks high without jumping at it, jumped onto a block while sprinting, and not while
+sneaking: the client decides an auto-jump on its own (`LocalPlayer.updateAutoJump`) and reports only the jump in its
+input. Levitation and slow falling are part of the fourth test course, over a connection with latency. With these four
+courses added, the thirteen test courses matched in all of their 19 727 simulated ticks; the other 67 were the loading
+of the terrain after the portal's changes of dimension. With the fixes for the worse connections below, the thirteen
+courses matched again in all of their 19 802 simulated ticks, and in all 19 841 of another run in which every tick of
+the player on foot ran a second time from its snapshot (`clauac.verifyRepeatedTicks=true`) and ended the same.
 
 Menu clicks matched the client's hashes in chests, the player's inventory (crafting included), furnaces, stonecutters,
 anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.
@@ -391,6 +393,26 @@ reported it, which the next tick confirmed; a sprint attack right after a hotbar
 strength that switch left, and an attack on an entity id the sandbox did not know, injected into the connection,
 matched without slowing the player down. While the player was dead the sandbox, like the client, did not move it
 (`NOT_SIMULATED`), and matching resumed after the respawn.
+
+Over worse connections the courses matched as well. A proxy between the client and the server held back what each side
+sent: by 300 ms each way; by 1 s each way, a round trip of 2 s; by 60 ms and up to 120 ms more for every piece it read,
+never letting a piece overtake the one before; by 40 ms and up to 20 ms more, while one in 500 pieces stalled its
+direction for 0.2 to 1 s, as TCP does while it resends a lost segment; and by 30 ms, while one in 2000 pieces stalled
+its direction for 3 to 6 s. Over these connections, courses 1, 2, 3, 5, 7, 8, 9, 10, 11 and 12 and the block and combat
+tests matched in all of their 35 526 simulated ticks but the 46 with the cheats of those tests, which ClauAC refused as
+over a direct connection. ClauAC held the client's packets for 2 to 9 ms on average. When a stall split the packets of a
+tick, they waited for the rest of the tick, at most for `setbacks.maximum-hold-millis`; once in the long stalls that
+time ran out and they went on unjudged, as they are meant to, and otherwise only the packets the block test lets go that
+way on purpose did. The long stalls and the round trip of 2 s each showed a bug, both fixed since (see "Following the
+client's timeline"): Paper disconnected the player for answering its keep-alives out of order, and the answer to a
+correction of a pig the player had taken over passed for steering.
+
+Paper's own checks acted a few times over these connections. After a stall of several seconds towards the server, the
+client's movement of those seconds arrived at once; Paper measured all of it from where the player had stood at the
+start of the server tick and teleported the player back (`moved too quickly`). Its vehicle checks corrected a pig the
+player took over with a hotbar key, most of all over the round trip of 2 s and the long stalls, and logged a happy
+ghast as `moved wrongly`, as they do over a direct connection. The sandbox followed every one of these corrections as
+the client did.
 
 ## Responses
 
