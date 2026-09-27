@@ -3,6 +3,7 @@ package io.github.hellotta.clauac.simulation.session;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.OptionalInt;
 import java.util.Set;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
@@ -28,9 +29,12 @@ final class ClientTickPackets {
     boolean reportedFlying;
     // - A START_FALL_FLYING command was part of this tick -
     boolean fallFlyingStartReported;
+    // - The jump power of a START_RIDING_JUMP command of this tick -
+    OptionalInt reportedRidingJump = OptionalInt.empty();
     // - What the simulated player itself would have sent while ticking -
     boolean predictedAbilitiesSent;
     boolean predictedFallFlyingStart;
+    OptionalInt predictedRidingJump = OptionalInt.empty();
     final Set<String> uncertainties = new LinkedHashSet<>();
     // - What the sandbox rejected during this tick: packets no vanilla client sends in the sandbox's situation, and -
     // - steps of the simulation that failed. Any of them makes the tick MISMATCHED, whatever the comparison finds -
@@ -45,8 +49,10 @@ final class ClientTickPackets {
         this.abilitiesReported = false;
         this.reportedFlying = false;
         this.fallFlyingStartReported = false;
+        this.reportedRidingJump = OptionalInt.empty();
         this.predictedAbilitiesSent = false;
         this.predictedFallFlyingStart = false;
+        this.predictedRidingJump = OptionalInt.empty();
         this.uncertainties.clear();
         this.rejections.clear();
         this.notes.clear();

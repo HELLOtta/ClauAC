@@ -27,7 +27,11 @@ final class TickReporter implements SimulationListener {
 
     private static final String CSV_HEADER = "clientTick,outcome,predictedX,predictedY,predictedZ,predictedOnGround,predictedHorizontalCollision,"
             + "predictedSprinting,positionReported,reportedX,reportedY,reportedZ,reportedOnGround,reportedHorizontalCollision,reportedSprinting,"
-            + "offset,entityNearby,notes";
+            + "offset,entityNearby,vehicle,vehiclePredictedX,vehiclePredictedY,vehiclePredictedZ,vehiclePredictedYRot,vehiclePredictedXRot,"
+            + "vehiclePredictedOnGround,vehiclePositionReported,vehicleReportedX,vehicleReportedY,vehicleReportedZ,vehicleReportedYRot,"
+            + "vehicleReportedXRot,vehicleReportedOnGround,vehicleOffset,notes";
+    // - The vehicle columns of a tick without a steered vehicle -
+    private static final String NO_VEHICLE_COLUMNS = ",".repeat(14);
 
     private final User user;
     private final String playerName;
@@ -100,11 +104,11 @@ final class TickReporter implements SimulationListener {
             }
         }
         if (report.outcome() == TickOutcome.MISMATCHED) {
-            this.logger.info("{} tick {} MISMATCHED by {}: predicted {} {} {} ground={} collision={} sprint={}, reported {} {} {} ground={} collision={} sprint={}{}; {}",
+            this.logger.info("{} tick {} MISMATCHED by {}: predicted {} {} {} ground={} collision={} sprint={}, reported {} {} {} ground={} collision={} sprint={}{}{}; {}",
                     this.playerName, report.clientTick(), report.offset(),
                     report.predictedX(), report.predictedY(), report.predictedZ(), report.predictedOnGround(), report.predictedHorizontalCollision(), report.predictedSprinting(),
                     report.reportedX(), report.reportedY(), report.reportedZ(), report.reportedOnGround(), report.reportedHorizontalCollision(), report.reportedSprinting(),
-                    nearby ? " (entity nearby)" : "", String.join("; ", report.notes()));
+                    nearby ? " (entity nearby)" : "", vehicleDescription(report.vehicle()), String.join("; ", report.notes()));
         }
         if (this.actionBarEnabled) {
             this.showInActionBar(report);
@@ -130,8 +134,42 @@ final class TickReporter implements SimulationListener {
                 Boolean.toString(report.reportedSprinting()),
                 Double.toString(report.offset()),
                 Boolean.toString(entityNearby),
+                vehicleColumns(report.vehicle()),
                 quote(String.join("; ", report.notes()))
         );
+    }
+
+    private static String vehicleColumns(ClientTickReport.@Nullable VehicleState vehicle) {
+        if (vehicle == null) {
+            return NO_VEHICLE_COLUMNS;
+        }
+        return String.join(",",
+                quote(vehicle.type()),
+                Double.toString(vehicle.predictedX()),
+                Double.toString(vehicle.predictedY()),
+                Double.toString(vehicle.predictedZ()),
+                Float.toString(vehicle.predictedYRot()),
+                Float.toString(vehicle.predictedXRot()),
+                Boolean.toString(vehicle.predictedOnGround()),
+                Boolean.toString(vehicle.positionReported()),
+                Double.toString(vehicle.reportedX()),
+                Double.toString(vehicle.reportedY()),
+                Double.toString(vehicle.reportedZ()),
+                Float.toString(vehicle.reportedYRot()),
+                Float.toString(vehicle.reportedXRot()),
+                Boolean.toString(vehicle.reportedOnGround()),
+                Double.toString(vehicle.offset())
+        );
+    }
+
+    private static String vehicleDescription(ClientTickReport.@Nullable VehicleState vehicle) {
+        if (vehicle == null) {
+            return "";
+        }
+        return String.format(Locale.ROOT, ", vehicle %s by %s: predicted %s %s %s rot %s %s ground=%s, reported %s %s %s rot %s %s ground=%s",
+                vehicle.type(), vehicle.offset(),
+                vehicle.predictedX(), vehicle.predictedY(), vehicle.predictedZ(), vehicle.predictedYRot(), vehicle.predictedXRot(), vehicle.predictedOnGround(),
+                vehicle.reportedX(), vehicle.reportedY(), vehicle.reportedZ(), vehicle.reportedYRot(), vehicle.reportedXRot(), vehicle.reportedOnGround());
     }
 
     private static String quote(String value) {
@@ -145,8 +183,12 @@ final class TickReporter implements SimulationListener {
             case UNVERIFIED -> NamedTextColor.YELLOW;
             case NOT_SIMULATED -> NamedTextColor.GRAY;
         };
-        String offset = Double.isNaN(report.offset()) ? "-" : String.format(Locale.ROOT, "%.3e", report.offset());
-        Component text = Component.text("ClauAC tick " + report.clientTick() + " " + report.outcome() + " offset " + offset, color);
+        // - While the player steers a vehicle, the vehicle's position is what the client reports -
+        ClientTickReport.VehicleState vehicle = report.vehicle();
+        double shownOffset = vehicle != null ? vehicle.offset() : report.offset();
+        String offset = Double.isNaN(shownOffset) ? "-" : String.format(Locale.ROOT, "%.3e", shownOffset);
+        String subject = vehicle != null ? " vehicle offset " : " offset ";
+        Component text = Component.text("ClauAC tick " + report.clientTick() + " " + report.outcome() + subject + offset, color);
         Object channel = this.user.getChannel();
         // - Only valid in the play phase; checked on the connection's event loop, where the phase changes -
         ChannelHelper.runInEventLoop(channel, () -> {

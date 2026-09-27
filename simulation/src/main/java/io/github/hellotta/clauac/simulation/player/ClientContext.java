@@ -21,4 +21,8 @@ public interface ClientContext extends PlayerInfoDirectory {
 
     // - LocalPlayer.aiStep sends START_FALL_FLYING when the player starts gliding -
     void onFallFlyingStartSent();
+
+    // - LocalPlayer.sendRidingJump sends START_RIDING_JUMP with the jump power when the player releases the jump of -
+    // - its vehicle -
+    void onRidingJumpSent(int jumpPower);
 }

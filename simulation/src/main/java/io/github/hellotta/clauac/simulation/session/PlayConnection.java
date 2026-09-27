@@ -23,6 +23,7 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.PositionAndRotation;
 import net.minecraft.network.HashedPatchMap;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundPingPacket;
@@ -113,6 +114,7 @@ import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.resources.RegistryOps;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.tags.EntityTypeTags;
 import net.minecraft.util.HashOps;
 import net.minecraft.util.Mth;
 import net.minecraft.util.ProblemReporter;
@@ -125,6 +127,9 @@ import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.ai.attributes.AttributeMap;
 import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.entity.vehicle.boat.AbstractBoat;
+import net.minecraft.world.entity.vehicle.minecart.AbstractMinecart;
+import net.minecraft.world.entity.vehicle.minecart.Minecart;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.ItemStack;
@@ -186,15 +191,15 @@ final class PlayConnection implements ClientContext {
     // - Minecraft.cameraEntity -
     private @Nullable Entity cameraEntity;
     private OptionalInt removedPlayerVehicleId = OptionalInt.empty();
-    // - The client's position is not simulated while riding; the first tick after riding adopts the reported one -
-    private boolean positionNeedsResync;
     // - A checked container click showed that the sandbox's items differ from the client's, in the menu with this -
     // - id. The sandbox's items are unknown until the server sends that menu's or the inventory's full contents -
     private OptionalInt unknownInventoryMenu = OptionalInt.empty();
-    // - A MISMATCHED report held back until the client's next tick shows whether a hotbar switch explains it (see -
-    // - releaseHeldReport), and the main hand item the player was using during that tick -
+    // - A report held back until the client's next tick decides on it (see releaseHeldReport): a MISMATCHED one that -
+    // - a hotbar switch may explain, with the main hand item the player was using during that tick, or one whose -
+    // - tick the sandbox simulated with a hotbar switch it inferred, which the next tick has to confirm -
     private @Nullable ClientTickReport heldReport;
     private ItemStack heldReportUsedItem = ItemStack.EMPTY;
+    private @Nullable InferredHotbarSwitch heldReportInferredSwitch;
     private int ticksSinceVelocityEstimate = VELOCITY_ESTIMATE_TICKS;
     // - The difference and the outcome of the tick whose resync estimated the velocity last -
     private double estimatedAfterOffset;
@@ -262,6 +267,11 @@ final class PlayConnection implements ClientContext {
     @Override
     public void onFallFlyingStartSent() {
         this.tickPackets.predictedFallFlyingStart = true;
+    }
+
+    @Override
+    public void onRidingJumpSent(int jumpPower) {
+        this.tickPackets.predictedRidingJump = OptionalInt.of(jumpPower);
     }
 
     // - Handles a clientbound play packet the client has provably processed -
@@ -852,10 +862,11 @@ final class PlayConnection implements ClientContext {
         }
         this.releaseHeldReport(tickPlayer, reports);
         tickLevel.tickRateManager().tick();
-        // - The rotation of the whole tick, which the client's key and mouse actions already used -
+        // - The rotation of the whole tick, which the client's key and mouse actions already used. A riding player -
+        // - reports it after its vehicle turned it during the tick -
         ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
         if (movePacket != null && movePacket.hasRotation()) {
-            tickPlayer.setYRot(movePacket.getYRot(tickPlayer.getYRot()));
+            tickPlayer.setYRot(movePacket.getYRot(tickPlayer.getYRot()) - this.passengerTurnOfTick(tickPlayer));
             tickPlayer.setXRot(movePacket.getXRot(tickPlayer.getXRot()));
         }
         tickPlayer.setReportedKeys(reportedKeys);
@@ -868,15 +879,7 @@ final class PlayConnection implements ClientContext {
             notes.add(this.clientLoaded ? "player removed" : "client has not loaded the level");
             return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
         }
-        if (tickPlayer.isPassenger()) {
-            tickLevel.tickEntities();
-            tickLevel.tickBlockEntities();
-            this.followReportedVehicle(tickPlayer);
-            this.positionNeedsResync = true;
-            List<String> notes = new ArrayList<>(this.tickPackets.notes);
-            notes.add("riding " + tickPlayer.getRootVehicle().typeHolder().getRegisteredName());
-            return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
-        }
+        InferredHotbarSwitch inferredSwitch = this.inferHotbarSwitch(tickPlayer);
         List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
         this.collectOngoingUncertainties(uncertainties);
         // - LivingEntity.updatingUsingItem, at the start of the player's tick, stops the use once the used hand holds -
@@ -885,15 +888,99 @@ final class PlayConnection implements ClientContext {
                 ? tickPlayer.getUseItem().copy()
                 : ItemStack.EMPTY;
         Vec3 positionBeforeTick = tickPlayer.position();
+        Entity vehicleBeforeTick = tickPlayer.getRootVehicle();
+        Vec3 vehiclePositionBeforeTick = vehicleBeforeTick.position();
         tickLevel.tickEntities();
         tickLevel.tickBlockEntities();
-        ClientTickReport report = this.compareWithClient(clientTick, tickPlayer, positionBeforeTick, reportedSprinting, uncertainties, new ArrayList<>(this.tickPackets.notes));
-        if (report.outcome() == TickOutcome.MISMATCHED && this.tickPackets.rejections.isEmpty() && !usedMainHandItem.isEmpty()) {
+        ClientTickReport report;
+        ItemStack heldUsedItem = ItemStack.EMPTY;
+        // - LocalPlayer.sendChanges decides after the tick whether the player rides -
+        if (tickPlayer.isPassenger()) {
+            Vec3 steeredVehicleBeforeTick = tickPlayer.getRootVehicle() == vehicleBeforeTick ? vehiclePositionBeforeTick : null;
+            report = this.compareRiding(clientTick, tickPlayer, steeredVehicleBeforeTick, reportedSprinting, uncertainties, new ArrayList<>(this.tickPackets.notes));
+        } else {
+            report = this.compareWithClient(clientTick, tickPlayer, positionBeforeTick, reportedSprinting, uncertainties, new ArrayList<>(this.tickPackets.notes));
+            if (report.outcome() == TickOutcome.MISMATCHED && this.tickPackets.rejections.isEmpty()) {
+                heldUsedItem = usedMainHandItem;
+            }
+        }
+        if (inferredSwitch != null || !heldUsedItem.isEmpty()) {
             this.heldReport = report;
-            this.heldReportUsedItem = usedMainHandItem;
+            this.heldReportUsedItem = heldUsedItem;
+            this.heldReportInferredSwitch = inferredSwitch;
             return null;
         }
         return report;
+    }
+
+    // - A hotbar key pressed during the tick's key handling (Minecraft.handleKeybinds, before any other key) changes -
+    // - the held item at once, but MultiPlayerGameMode reports the new slot only at the start of the next tick unless -
+    // - an action of this tick needed it first. While the player rides a vehicle it steers by what it holds (a pig -
+    // - by a carrot on a stick, a strider by a warped fungus on a stick), this tick's packets show such a switch all -
+    // - the same: LocalPlayer.sendChanges sends the vehicle's position exactly while the client steers it. When they -
+    // - contradict the held item and no slot was reported after the tick's first packet, the sandbox selects the -
+    // - first hotbar slot that explains them. The next tick has to report the slot (see confirmInferredHotbarSwitch) -
+    private @Nullable InferredHotbarSwitch inferHotbarSwitch(SandboxPlayer player) {
+        Entity vehicle = player.getRootVehicle();
+        boolean clientSteers = this.tickPackets.vehicleMove != null;
+        if (vehicle == player || vehicle.isLocalInstanceAuthoritative() == clientSteers) {
+            return null;
+        }
+        List<Packet<?>> actions = this.tickPackets.actions;
+        for (int index = 1; index < actions.size(); index++) {
+            if (actions.get(index) instanceof ServerboundSetCarriedItemPacket) {
+                return null;
+            }
+        }
+        Inventory inventory = player.getInventory();
+        int previousSlot = inventory.getSelectedSlot();
+        for (int slot = 0; slot < Inventory.getSelectionSize(); slot++) {
+            if (slot == previousSlot) {
+                continue;
+            }
+            inventory.setSelectedSlot(slot);
+            if (vehicle.isLocalInstanceAuthoritative() == clientSteers) {
+                // - The hotbar key came before the tick's other key handling, which the sandbox replayed already -
+                boolean leadingReport = !actions.isEmpty() && actions.getFirst() instanceof ServerboundSetCarriedItemPacket;
+                if (actions.size() > (leadingReport ? 1 : 0)) {
+                    this.tickPackets.uncertainties.add("the tick's actions came after a hotbar key that only the vehicle's packets showed");
+                }
+                this.tickPackets.notes.add("inferred a hotbar key for slot " + (slot + 1) + " from " + (clientSteers ? "steering" : "no longer steering") + " the vehicle");
+                return new InferredHotbarSwitch(previousSlot, slot, vehicle, clientSteers);
+            }
+        }
+        inventory.setSelectedSlot(previousSlot);
+        return null;
+    }
+
+    // - How far the player's vehicle turns it during this tick, which the rotation a riding player reports already -
+    // - includes. AbstractBoat.positionRider turns a passenger the local client is authoritative for (the local -
+    // - player always is) by the boat's deltaRotation. A boat the client steers turns itself by the same amount -
+    // - (controlBoat); the client reports the boat's rotation after the tick, and the boat's rotation before it is -
+    // - the one the client reported last or the sandbox took over. A boat the client does not steer has no -
+    // - deltaRotation (AbstractBoat.tick). The turn is exact up to the rounding of these float rotations, which -
+    // - AbstractBoat.clampRotation adds to at every frame anyway (Entity.turn calls onPassengerTurned) -
+    private float passengerTurnOfTick(SandboxPlayer player) {
+        ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
+        if (vehicleMove != null && player.getVehicle() instanceof AbstractBoat boat && boat.isLocalInstanceAuthoritative()
+                && !player.is(EntityTypeTags.CAN_TURN_IN_BOATS)) {
+            return vehicleMove.movingTo().yRot() - boat.getYRot();
+        }
+        return 0.0F;
+    }
+
+    // - Minecart.positionRider turns a passenger player with the experimental minecart movement, but only while the -
+    // - client's "rotate with minecart" option is on (LocalPlayer.shouldRotateWithMinecart), which the server never -
+    // - learns. The rotation such a player acted with during a tick is then unknown -
+    private static boolean passengerTurnUnknown(SandboxPlayer player) {
+        return player.getVehicle() instanceof Minecart && AbstractMinecart.useExperimentalMovement(player.level());
+    }
+
+    // - An action whose outcome depends on the rotation the player had during the tick -
+    private void checkActionRotation(SandboxPlayer player, String action) {
+        if (passengerTurnUnknown(player)) {
+            this.tickPackets.uncertainties.add(action + " with a rotation the minecart may have turned");
+        }
     }
 
     // - A tick whose simulation failed partway. Nothing the client sent can be checked any more, so the tick is -
@@ -931,7 +1018,7 @@ final class PlayConnection implements ClientContext {
                 clientTick, TickOutcome.MISMATCHED,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
-                Double.NaN, notes
+                Double.NaN, null, notes
         );
     }
 
@@ -948,8 +1035,10 @@ final class PlayConnection implements ClientContext {
         return null;
     }
 
-    // - A held report's tick may have ended with a hotbar switch that stopped the player's item use during that tick. -
-    // - If this tick reports such a switch, the held tick is unverified; otherwise its mismatch stands -
+    // - Decides on the report held back from the previous tick, before this tick's actions. A hotbar switch the -
+    // - sandbox inferred for that tick has to be reported now. A held mismatch may come from a hotbar switch that -
+    // - stopped the player's item use during that tick: if this tick reports such a switch, the held tick is -
+    // - unverified; otherwise its mismatch stands -
     private void releaseHeldReport(SandboxPlayer player, List<ClientTickReport> reports) {
         ClientTickReport held = this.heldReport;
         if (held == null) {
@@ -958,8 +1047,13 @@ final class PlayConnection implements ClientContext {
         this.heldReport = null;
         ItemStack usedItem = this.heldReportUsedItem;
         this.heldReportUsedItem = ItemStack.EMPTY;
+        InferredHotbarSwitch inferredSwitch = this.heldReportInferredSwitch;
+        this.heldReportInferredSwitch = null;
+        if (inferredSwitch != null) {
+            held = this.confirmInferredHotbarSwitch(held, inferredSwitch, player);
+        }
         ServerboundSetCarriedItemPacket leadingSwitch = this.leadingHotbarSwitch(player);
-        if (leadingSwitch != null && !ItemStack.isSameItem(player.getInventory().getItem(leadingSwitch.getSlot()), usedItem)) {
+        if (!usedItem.isEmpty() && leadingSwitch != null && !ItemStack.isSameItem(player.getInventory().getItem(leadingSwitch.getSlot()), usedItem)) {
             held = held.withOutcome(TickOutcome.UNVERIFIED,
                     "not simulated: the hotbar switch the client reported with its next tick may have stopped the item use in this tick");
             // - The held tick was the last one to estimate the velocity, and its difference is now unverified -
@@ -970,12 +1064,67 @@ final class PlayConnection implements ClientContext {
         reports.add(held);
     }
 
-    // - The report held back when the play phase or the connection ends, when no further tick can explain it -
+    // - The client reports a slot it selected with a hotbar key at the start of its next tick (MultiPlayerGameMode.tick), -
+    // - so this tick has to start with that report. Another slot than the sandbox chose confirms the switch as well -
+    // - when it steers the vehicle the same way; the client then held another item during the held tick, which in a -
+    // - riding tick changes nothing the sandbox compares, only the attack strength ticker afterwards (see -
+    // - SandboxPlayer.considerEarlierHotbarSwitch). Without that report, no vanilla client explains the held tick's -
+    // - vehicle packets, and the client still holds its slot from before -
+    private ClientTickReport confirmInferredHotbarSwitch(ClientTickReport held, InferredHotbarSwitch inferred, SandboxPlayer player) {
+        Inventory inventory = player.getInventory();
+        List<Packet<?>> actions = this.tickPackets.actions;
+        if (!actions.isEmpty() && actions.getFirst() instanceof ServerboundSetCarriedItemPacket carriedItem && Inventory.isHotbarSlot(carriedItem.getSlot())) {
+            int reportedSlot = carriedItem.getSlot();
+            if (reportedSlot == inferred.slot()) {
+                return held;
+            }
+            if (this.steersAsInferred(player, inferred, reportedSlot)) {
+                ItemStack assumedItem = inventory.getItem(inferred.slot());
+                inventory.setSelectedSlot(reportedSlot);
+                if (!ItemStack.isSameItem(assumedItem, inventory.getItem(reportedSlot))) {
+                    player.considerEarlierHotbarSwitch();
+                }
+                return held.withOutcome(held.outcome(),
+                        "the client selected hotbar slot " + (reportedSlot + 1) + " in this tick, where the sandbox chose slot " + (inferred.slot() + 1));
+            }
+        }
+        inventory.setSelectedSlot(inferred.previousSlot());
+        return held.withOutcome(TickOutcome.MISMATCHED, "rejected: the client " + (inferred.steers() ? "steered" : "stopped steering")
+                + " its vehicle, which only a hotbar switch explains, and reported none with its next tick");
+    }
+
+    // - Whether selecting this slot hands the vehicle of the inferred switch to the client, or takes it away, as the -
+    // - inferred slot did. Once the player left that vehicle, the slot has to hold the same item -
+    private boolean steersAsInferred(SandboxPlayer player, InferredHotbarSwitch inferred, int slot) {
+        Inventory inventory = player.getInventory();
+        if (player.getRootVehicle() != inferred.vehicle()) {
+            return ItemStack.isSameItem(inventory.getItem(slot), inventory.getItem(inferred.slot()));
+        }
+        int selectedSlot = inventory.getSelectedSlot();
+        inventory.setSelectedSlot(slot);
+        boolean steers = inferred.vehicle().isLocalInstanceAuthoritative();
+        inventory.setSelectedSlot(selectedSlot);
+        return steers == inferred.steers();
+    }
+
+    // - The report held back when the play phase or the connection ends, when no further tick can explain it. A -
+    // - hotbar switch the sandbox inferred for its tick was never reported -
     @Nullable ClientTickReport takeHeldReport() {
         ClientTickReport held = this.heldReport;
+        InferredHotbarSwitch inferredSwitch = this.heldReportInferredSwitch;
         this.heldReport = null;
         this.heldReportUsedItem = ItemStack.EMPTY;
+        this.heldReportInferredSwitch = null;
+        if (held != null && inferredSwitch != null) {
+            return held.withOutcome(TickOutcome.UNVERIFIED,
+                    "not simulated: the play phase ended before the client reported the hotbar slot inferred for this tick");
+        }
         return held;
+    }
+
+    // - A hotbar key the tick's packets showed the client pressing (see inferHotbarSwitch): the slot selected before, -
+    // - the one the sandbox selected, the vehicle, and whether the client steers it since -
+    private record InferredHotbarSwitch(int previousSlot, int slot, Entity vehicle, boolean steers) {
     }
 
     // - Replays Minecraft.handleKeybinds and MultiPlayerGameMode.tick for this tick from the packets they sent. An -
@@ -1018,8 +1167,11 @@ final class PlayConnection implements ClientContext {
                 Packet<?> next = index + 1 < actions.size() ? actions.get(index + 1) : null;
                 return this.performPlayerAction(playerAction, next, level, player) || swingAccompanied;
             }
-            case ServerboundUseItemOnPacket useItemOn ->
-                    this.gameMode.useItemOn(level, player, useItemOn.hand(), useItemOn.hitResult(), useItemOn.sequence(), this.tickPackets);
+            case ServerboundUseItemOnPacket useItemOn -> {
+                // - A placed block faces by the player's rotation -
+                this.checkActionRotation(player, "used an item on a block");
+                this.gameMode.useItemOn(level, player, useItemOn.hand(), useItemOn.hitResult(), useItemOn.sequence(), this.tickPackets);
+            }
             case ServerboundUseItemPacket useItem -> {
                 player.setYRot(useItem.yRot());
                 player.setXRot(useItem.xRot());
@@ -1047,6 +1199,8 @@ final class PlayConnection implements ClientContext {
             }
             case ServerboundPunchPacket ignored -> {
                 if (!swingAccompanied) {
+                    // - What the crosshair pointed at depends on the player's rotation -
+                    this.checkActionRotation(player, "swung at what the crosshair pointed at");
                     this.gameMode.swingAlone(level, player, crosshair);
                 }
                 return false;
@@ -1110,23 +1264,7 @@ final class PlayConnection implements ClientContext {
         throw new IllegalArgumentException("Unknown player action " + action.getAction());
     }
 
-    // - While the player steers its vehicle, the client moves the vehicle and reports where it went. The sandbox does -
-    // - not compare vehicles, and places the vehicle and its riders where the client reported them -
-    private void followReportedVehicle(SandboxPlayer ridingPlayer) {
-        ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
-        Entity vehicle = ridingPlayer.getRootVehicle();
-        if (vehicleMove != null && vehicle != ridingPlayer && vehicle.isLocalInstanceAuthoritative()) {
-            Vec3 position = vehicleMove.movingTo().position();
-            vehicle.absSnapTo(position.x, position.y, position.z, vehicleMove.movingTo().yRot(), vehicleMove.movingTo().xRot());
-            vehicle.setOnGround(vehicleMove.onGround());
-            vehicle.getPassengers().forEach(vehicle::positionRider);
-        }
-    }
-
     private void collectOngoingUncertainties(List<String> uncertainties) {
-        if (this.positionNeedsResync) {
-            uncertainties.add("position unknown after riding");
-        }
         if (this.unknownInventoryMenu.isPresent()) {
             uncertainties.add("items differ from the client's");
         }
@@ -1143,7 +1281,7 @@ final class PlayConnection implements ClientContext {
                 clientTick, rejections.isEmpty() ? TickOutcome.NOT_SIMULATED : TickOutcome.MISMATCHED,
                 tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), tickPlayer.onGround(), tickPlayer.horizontalCollision, tickPlayer.isSprinting(),
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
-                Double.NaN, notes
+                Double.NaN, null, notes
         );
     }
 
@@ -1235,12 +1373,9 @@ final class PlayConnection implements ClientContext {
         if (predictedSprinting != reportedSprinting) {
             differences.add("sprinting");
         }
-        if (packets.predictedAbilitiesSent != packets.abilitiesReported
-                || packets.abilitiesReported && tickPlayer.getAbilities().flying != packets.reportedFlying) {
-            differences.add("flying");
-        }
-        if (packets.predictedFallFlyingStart != packets.fallFlyingStartReported) {
-            differences.add("fall flying start");
+        this.addPlayerCommandDifferences(differences, tickPlayer);
+        if (packets.vehicleMove != null) {
+            differences.add("a vehicle position was sent while not riding");
         }
         boolean onlyPositionDiffers = positionDiffers && differences.size() == 1;
         double roundingOfEstimate = VELOCITY_ESTIMATE_ULPS * Math.ulp(Math.max(Math.abs(reportedX), Math.max(Math.abs(reportedY), Math.abs(reportedZ))));
@@ -1256,27 +1391,7 @@ final class PlayConnection implements ClientContext {
 
         this.advanceLastSent(reported);
 
-        // - A rejected packet makes the tick MISMATCHED even when everything else matched: no uncertainty explains a -
-        // - packet no vanilla client sends -
-        boolean rejected = !packets.rejections.isEmpty();
-        TickOutcome outcome;
-        if (differences.isEmpty() && !rejected) {
-            outcome = TickOutcome.MATCHED;
-            if (!uncertainties.isEmpty()) {
-                notes.add("matched despite: " + String.join(", ", uncertainties));
-            }
-        } else {
-            outcome = uncertainties.isEmpty() || rejected ? TickOutcome.MISMATCHED : TickOutcome.UNVERIFIED;
-            if (!differences.isEmpty()) {
-                notes.add("differs in: " + String.join(", ", differences));
-            }
-            if (rejected) {
-                notes.add("rejected: " + String.join(", ", packets.rejections));
-            }
-            if (!uncertainties.isEmpty()) {
-                notes.add((differences.isEmpty() ? "matched despite: " : "not simulated: ") + String.join(", ", uncertainties));
-            }
-        }
+        TickOutcome outcome = this.outcome(differences, uncertainties, notes);
         if (!differences.isEmpty()) {
             // - Continue from the client's state -
             if (positionReported) {
@@ -1287,14 +1402,173 @@ final class PlayConnection implements ClientContext {
             }
             adoptReportedState(tickPlayer, reported, reportedSprinting, packets);
         }
-        this.positionNeedsResync = false;
         this.ticksSinceVelocityEstimate = Math.min(this.ticksSinceVelocityEstimate + 1, VELOCITY_ESTIMATE_TICKS);
 
         return new ClientTickReport(
                 clientTick, outcome,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
                 positionReported, reportedX, reportedY, reportedZ, reportedOnGround, reportedHorizontalCollision, reportedSprinting,
-                offset, notes
+                offset, null, notes
+        );
+    }
+
+    // - What the player itself sends while it ticks, on foot and riding: its abilities (flying), the start of gliding and -
+    // - the jump of its vehicle -
+    private void addPlayerCommandDifferences(List<String> differences, SandboxPlayer tickPlayer) {
+        ClientTickPackets packets = this.tickPackets;
+        if (packets.predictedAbilitiesSent != packets.abilitiesReported
+                || packets.abilitiesReported && tickPlayer.getAbilities().flying != packets.reportedFlying) {
+            differences.add("flying");
+        }
+        if (packets.predictedFallFlyingStart != packets.fallFlyingStartReported) {
+            differences.add("fall flying start");
+        }
+        if (!packets.predictedRidingJump.equals(packets.reportedRidingJump)) {
+            differences.add("riding jump");
+        }
+    }
+
+    // - The outcome of a compared tick, with the notes that explain it. A rejected packet makes the tick MISMATCHED -
+    // - even when everything else matched: no uncertainty explains a packet no vanilla client sends -
+    private TickOutcome outcome(List<String> differences, List<String> uncertainties, List<String> notes) {
+        Set<String> rejections = this.tickPackets.rejections;
+        boolean rejected = !rejections.isEmpty();
+        if (differences.isEmpty() && !rejected) {
+            if (!uncertainties.isEmpty()) {
+                notes.add("matched despite: " + String.join(", ", uncertainties));
+            }
+            return TickOutcome.MATCHED;
+        }
+        if (!differences.isEmpty()) {
+            notes.add("differs in: " + String.join(", ", differences));
+        }
+        if (rejected) {
+            notes.add("rejected: " + String.join(", ", rejections));
+        }
+        if (!uncertainties.isEmpty()) {
+            notes.add((differences.isEmpty() ? "matched despite: " : "not simulated: ") + String.join(", ", uncertainties));
+        }
+        return uncertainties.isEmpty() || rejected ? TickOutcome.MISMATCHED : TickOutcome.UNVERIFIED;
+    }
+
+    // - LocalPlayer.sendChanges while the player rides: a rotation packet every tick with the player's ground and -
+    // - collision state, and, when the player steers the vehicle (it is authoritative on the client), the vehicle's -
+    // - position (ServerboundMoveVehiclePacket, from Entity.getClientPositionAndRotation) and the player's sprinting. -
+    // - The sandbox moved the vehicle with the same vanilla code and the same keys. A vehicle the player does not steer -
+    // - moves as the server says, which the sandbox follows like the client. On any difference the sandbox takes over -
+    // - what the client reported. vehiclePositionBeforeTick is null when the player changed vehicles during the tick -
+    private ClientTickReport compareRiding(
+            long clientTick, SandboxPlayer tickPlayer, @Nullable Vec3 vehiclePositionBeforeTick, boolean reportedSprinting, List<String> uncertainties, List<String> notes
+    ) {
+        ClientTickPackets packets = this.tickPackets;
+        Entity vehicle = tickPlayer.getRootVehicle();
+        String vehicleType = vehicle.typeHolder().getRegisteredName();
+        boolean steering = vehicle.isLocalInstanceAuthoritative();
+        boolean predictedOnGround = tickPlayer.onGround();
+        boolean predictedHorizontalCollision = tickPlayer.horizontalCollision;
+        boolean predictedSprinting = tickPlayer.isSprinting();
+        List<String> differences = new ArrayList<>();
+        ServerboundMovePlayerPacket movePacket = packets.movePacket;
+        if (movePacket == null || !movePacket.hasRotation()) {
+            differences.add("expected a rotation, none was sent");
+        } else if (movePacket.hasPosition()) {
+            differences.add("a position was sent while riding");
+        } else {
+            if (movePacket.isOnGround() != predictedOnGround) {
+                differences.add("on ground");
+            }
+            if (movePacket.horizontalCollision() != predictedHorizontalCollision) {
+                differences.add("horizontal collision");
+            }
+        }
+        // - LocalPlayer.sendIsSprintingIfNeeded only runs for a steered vehicle -
+        if (steering && predictedSprinting != reportedSprinting) {
+            differences.add("sprinting");
+        }
+        this.addPlayerCommandDifferences(differences, tickPlayer);
+
+        ServerboundMoveVehiclePacket vehicleMove = packets.vehicleMove;
+        ClientTickReport.VehicleState vehicleState = null;
+        if (steering) {
+            PositionAndRotation predicted = vehicle.getClientPositionAndRotation();
+            Vec3 predictedPosition = predicted.position();
+            boolean predictedVehicleOnGround = vehicle.onGround();
+            if (vehicleMove == null) {
+                differences.add("expected a vehicle position, none was sent");
+                vehicleState = new ClientTickReport.VehicleState(
+                        vehicleType, predictedPosition.x, predictedPosition.y, predictedPosition.z, predicted.yRot(), predicted.xRot(), predictedVehicleOnGround,
+                        false, Double.NaN, Double.NaN, Double.NaN, Float.NaN, Float.NaN, false, Double.NaN
+                );
+            } else {
+                PositionAndRotation reportedVehicle = vehicleMove.movingTo();
+                Vec3 reportedPosition = reportedVehicle.position();
+                if (predictedPosition.x != reportedPosition.x || predictedPosition.y != reportedPosition.y || predictedPosition.z != reportedPosition.z) {
+                    differences.add("vehicle position");
+                }
+                if (predicted.yRot() != reportedVehicle.yRot() || predicted.xRot() != reportedVehicle.xRot()) {
+                    differences.add("vehicle rotation");
+                }
+                if (predictedVehicleOnGround != vehicleMove.onGround()) {
+                    differences.add("vehicle on ground");
+                }
+                vehicleState = new ClientTickReport.VehicleState(
+                        vehicleType, predictedPosition.x, predictedPosition.y, predictedPosition.z, predicted.yRot(), predicted.xRot(), predictedVehicleOnGround,
+                        true, reportedPosition.x, reportedPosition.y, reportedPosition.z, reportedVehicle.yRot(), reportedVehicle.xRot(), vehicleMove.onGround(),
+                        predictedPosition.distanceTo(reportedPosition)
+                );
+            }
+        } else {
+            notes.add("riding " + vehicleType + ", which the server moves");
+            if (vehicleMove != null) {
+                differences.add("a vehicle position was sent for a vehicle the client does not steer");
+            }
+        }
+
+        TickOutcome outcome = this.outcome(differences, uncertainties, notes);
+        if (!differences.isEmpty()) {
+            // - Continue from the client's state -
+            if (steering && vehicleMove != null) {
+                PositionAndRotation reportedVehicle = vehicleMove.movingTo();
+                Vec3 reportedPosition = reportedVehicle.position();
+                if (vehiclePositionBeforeTick != null) {
+                    correctHorizontalVelocity(vehicle, vehiclePositionBeforeTick, reportedPosition);
+                }
+                vehicle.absSnapTo(reportedPosition.x, reportedPosition.y, reportedPosition.z, reportedVehicle.yRot(), reportedVehicle.xRot());
+                vehicle.setOnGround(vehicleMove.onGround());
+                // - positionRider only has to move the passengers along; a boat turns the player's head a second -
+                // - time, and its rotation, which the client reported, is taken below -
+                float yHeadRot = tickPlayer.getYHeadRot();
+                vehicle.getPassengers().forEach(vehicle::positionRider);
+                tickPlayer.setYHeadRot(yHeadRot);
+            }
+            if (movePacket != null && movePacket.hasRotation() && !movePacket.hasPosition()) {
+                tickPlayer.setOnGround(movePacket.isOnGround());
+                tickPlayer.horizontalCollision = movePacket.horizontalCollision();
+            }
+            if (steering) {
+                tickPlayer.setSprinting(reportedSprinting);
+            }
+            if (packets.abilitiesReported) {
+                tickPlayer.getAbilities().flying = packets.reportedFlying;
+            }
+        }
+        // - The rotation the client ended its tick with, which it reported. The sandbox's lies a rounding apart after -
+        // - a boat's turn (see passengerTurnOfTick), or further when the turn depends on what the client does not -
+        // - report (see passengerTurnUnknown). The head keeps the sandbox's turn: Player.aiStep points it along the -
+        // - rotation before the vehicle turns both, and AbstractBoat.clampRotation limits only the rotation -
+        if (movePacket != null && movePacket.hasRotation()) {
+            tickPlayer.setYRot(movePacket.getYRot(tickPlayer.getYRot()));
+            tickPlayer.setXRot(movePacket.getXRot(tickPlayer.getXRot()));
+        }
+        // - A ridden player's own velocity is zeroed every tick (Entity.rideTick), so no estimate of it lasts -
+        this.ticksSinceVelocityEstimate = VELOCITY_ESTIMATE_TICKS;
+
+        ReportedState reported = this.reportedState();
+        return new ClientTickReport(
+                clientTick, outcome,
+                tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), predictedOnGround, predictedHorizontalCollision, predictedSprinting,
+                reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
+                Double.NaN, vehicleState, notes
         );
     }
 
@@ -1305,11 +1579,11 @@ final class PlayConnection implements ClientContext {
     // - the same scale times the part of the client's movement the simulation did not make, so an axis whose -
     // - movement matched keeps its velocity exactly. An axis the simulation did not move along gives no scale and -
     // - keeps its velocity; vertical velocity also depends on gravity, which is not a scale, and is kept -
-    private static void correctHorizontalVelocity(SandboxPlayer player, Vec3 positionBeforeTick, Vec3 reportedPosition) {
-        Vec3 predictedMovement = player.position().subtract(positionBeforeTick);
+    private static void correctHorizontalVelocity(Entity entity, Vec3 positionBeforeTick, Vec3 reportedPosition) {
+        Vec3 predictedMovement = entity.position().subtract(positionBeforeTick);
         Vec3 reportedMovement = reportedPosition.subtract(positionBeforeTick);
-        Vec3 velocity = player.getDeltaMovement();
-        player.setDeltaMovement(
+        Vec3 velocity = entity.getDeltaMovement();
+        entity.setDeltaMovement(
                 velocityForMovement(velocity.x, predictedMovement.x, reportedMovement.x),
                 velocity.y,
                 velocityForMovement(velocity.z, predictedMovement.z, reportedMovement.z)
@@ -1345,6 +1619,11 @@ final class PlayConnection implements ClientContext {
     // - START_FALL_FLYING, sent while the player ticks -
     void onFallFlyingStartReported() {
         this.tickPackets.fallFlyingStartReported = true;
+    }
+
+    // - START_RIDING_JUMP, sent while the player ticks, with the jump power -
+    void onRidingJumpReported(int jumpPower) {
+        this.tickPackets.reportedRidingJump = OptionalInt.of(jumpPower);
     }
 
     // - LocalPlayer's record of what it last sent: xLast, yLast, zLast, lastOnGround, lastHorizontalCollision, -

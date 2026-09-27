@@ -275,7 +275,7 @@ public final class SandboxLevel extends Level {
     }
 
     // - The only packet level code sends is the paddle state of a boat the local player steers; the real client sent -
-    // - its own, and the sandbox does not compare vehicles -
+    // - its own, and the paddles only animate the boat -
     @Override
     public void sendPacketToServer(Packet<?> packet) {
     }

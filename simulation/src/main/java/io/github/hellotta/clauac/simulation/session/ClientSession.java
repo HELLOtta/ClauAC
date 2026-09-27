@@ -314,9 +314,13 @@ public final class ClientSession implements PlayerSimulation {
                     case START_SPRINTING -> this.requirePlay().onSprintReported(true);
                     case STOP_SPRINTING -> this.requirePlay().onSprintReported(false);
                     case START_FALL_FLYING -> this.requirePlay().onFallFlyingStartReported();
-                    case STOP_SLEEPING, START_RIDING_JUMP, STOP_RIDING_JUMP, OPEN_INVENTORY -> {
-                        // - Requests the server answers: leaving the bed, the riding jump and the mount's inventory -
-                        // - screen only change the client once the server's packets for them arrive -
+                    // - The client jumps its vehicle itself and tells the server the power -
+                    case START_RIDING_JUMP -> this.requirePlay().onRidingJumpReported(command.getData());
+                    // - Only the enum and the server's handler know it; no code of the 26.3 client sends it -
+                    case STOP_RIDING_JUMP -> this.reject("the client sent STOP_RIDING_JUMP, which a vanilla client never sends");
+                    case STOP_SLEEPING, OPEN_INVENTORY -> {
+                        // - Requests the server answers: leaving the bed and the mount's inventory screen only change -
+                        // - the client once the server's packets for them arrive -
                     }
                 }
             }
@@ -381,7 +385,7 @@ public final class ClientSession implements PlayerSimulation {
                 this.clientTick, TickOutcome.MISMATCHED,
                 Double.NaN, Double.NaN, Double.NaN, false, false, false,
                 false, Double.NaN, Double.NaN, Double.NaN, false, false, false,
-                Double.NaN, notes
+                Double.NaN, null, notes
         );
     }
 }

@@ -107,6 +107,21 @@ entity, and moves the player with the keys, rotation and sprint commands the cli
 horizontal collision, sprinting, flying and the start of gliding. When anything differs, the sandbox continues from the
 client's reported state, including a velocity estimated from the tick it just simulated.
 
+A riding player sends a rotation with its ground and collision state every tick instead, and, while it steers the
+vehicle (a boat, a saddled horse or camel, a pig or strider with its item on a stick, a happy ghast with a harness, a
+saddled nautilus), the vehicle's position, rotation and ground state, its sprinting and the power of a vehicle jump.
+The sandbox moves the vehicle with the same vanilla code and keys and compares all of it exactly; a vehicle the player
+does not steer moves as the server says, which the sandbox follows like the client. Two things need care:
+
+- A boat turns its rider during the tick, so the rotation the client reports is the one after that turn. The sandbox
+  starts the tick with the reported rotation minus the turn the client reported for the boat, and ends it with the
+  reported rotation.
+- A hotbar key pressed during a tick changes the held item at once, but the client reports the new slot only at the
+  start of its next tick. For a vehicle steered by what the player holds, the tick's own packets show the switch: the
+  client sends the vehicle's position exactly while it steers. When they contradict the held item, the sandbox selects
+  the first hotbar slot that explains them and holds the tick's result until the next tick reports the slot; a switch
+  the next tick does not report makes the tick `MISMATCHED`.
+
 Menu clicks happen on screens between the client's ticks and are applied right away. The client sends the slots a
 click changed as hashes, so every click is checked: when the sandbox's items turn out to differ from the client's, it
 marks them unknown and ClauAC has the server resend the player's inventory (Paper's `Player#updateInventory`), which
@@ -122,10 +137,11 @@ Each client tick gets one outcome:
 | `MISMATCHED`    | It did not, and nothing outside the simulation's reach was involved; or the client sent a  |
 |                 | packet no vanilla client sends in that situation                                           |
 | `UNVERIFIED`    | It did not, but something the simulation cannot know was involved (see the notes)          |
-| `NOT_SIMULATED` | The client did not move its player (loading screen, dead, riding)                          |
+| `NOT_SIMULATED` | The client did not move its player (loading screen, dead)                                  |
 
 - Every connection is recorded to `plugins/ClauAC/reports/<time>-<player>.csv`, one line per client tick, with the
-  predicted and reported values, the offset, whether another entity was within one block, and notes.
+  predicted and reported values, the offset, whether another entity was within one block, the predicted and reported
+  state of a vehicle the player steers, and notes.
 - `MISMATCHED` ticks are logged to the server console, and a summary is logged when the player leaves; so is every
   inventory resend.
 - `/clauac debug` shows the outcome of every tick in your action bar, `/clauac status` summarises all connections
@@ -152,14 +168,20 @@ the tick is `UNVERIFIED` instead of `MISMATCHED`:
 - The client's velocity is never reported. After a difference the sandbox estimates it from the reported movement;
   the rounding of that estimate can move later positions by a few units in the last place, and after an `UNVERIFIED`
   tick, a difference that keeps shrinking in the ticks right after it stays `UNVERIFIED`.
-- Items the sandbox had to mark unknown, the first tick after riding, attacks on or interactions with entities the
-  sandbox does not know, and teleports whose result differs from the sandbox's.
+- Items the sandbox had to mark unknown, attacks on or interactions with entities the sandbox does not know, and
+  teleports whose result differs from the sandbox's.
+- With the experimental minecart movement, a minecart turns its rider only while the client's "rotate with minecart"
+  option is on, which the server never learns. Placing a block or swinging at what the crosshair points at in such a
+  minecart depends on the rotation the client had.
 
 Known limits:
 
 - An `UNVERIFIED` tick accepts any difference; the alternatives are not simulated yet, so a tick that is uncertain is
   not bounded either.
-- Riding is `NOT_SIMULATED`: vehicles are placed where the client reports them, not compared.
+- The rotation a boat's rider starts a tick with is exact up to the rounding of the float rotations it is computed
+  from; the client's own boat adds such rounding at every frame (`AbstractBoat.clampRotation`), and no packet reports
+  it. Only a rotation-dependent action within that rounding of a boundary could differ.
+- Not verified in game yet: riding in a boat another player steers.
 - The client opens its own inventory screen without telling the server, and its creative inventory screen ignores
   cursor updates and keeps its own menu when the game mode changes. The sandbox cannot follow those; the differences
   show up in the next checked click and are resolved by the inventory resend.
@@ -177,8 +199,11 @@ walking, jumping, sneaking, sprinting and sprint jumping, stairs up and down, si
 creative flight, gliding with an elytra and boosting with fireworks, cows and another player pushing the player,
 walking into a boat and stepping onto it, a team whose collision rule stops those pushes, eating, blocking with a
 shield and drawing a bow while walking, placing a block and walking into it, breaking blocks, and a sprint hit on a
-boat and on another player. Riding a boat and a horse was `NOT_SIMULATED`, and the first
-tick after dismounting matched the client's dismount position.
+boat and on another player. Riding matched as well, the vehicle included: steering a boat on water through turns and
+leaving it, a horse walking, sprinting and making a charged jump, a camel walking and dashing, a pig steered with a
+carrot on a stick and boosted, a strider on lava, a happy ghast flying up, forward and down, a nautilus swimming and
+dashing, a minecart on powered rails, and a panicking pig the server moved, which the player took over with a hotbar
+key and handed back the same way.
 
 Menu clicks matched the client's hashes in chests, the player's inventory (crafting included), furnaces, stonecutters,
 anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.

@@ -39,11 +39,11 @@ import net.minecraft.world.phys.Vec2;
 import net.minecraft.world.phys.Vec3;
 import org.jspecify.annotations.Nullable;
 
-// - Port of the parts of the client-only LocalPlayer and AbstractClientPlayer that decide how the local player moves. -
-// - Everything else is inherited unchanged from the vanilla Player, LivingEntity and Entity classes. Left out on -
-// - purpose, because they only render, play or show something: view bobbing, walked distance, first person hands, -
-// - ambient sounds, water vision, the nausea and portal spinning effect, the tutorial and every screen. The riding -
-// - jump is left out as well: the session reports ticks spent riding as not simulated -
+// - Port of the parts of the client-only LocalPlayer and AbstractClientPlayer that decide how the local player moves, -
+// - on foot and on a vehicle. Everything else is inherited unchanged from the vanilla Player, LivingEntity and Entity -
+// - classes. Left out on purpose, because they only render, play or show something: view bobbing, walked distance, -
+// - first person hands, ambient sounds, water vision, the nausea and portal spinning effect, the tutorial, the riding -
+// - sounds and every screen -
 public final class SandboxPlayer extends Player {
 
     // - Player.attack weighs the attack strength half a tick ahead -
@@ -59,6 +59,9 @@ public final class SandboxPlayer extends Player {
     private boolean crouching;
     private boolean flashOnSetHealth;
     private boolean startedUsingItem;
+    // - LocalPlayer's charge of the jump of a vehicle that can jump (horses, camels) -
+    private int jumpRidingTicks;
+    private float jumpRidingScale;
     private @Nullable InteractionHand usingItemHand;
     // - The other values the client's attackStrengthTicker may have. A hotbar switch the client reports at the start -
     // - of a tick may already have happened during the previous tick's key handling (see PlayConnection); the -
@@ -458,6 +461,35 @@ public final class SandboxPlayer extends Player {
             }
         }
 
+        // - Holding jump charges the vehicle's jump, releasing it jumps and sends START_RIDING_JUMP with the power -
+        PlayerRideableJumping jumpableVehicle = this.jumpableVehicle();
+        if (jumpableVehicle != null && jumpableVehicle.getJumpCooldown() == 0) {
+            if (this.jumpRidingTicks < 0) {
+                this.jumpRidingTicks++;
+                if (this.jumpRidingTicks == 0) {
+                    this.jumpRidingScale = 0.0F;
+                }
+            }
+
+            if (wasJumping && !this.input.keyPresses.jump()) {
+                this.jumpRidingTicks = -10;
+                jumpableVehicle.onPlayerJump(Mth.floor(this.getJumpRidingScale() * 100.0F));
+                this.client.onRidingJumpSent(Mth.floor(this.getJumpRidingScale() * 100.0F));
+            } else if (!wasJumping && this.input.keyPresses.jump()) {
+                this.jumpRidingTicks = 0;
+                this.jumpRidingScale = 0.0F;
+            } else if (wasJumping) {
+                this.jumpRidingTicks++;
+                if (this.jumpRidingTicks < 10) {
+                    this.jumpRidingScale = this.jumpRidingTicks * 0.1F;
+                } else {
+                    this.jumpRidingScale = 0.8F + 2.0F / (this.jumpRidingTicks - 9) * 0.1F;
+                }
+            }
+        } else {
+            this.jumpRidingScale = 0.0F;
+        }
+
         super.aiStep();
         if (this.onGround() && abilities.flying && !this.client.isLocalModeSpectator()) {
             abilities.flying = false;
@@ -543,6 +575,10 @@ public final class SandboxPlayer extends Player {
         return this.getControlledVehicle() instanceof PlayerRideableJumping playerRideableJumping && playerRideableJumping.canJump()
                 ? playerRideableJumping
                 : null;
+    }
+
+    public float getJumpRidingScale() {
+        return this.jumpRidingScale;
     }
 
     @Override
