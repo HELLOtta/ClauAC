@@ -63,7 +63,9 @@ Findings from running the official 26.3 client in a cloud container without a GP
 - **Test world settings:** game rule ids are snake_case in 26.3 (`log_admin_commands`, `advance_time`,
   `drowning_damage`). Set `broadcast-console-to-ops=false` in `run/server.properties` for recordings, otherwise console
   commands fill the chat and cover the action bar. A test player left idle under water drowns, so turn
-  `drowning_damage` off on the test world.
+  `drowning_damage` off on the test world. Phantoms come for a player that has gone more than 72000 ticks without
+  sleeping whenever the sky is dark enough (`PhantomSpawner`), which a thunderstorm makes it even at a stopped noon, and
+  they killed an idle test player: turn `spawn_phantoms` off, clear the weather and turn `advance_weather` off.
 - **Console commands:** `~ ~ ~` in a console command means the console's position (the world spawn); run relative
   commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`.
 - **Key presses:** `xdotool key` releases the key within the same client tick, which the client's per-tick key polling
