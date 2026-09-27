@@ -209,7 +209,7 @@ Known limits:
   at the next pong instead.
 - A connection that was already playing when ClauAC started watching it (after a plugin reload) is not simulated:
   the simulation has to see a connection from its first configuration packet on.
-- Not verified yet: pistons moving blocks and entities, and equipment effects such as leather boots on powder snow.
+- Not verified yet: equipment effects such as leather boots on powder snow.
 
 ### Verified so far
 
@@ -224,6 +224,14 @@ leaving it, a horse walking, sprinting and making a charged jump, a camel walkin
 carrot on a stick and boosted, a strider on lava, a happy ghast flying up, forward and down, a nautilus swimming and
 dashing, a minecart on powered rails, and a panicking pig the server moved, which the player took over with a hotbar
 key and handed back the same way.
+
+Pistons matched too: a piston pushing the player sideways, into a wall, and back while the player walked towards it,
+lifting the block the player stood on, pushing the jumping player down, and lifting the player against a ceiling,
+which left it in the lifted block until the client moved it out sideways; a sticky piston lifting the player and
+pulling it down again, a honey block carrying it, a slime block launching it up and throwing it sideways, pistons
+powered in pulses from one tick up while the player walked backwards into them, and a piston and a slime block
+pushing a boat the player rode. Paper's own movement check logged some of these as `moved wrongly` and teleported the
+player back to where the server's pistons had put it; the sandbox followed those teleports as the client did.
 
 Menu clicks matched the client's hashes in chests, the player's inventory (crafting included), furnaces, stonecutters,
 anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.
