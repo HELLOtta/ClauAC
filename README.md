@@ -205,18 +205,21 @@ The system properties `clauac.maximumQueuedMebibytes`, `clauac.maximumLagMillis`
 in effect when it starts.
 
 Measured on the development server in a container with 4 processors (2 simulation threads) with a real 26.3 client,
-over the seven test courses (walking, swimming, effects, flight, entities, menus, gliding, riding, pistons):
+over the eight test courses (walking, swimming, effects, flight, entities, menus, gliding, riding, pistons,
+equipment):
 
-- A client tick took 1.1 to 1.7 ms on average, depending on the course, with a median of about 1 ms and a 99th
-  percentile of 4.5 to 9.5 ms; single ticks took up to about 50 ms. That is about 2.5% of one simulation thread per
-  player. A Java Flight Recorder profile showed most of it going into ticking the entities and block entities the
-  client knows, as the client itself does; 30 chickens next to the player added 0.2 to 1 ms per tick.
+- A client tick took 1.2 to 1.5 ms on average, depending on the course, and 2.2 ms in the first course after the
+  server started, with a median of about 1 ms and a 99th percentile of 5 to 9.5 ms; single ticks took up to about 70
+  ms. That is about 2.5% of one simulation thread per player. A Java Flight Recorder profile showed most of it going
+  into ticking the entities and block entities the client knows, as the client itself does; 30 chickens next to the
+  player added 0.2 to 1 ms per tick.
 - Joining is the most expensive part: the configuration phase with the registries and the first chunks took about
   1.3 to 1.6 s of simulation time, which left the simulation up to 0.4 s behind for a moment.
-- A snapshot of the player's state (about 300 objects) took about 1 ms once warmed up, and up to 3 ms on average
-  where only a few were taken. Snapshots are only taken in ticks with alternatives, such as every tick an item is
-  used in the main hand, which then took 0.5 to 2 ms more. With `clauac.verifyRepeatedTicks=true`, which repeats
-  every tick from a snapshot, a tick took 4 to 6 ms on average.
+- Snapshots of the player's state (about 300 objects, up to 420) are only taken in ticks with alternatives, such as
+  every tick an item is used in the main hand, which then took 0.5 to 1.5 ms more. Taking one and restoring it took
+  1.1 ms on average over the 70 of one connection, and 3 ms over the first 45 after the server started; taken every
+  tick, as with `clauac.verifyRepeatedTicks=true`, 0.4 to 0.6 ms. That option, which repeats every tick from a
+  snapshot, made a tick take 2.1 to 4 ms on average, and 5.5 ms in the first course after the server started.
 
 The memory limits were tried with lowered values. With `clauac.maximumLagMillis=100` the configuration phase of a
 joining client left a packet waiting longer than that, and the simulation stopped with the reason in the log and in
@@ -283,10 +286,12 @@ Known limits:
   once, and 1% more than real time allows all along. Those ticks are simulated and checked like any other, so each of
   them still has to move the player as vanilla would.
 - Every bundle ClauAC sends ends with a ping that the client answers, so the client sends more packets than without
-  ClauAC: in the test world, a player standing still answered about 90 pings per second next to its 20 tick ends.
-  Paper disconnects a client that sends more than 500 packets per second over 7 seconds (`packet-limiter` in
-  `paper-global.yml`); the packets a connection stall of 25 seconds held back went over that once they arrived,
-  where without the pongs they would have stayed far below it.
+  ClauAC. The server's packets for one tick leave the event loop in several batches, each its own bundle: in the test
+  world, a player standing still among the animals around answered 55 to 95 pings per second next to its 20 tick
+  ends, and 150 per second with 150 chickens walking around it, 87% of all it sent. Paper disconnects a client that
+  sends more than 500 packets per second over 7 seconds (`packet-limiter` in `paper-global.yml`), so the pongs a
+  connection stall held back can do that once they arrive: a stall of 25 seconds did in the test world, where without
+  the pongs it would have stayed far below the limit.
 
 ### Verified so far
 

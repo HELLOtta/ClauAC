@@ -78,6 +78,12 @@ Findings from running the official 26.3 client in a cloud container without a GP
   and, for a simulated one, a second line with what its simulation costs.
 - **Rebuilding:** `runServer` loads the plugin jar straight from `build/libs`. Building while the server runs replaces
   the jar under it and later fails with `NoClassDefFoundError`, so stop the server before building.
+- **System properties:** the container already sets `JAVA_TOOL_OPTIONS` for its HTTPS proxy, so add ClauAC's
+  properties to it instead of replacing it, e.g.
+  `JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Dclauac.verifyRepeatedTicks=true" ./gradlew runServer`.
+- **Holding the client's packets** (a proxy imitating a stalled connection): Paper disconnects a client that sent more
+  than 500 packets per second over 7 s, and the pongs to ClauAC's pings make the test client send about 80 to 170
+  per second. Releasing 25 s of held packets got it disconnected; holds of 15 s stayed below the limit.
 - **A second player:** start another client with its own game directory (a copy of `options.txt` with a low
   `maxFps` and `renderDistance` keeps both clients responsive). Both windows share the Xvfb display: find them with
   `xdotool search --pid <pid>`, move the second one off screen with `xdotool windowmove`, and give the first one the
