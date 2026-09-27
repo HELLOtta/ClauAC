@@ -92,3 +92,12 @@ Findings from running the official 26.3 client in a cloud container without a GP
 - **Test world:** blocks placed by earlier tests stay in the world and get in the way of later courses (a leftover
   furnace swallowed the clicks meant for a chest). Clear them before a recording, for example with
   `fill <from> <to> minecraft:air replace <block>`, which leaves the course itself alone.
+- **config.yml of the dev server:** `saveDefaultConfig` never overwrites `run/plugins/ClauAC/config.yml`, so after a
+  new setting was added the file lacks it and the setting takes its default. Delete the file before starting the
+  server to get the current one with its comments.
+- **Testing setbacks:** a proxy that changes the positions in the client's movement packets imitates a movement
+  cheat without a cheat client; the server's own position of the player can be sampled with
+  `data get entity <name> Pos` on the console meanwhile. Two findings from that: the client answers a vehicle
+  correction (`ClientboundMoveVehiclePacket`) with a vehicle move packet right away, before the pong behind it; and
+  since the simulation continues from what a failed tick reported, a tick that fails after the client took a
+  correction needs a setback of its own, or the ticks after it match and their movement reaches the server.

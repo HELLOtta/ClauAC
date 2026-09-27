@@ -9,29 +9,41 @@ import org.bukkit.configuration.Configuration;
 import org.bukkit.configuration.ConfigurationSection;
 import org.slf4j.Logger;
 
-// - ClauAC's settings from config.yml: who gets alerts, how often and how they look, and which checks alert. Read on -
-// - the server thread when the plugin enables and on /clauac reload; the object never changes, so any thread may read -
-// - it. The config.yml in the plugin jar holds every default: Bukkit falls back to it for a missing or unreadable value -
-public record ClauACSettings(boolean alertsOnJoin, long alertIntervalNanos, String alertFormat, Set<Check> alertedChecks) {
+// - ClauAC's settings from config.yml: who gets alerts, how often and how they look, how long the client's movement -
+// - may wait for its check, and which checks alert and set back. Read on the server thread when the plugin enables -
+// - and on /clauac reload; the object never changes, so any thread may read it. The config.yml in the plugin jar -
+// - holds every default: Bukkit falls back to it for a missing or unreadable value -
+public record ClauACSettings(
+        boolean alertsOnJoin, long alertIntervalNanos, String alertFormat, long maximumHoldNanos, Set<Check> alertedChecks, Set<Check> setbackChecks
+) {
 
     private static final String ALERTS_ON_JOIN = "alerts.on-join";
     private static final String ALERT_INTERVAL_MILLIS = "alerts.interval-millis";
     private static final String ALERT_FORMAT = "alerts.format";
+    private static final String MAXIMUM_HOLD_MILLIS = "setbacks.maximum-hold-millis";
     private static final String CHECKS = "checks";
     private static final String CHECK_ALERT = ".alert";
+    private static final String CHECK_SETBACK = ".setback";
 
     public ClauACSettings {
         alertedChecks = Set.copyOf(alertedChecks);
+        setbackChecks = Set.copyOf(setbackChecks);
     }
 
     public static ClauACSettings load(Configuration config, Logger logger) {
         boolean alertsOnJoin = readBoolean(config, ALERTS_ON_JOIN, logger);
         long alertIntervalMillis = readNonNegativeLong(config, ALERT_INTERVAL_MILLIS, logger);
         String alertFormat = readString(config, ALERT_FORMAT, logger);
+        long maximumHoldMillis = readNonNegativeLong(config, MAXIMUM_HOLD_MILLIS, logger);
         Set<Check> alertedChecks = EnumSet.noneOf(Check.class);
+        Set<Check> setbackChecks = EnumSet.noneOf(Check.class);
         for (Check check : Check.values()) {
-            if (readBoolean(config, CHECKS + "." + check.displayName() + CHECK_ALERT, logger)) {
+            String path = CHECKS + "." + check.displayName();
+            if (readBoolean(config, path + CHECK_ALERT, logger)) {
                 alertedChecks.add(check);
+            }
+            if (readBoolean(config, path + CHECK_SETBACK, logger)) {
+                setbackChecks.add(check);
             }
         }
         ConfigurationSection checks = config.getConfigurationSection(CHECKS);
@@ -42,7 +54,8 @@ public record ClauACSettings(boolean alertsOnJoin, long alertIntervalNanos, Stri
                 }
             }
         }
-        return new ClauACSettings(alertsOnJoin, TimeUnit.MILLISECONDS.toNanos(alertIntervalMillis), alertFormat, alertedChecks);
+        return new ClauACSettings(alertsOnJoin, TimeUnit.MILLISECONDS.toNanos(alertIntervalMillis), alertFormat,
+                TimeUnit.MILLISECONDS.toNanos(maximumHoldMillis), alertedChecks, setbackChecks);
     }
 
     private static boolean readBoolean(Configuration config, String path, Logger logger) {
@@ -80,5 +93,9 @@ public record ClauACSettings(boolean alertsOnJoin, long alertIntervalNanos, Stri
 
     public boolean alerts(Check check) {
         return this.alertedChecks.contains(check);
+    }
+
+    public boolean setsBack(Check check) {
+        return this.setbackChecks.contains(check);
     }
 }

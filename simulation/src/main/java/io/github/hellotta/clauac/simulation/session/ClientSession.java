@@ -9,6 +9,7 @@ import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationListener;
 import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
+import io.github.hellotta.clauac.simulation.api.TickEnd;
 import io.github.hellotta.clauac.simulation.api.TickOutcome;
 import io.github.hellotta.clauac.simulation.registry.ConfigurationSession;
 import io.github.hellotta.clauac.simulation.registry.ReceivedRegistries;
@@ -92,9 +93,12 @@ public final class ClientSession implements PlayerSimulation {
     private @Nullable ConfigurationSession configuration;
     private @Nullable PlayConnection play;
     private long clientTick;
-    // - The tick whose report the play connection holds back, and that tick's time, which goes with the report -
+    // - The serverbound packets handed in so far, as TickEnd counts them -
+    private long serverboundPackets;
+    // - The tick whose report the play connection holds back, and that tick's time and end, which go with the report -
     private long heldTick = -1L;
     private long heldTickNanos;
+    private @Nullable TickEnd heldTickEnd;
 
     public ClientSession(
             UUID profileId, String profileName, SimulationListener listener, ServerRegistryCache registryCache, Executor simulationThreads, SimulationLimits limits
@@ -165,18 +169,32 @@ public final class ClientSession implements PlayerSimulation {
         if (ending != null) {
             ClientTickReport held = ending.takeHeldReport("the play phase ended before the client reported the hotbar switch this tick assumed");
             if (held != null) {
-                this.listener.onClientTick(held, this.heldTickNanos(held));
+                this.listener.onClientTick(held, this.heldTickNanos(held), this.heldTickEnd(held));
             }
         }
         this.heldTick = -1L;
+        this.heldTickEnd = null;
     }
 
     // - The time of the tick whose report the play connection held back -
     private long heldTickNanos(ClientTickReport report) {
+        this.requireHeld(report);
+        return this.heldTickNanos;
+    }
+
+    // - Where the tick whose report the play connection held back ended -
+    private TickEnd heldTickEnd(ClientTickReport report) {
+        this.requireHeld(report);
+        if (this.heldTickEnd == null) {
+            throw new IllegalStateException("the end of held client tick " + report.clientTick() + " was not kept");
+        }
+        return this.heldTickEnd;
+    }
+
+    private void requireHeld(ClientTickReport report) {
         if (report.clientTick() != this.heldTick) {
             throw new IllegalStateException("the report of client tick " + report.clientTick() + " was not held back");
         }
-        return this.heldTickNanos;
     }
 
     // - A packet from the client that the sandbox cannot decode or apply is one no vanilla client sends in the -
@@ -184,6 +202,10 @@ public final class ClientSession implements PlayerSimulation {
     // - packets cannot switch it off. A server packet the sandbox cannot apply would make the real client fail as -
     // - well, since the sandbox runs the client's own handlers; it stops the simulation -
     private void process(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket, long arrivedAt) {
+        // - Every serverbound packet handed in counts, whether it can be decoded or not, as the plugin counts them -
+        if (direction == PacketDirection.SERVERBOUND) {
+            this.serverboundPackets++;
+        }
         if (this.closed || this.failed) {
             return;
         }
@@ -440,40 +462,45 @@ public final class ClientSession implements PlayerSimulation {
     // - Every tick end counts against the tick budget; the ones outside the play phase are rejected anyway -
     private void endClientTick(long arrivedAt) {
         this.clientTick++;
+        TickEnd end = new TickEnd(this.serverboundPackets, arrivedAt);
+        // - The server's packets that will move the player but that the client had not processed when the tick began -
+        boolean repositionPending = this.pending.findFirst(PlayConnection::repositionsPlayer) != null;
         PlayConnection connection = this.play;
         float millisPerTick = connection != null ? connection.clientTickMillis() : PlayConnection.DEFAULT_TICK_MILLIS;
         boolean inBudget = this.tickBudget.take(arrivedAt, millisPerTick);
         if (connection == null) {
-            ClientTickReport report = this.tickOutsidePlay();
-            this.listener.onClientTick(report, this.cost.endTick(System.nanoTime()));
+            ClientTickReport report = this.tickOutsidePlay(repositionPending);
+            this.listener.onClientTick(report, this.cost.endTick(System.nanoTime()), end);
             return;
         }
         List<ClientTickReport> reports = inBudget
-                ? connection.tick(this.clientTick)
+                ? connection.tick(this.clientTick, repositionPending)
                 : connection.skipTick(this.clientTick, new Flag(Check.TICK_RATE, String.format(Locale.ROOT,
                         "the client ended more ticks than real time allows, one per %.1f ms and at once those of %d ms, so this tick was not simulated",
-                        millisPerTick, TimeUnit.NANOSECONDS.toMillis(this.limits.maximumTickBurstNanos()))));
+                        millisPerTick, TimeUnit.NANOSECONDS.toMillis(this.limits.maximumTickBurstNanos()))), repositionPending);
         long tickNanos = this.cost.endTick(System.nanoTime());
         boolean delivered = false;
         for (ClientTickReport report : reports) {
             if (report.clientTick() == this.clientTick) {
-                this.listener.onClientTick(report, tickNanos);
+                this.listener.onClientTick(report, tickNanos, end);
                 delivered = true;
             } else {
-                this.listener.onClientTick(report, this.heldTickNanos(report));
+                this.listener.onClientTick(report, this.heldTickNanos(report), this.heldTickEnd(report));
             }
         }
         if (delivered) {
             this.heldTick = -1L;
+            this.heldTickEnd = null;
         } else {
             // - The play connection held this tick's report back -
             this.heldTick = this.clientTick;
             this.heldTickNanos = tickNanos;
+            this.heldTickEnd = end;
         }
     }
 
     // - A vanilla client only ends its ticks while it is in a level; there is nothing to simulate or compare -
-    private ClientTickReport tickOutsidePlay() {
+    private ClientTickReport tickOutsidePlay(boolean repositionPending) {
         List<Flag> rejections = new ArrayList<>(this.pendingRejections);
         rejections.add(new Flag(Check.BAD_PACKETS, "the client ended a tick outside the play phase, which a vanilla client never does"));
         List<String> notes = new ArrayList<>(this.pendingNotes);
@@ -484,7 +511,7 @@ public final class ClientSession implements PlayerSimulation {
                 this.clientTick, TickOutcome.MISMATCHED,
                 Double.NaN, Double.NaN, Double.NaN, false, false, false,
                 false, Double.NaN, Double.NaN, Double.NaN, false, false, false,
-                Double.NaN, null, rejections, notes
+                Double.NaN, null, ClientTickReport.Start.none(repositionPending), rejections, notes
         );
     }
 

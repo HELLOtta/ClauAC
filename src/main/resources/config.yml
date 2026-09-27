@@ -12,23 +12,37 @@ alerts:
   # - %count% (the flags of that player and check since its last alert, this one included) -
   format: "<dark_gray>[<aqua>ClauAC</aqua>]</dark_gray> <white>%player%</white> <gray>failed</gray> <red>%check%</red> <dark_gray>x%count%</dark_gray> <gray>%detail%</gray>"
 
-# - What ClauAC does when a client tick fails a check, per check. alert: whether players with alerts on hear of it -
+setbacks:
+  # - The server applies a tick's movement only once the simulation has checked that tick, so that a setback never -
+  # - has to undo anything on the server. The client's packets wait for that from the tick's first movement packet -
+  # - on, at most this many milliseconds; when the simulation falls further behind, they go on unchecked, and a -
+  # - tick found to fail afterwards sets the player back with a teleport on the server -
+  maximum-hold-millis: 1000
+
+# - What ClauAC does when a client tick fails a check, per check. alert: whether players with alerts on hear of it. -
+# - setback: whether the tick's movement is thrown away and the client put back where the server has the player -
 checks:
   # - The player did not move the way the vanilla client moves it -
   Simulation:
     alert: true
+    setback: true
   # - The vehicle the player steers did not move the way the vanilla client moves it -
   Vehicle:
     alert: true
+    setback: true
   # - The client sent a packet no vanilla client sends in its situation -
   BadPackets:
     alert: true
+    setback: true
   # - The client ended more ticks than the simulation takes on -
   TickRate:
     alert: true
+    setback: true
   # - The client held back its answers to the server's packets -
   Pings:
     alert: true
-  # - The simulation itself failed during a tick -
+    setback: true
+  # - The simulation itself failed during a tick; nothing the client sent could be checked -
   SimulationFailure:
     alert: true
+    setback: false

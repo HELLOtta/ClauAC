@@ -235,6 +235,8 @@ final class PlayConnection implements ClientContext {
     // - tick the sandbox simulated with a hotbar switch it inferred, which the next tick has to confirm -
     private @Nullable ClientTickReport heldReport;
     private ItemStack heldReportUsedItem = ItemStack.EMPTY;
+    // - The player when the current tick began, for its report -
+    private ClientTickReport.Start tickStart = ClientTickReport.Start.none(false);
     private @Nullable InferredHotbarSwitch heldReportInferredSwitch;
     // - Whether the alternative that stops the held tick's item use was tried there without matching -
     private boolean heldReportUseStopTried;
@@ -874,7 +876,8 @@ final class PlayConnection implements ClientContext {
     // - Returns the reports that are final, in the order of the client's ticks: a report may be held back for one tick. -
     // - A failure of the simulation makes the tick MISMATCHED instead of ending the simulation, so that no packet a -
     // - client sends can switch it off -
-    List<ClientTickReport> tick(long clientTick) {
+    List<ClientTickReport> tick(long clientTick, boolean repositionPending) {
+        this.tickStart = this.currentStart(repositionPending);
         List<ClientTickReport> reports = new ArrayList<>(2);
         try {
             ClientTickReport report = this.simulateTick(clientTick, reports);
@@ -912,7 +915,8 @@ final class PlayConnection implements ClientContext {
     // - A tick the client ended sooner than real time allows (see TickBudget) is not simulated, so that ending ticks -
     // - faster cannot make the simulation fall behind: the client's reported state is taken over, and neither the -
     // - player nor the level with its entities ticks. A report held back from the previous tick goes first -
-    List<ClientTickReport> skipTick(long clientTick, Flag rejection) {
+    List<ClientTickReport> skipTick(long clientTick, Flag rejection, boolean repositionPending) {
+        this.tickStart = this.currentStart(repositionPending);
         List<ClientTickReport> reports = new ArrayList<>(2);
         ClientTickReport held = this.takeHeldReport("the next tick, which had to report the hotbar switch this tick assumed, came too soon to be simulated");
         if (held != null) {
@@ -921,6 +925,25 @@ final class PlayConnection implements ClientContext {
         reports.add(this.unsimulatedTick(clientTick, rejection));
         this.tickPackets.reset();
         return reports;
+    }
+
+    // - The player as the tick begins, with the server's packets the client had processed before it applied -
+    private ClientTickReport.Start currentStart(boolean repositionPending) {
+        SandboxPlayer current = this.player;
+        if (current == null) {
+            return ClientTickReport.Start.none(repositionPending);
+        }
+        Vec3 velocity = current.getDeltaMovement();
+        return new ClientTickReport.Start(current.getX(), current.getY(), current.getZ(), velocity.x, velocity.y, velocity.z, repositionPending);
+    }
+
+    // - The server's packets that put the player somewhere: after one of them the player is where the server wants -
+    // - it, whatever it did before -
+    static boolean repositionsPlayer(Packet<?> packet) {
+        return packet instanceof ClientboundPlayerPositionPacket
+                || packet instanceof ClientboundRespawnPacket
+                || packet instanceof ClientboundLoginPacket
+                || packet instanceof ClientboundStartConfigurationPacket;
     }
 
     // - Minecraft.getTickTargetMillis: the client ticks no faster than its timer, and slower while the level runs -
@@ -1330,7 +1353,7 @@ final class PlayConnection implements ClientContext {
                 clientTick, TickOutcome.MISMATCHED,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
-                Double.NaN, null, rejections, notes
+                Double.NaN, null, this.tickStart, rejections, notes
         );
     }
 
@@ -1740,7 +1763,7 @@ final class PlayConnection implements ClientContext {
                 clientTick, rejections.isEmpty() ? TickOutcome.NOT_SIMULATED : TickOutcome.MISMATCHED,
                 tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), tickPlayer.onGround(), tickPlayer.horizontalCollision, tickPlayer.isSprinting(),
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
-                Double.NaN, null, List.copyOf(rejections), notes
+                Double.NaN, null, this.tickStart, List.copyOf(rejections), notes
         );
     }
 
@@ -1845,7 +1868,7 @@ final class PlayConnection implements ClientContext {
                 clientTick, outcome,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
                 positionReported, reportedX, reportedY, reportedZ, reportedOnGround, reportedHorizontalCollision, reportedSprinting,
-                offset, null, verdict.flags(), notes
+                offset, null, this.tickStart, verdict.flags(), notes
         );
     }
 
@@ -2060,7 +2083,7 @@ final class PlayConnection implements ClientContext {
                 clientTick, verdict.outcome(),
                 tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), predictedOnGround, predictedHorizontalCollision, predictedSprinting,
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
-                Double.NaN, vehicleState, verdict.flags(), notes
+                Double.NaN, vehicleState, this.tickStart, verdict.flags(), notes
         );
     }
 

@@ -4,8 +4,9 @@ A predictive (simulation-based) anticheat plugin for [Paper](https://papermc.io/
 [PacketEvents](https://github.com/retrooper/packetevents).
 
 > **Status:** prototype. ClauAC simulates every client tick of a player's movement with Minecraft's own code and
-> compares the result with what the client sent. It names the checks a tick failed, alerts the players who watch for
-> them and calls an event other plugins can act on (see "Responses"), but it does not set back or punish anyone yet.
+> compares the result with what the client sent. It names the checks a tick failed, keeps the movement of a failed tick
+> from the server and sets the player back, alerts the players who watch for failed checks and calls an event other
+> plugins can act on (see "Responses"). It does not kick or punish anyone.
 
 ## Target platform
 
@@ -158,8 +159,8 @@ Each client tick gets one outcome:
   failed (see "Responses") and notes.
 - `MISMATCHED` ticks are logged to the server console with the checks they failed, and a summary is logged when the
   player leaves; so is every inventory resend.
-- `/clauac debug` shows the outcome of every tick in your action bar, `/clauac status` summarises all connections
-  (see "Responses" for all commands).
+- `/clauac debug` shows the outcome of every tick in your action bar with the checks it failed, `/clauac status`
+  summarises all connections (see "Responses" for all commands).
 
 A packet from the client that the sandbox cannot decode or apply, or that no vanilla client sends in the situation
 the sandbox is in (a pong or a teleport acceptance for something the server never sent, a tick outside the play phase,
@@ -278,7 +279,8 @@ What cannot be tried that way leaves the tick `UNVERIFIED` instead of `MISMATCHE
 
 Known limits:
 
-- An `UNVERIFIED` tick accepts any difference; only what the alternatives cannot cover (see above) is left to it.
+- An `UNVERIFIED` tick accepts any difference, and its movement reaches the server like that of a `MATCHED` one; only
+  what the alternatives cannot cover (see above) is left to it.
 - The rotation a boat's rider starts a tick with is exact up to the rounding of the float rotations it is computed
   from; the client's own boat adds such rounding at every frame (`AbstractBoat.clampRotation`), and no packet reports
   it. Only a rotation-dependent action within that rounding of a boundary could differ.
@@ -358,6 +360,61 @@ Every `MISMATCHED` tick names the checks it failed, each with what exactly faile
 Something the simulation cannot know (see "What the simulation cannot know") only ever explains a difference in the
 movement: the tick is `UNVERIFIED` instead of failing `Simulation` or `Vehicle`. The other checks fail regardless.
 
+### Setbacks
+
+A tick that fails a check whose `setback` is on (every check but `SimulationFailure` by default) is set back: its
+movement never reaches the server, and the client is put back where the server has the player.
+
+- The server applies the client's movement only once the simulation has judged its tick. From a tick's first movement
+  packet on (a position, rotation or ground update of the player, or a vehicle position), ClauAC keeps the client's
+  packets from the server until that tick's verdict, and then lets them go on in the order the client sent them. A
+  packet that is no movement goes on right away while nothing is held, and waits behind what is held otherwise, so
+  that the server gets everything in its order. The packets go on from PacketEvents' decoder, past every packet
+  listener, as if they arrived just then.
+- The movement packets of a failed tick are thrown away, and so are those of every tick after it until the client has
+  taken a correction: a teleport to where the server has the player, which keeps the client's own rotation and gives
+  it the velocity it had when the failed tick began (none when the server has the player elsewhere by now). When the
+  player steers a vehicle, the correction puts the vehicle where the server has it, as the server does after a vehicle
+  moved wrongly, and stops it: that packet carries no velocity, and the client's and the simulation's would differ
+  otherwise. The correction goes out in one of ClauAC's own bundles, so that the pong to the ping behind it shows when
+  the client has taken it; the client's answer to ClauAC's teleport goes no further than the simulation. The server
+  is not involved at all: it never saw the movement that was thrown away.
+- A tick that fails after the client has taken the correction gets a setback of its own, since the simulation went
+  on from where the correction put the player. A tick the client played before it took the correction needs none; the
+  correction puts the client back anyway.
+- When the simulation falls behind, the packets go on unjudged once the oldest has waited `setbacks.maximum-hold-millis`
+  (a second by default), or once more than 2048 packets or 4 MiB are held. The packets of a connection that started
+  while the vanilla runtime was starting are never held, since the simulation does not see all of them. The server
+  then applies movement that may turn out to fail. Such a setback teleports the player back to where the failed tick
+  began, on the server (`Player#teleport`, cause `UNKNOWN`), unless the server put the player somewhere itself after
+  that tick began (a teleport or a respawn), which the setback would undo. A plugin can cancel that teleport; the log
+  says so then. Vehicle movement that reached the server this way stays: the vehicle is only put back where the server
+  has it.
+- A dead or sleeping player is not set back, and neither is a rider that did not steer its vehicle, whose position the
+  server decides.
+
+Every setback is logged. `/clauac status` adds a line per connection with the packets held so far and for how long,
+the movement packets kept from the server, how often packets went on unjudged, and the setbacks by kind.
+
+Setbacks were tried in game with a proxy between the client and the server that shifted the positions in the
+client's movement packets for three seconds while the player moved on, as a movement cheat would, and with the
+server's own position of the player sampled with `data get entity` in the meantime:
+
+- Walking east with positions reported 2 blocks higher, the ticks with a shifted position failed `Simulation` and the
+  client was put back again and again: for the whole three seconds of walking it got no further than 0.12 to 0.87
+  blocks from where the server had it, and the server's position did not change. With positions reported 4 blocks
+  ahead the client stayed 0.10 to 0.63 blocks from it. A boat steered east and reported 3 blocks ahead failed
+  `Vehicle` and stayed 0.04 to 0.54 blocks from where the server had it.
+- Paper's own movement checks, which log a player or vehicle that "moved too quickly" or "moved wrongly", never saw
+  any of it. Once the shift stopped, the next tick still failed (the simulation had continued from the last shifted
+  report) and every tick after it matched again, the boat's included.
+- In the eight test courses (see "Cost and limits"), which all matched as before, 13 582 packets were held, 2.2 ms on
+  average and 77 ms at most, and no movement was kept from the server.
+- With `setbacks.maximum-hold-millis` set to 1, the packets went on unjudged 126 times and the server did get the
+  shifted positions; the setbacks were then 51 teleports on the server back to where the failed tick began, 14
+  corrections where the verdict came first after all, and one left out because the previous teleport was still on its
+  way to the client.
+
 ### Alerts
 
 Players with the permission `clauac.alerts` see in their chat when a player fails a check: from the moment they join
@@ -372,12 +429,14 @@ every `MISMATCHED` tick with the checks it failed either way.
 
 ### Commands and permissions
 
-| Command          | Permission      | Does                                                                      |
-|------------------|-----------------|---------------------------------------------------------------------------|
-| `/clauac alerts` | `clauac.alerts` | Turns your alerts on or off                                               |
-| `/clauac debug`  | `clauac.admin`  | Shows the outcome of every tick of your own connection in your action bar |
-| `/clauac status` | `clauac.admin`  | Summarises the simulation of every connection (see "Cost and limits")     |
-| `/clauac reload` | `clauac.admin`  | Reads `config.yml` again                                                  |
+| Command          | Permission      | Does                                                                    |
+|------------------|-----------------|-------------------------------------------------------------------------|
+| `/clauac alerts` | `clauac.alerts` | Turns your alerts on or off                                             |
+| `/clauac debug`  | `clauac.admin`  | Shows the outcome of every tick of your own connection, with the checks |
+|                  |                 | it failed, in your action bar                                           |
+| `/clauac status` | `clauac.admin`  | Summarises the simulation of every connection (see "Cost and limits")   |
+|                  |                 | and its setbacks                                                        |
+| `/clauac reload` | `clauac.admin`  | Reads `config.yml` again                                                |
 
 Both permissions default to operators, and `clauac.admin` includes `clauac.alerts`.
 
@@ -386,29 +445,34 @@ Both permissions default to operators, and `clauac.admin` includes `clauac.alert
 The first start writes `plugins/ClauAC/config.yml` with the defaults and a comment on every setting; `/clauac reload`
 reads it again while the server runs.
 
-| Setting                  | Default     | Meaning                                                                     |
-|--------------------------|-------------|-----------------------------------------------------------------------------|
-| `alerts.on-join`         | `true`      | Players with `clauac.alerts` get alerts as soon as they join                |
-| `alerts.interval-millis` | `1000`      | At most one alert per player and check within this many milliseconds        |
-| `alerts.format`          | (see above) | The alert in MiniMessage, with `%player%`, `%check%`, `%detail%`, `%tick%`  |
-|                          |             | (the client tick) and `%count%` filled in                                   |
-| `checks.<name>.alert`    | `true`      | Whether failing the check of that name (see the table above) alerts         |
+| Setting                        | Default     | Meaning                                                                    |
+|--------------------------------|-------------|----------------------------------------------------------------------------|
+| `alerts.on-join`               | `true`      | Players with `clauac.alerts` get alerts as soon as they join               |
+| `alerts.interval-millis`       | `1000`      | At most one alert per player and check within this many milliseconds       |
+| `alerts.format`                | (see above) | The alert in MiniMessage, with `%player%`, `%check%`, `%detail%`, `%tick%` |
+|                                |             | (the client tick) and `%count%` filled in                                  |
+| `setbacks.maximum-hold-millis` | `1000`      | How long the client's packets wait for their tick's verdict at most        |
+| `checks.<name>.alert`          | `true`      | Whether failing the check of that name (see the table above) alerts        |
+| `checks.<name>.setback`        | `true`      | Whether failing it sets the player back; `false` for `SimulationFailure`,  |
+|                                |             | a failure of ClauAC's own that says nothing about the client               |
 
 The format is [MiniMessage](https://docs.papermc.io/adventure/minimessage/format/) text. The filled-in values are
 escaped, so that a detail with a `<` in it shows as it is instead of becoming a MiniMessage tag. A value ClauAC cannot
 use, such as text where a number belongs or a negative interval, is replaced by its default, and a check name ClauAC
-does not know is ignored, each with a warning in the log. The alerts go out through Paper's `String` API
+does not know is ignored, each with a warning in the log. A setting missing from the file takes its default, so that
+the `config.yml` of an earlier version keeps working. The alerts go out through Paper's `String` API
 (`Player#sendRichMessage`), so no adventure object crosses into Paper (see "Rule for ClauAC's own code").
 
 ### For other plugins: `ClauACFlagEvent`
 
 ClauAC calls `io.github.hellotta.clauac.api.ClauACFlagEvent` once for every check a tick failed, before it responds to
 it. The event holds the player, the check (`io.github.hellotta.clauac.simulation.api.Check`), the detail and the
-client tick; cancelling it keeps ClauAC from responding to that flag, so it does not alert. The event is asynchronous:
-the simulation thread that finished the tick calls it as soon as the result is known, with ClauAC's plugin class
-loader as the thread's context class loader. A listener therefore has to be quick and must hand anything that touches
-the world or the player's state to the server thread. A plugin that listens for it depends on ClauAC in its
-`plugin.yml` (`depend: [ClauAC]`), so that it loads after ClauAC and sees its classes:
+client tick; cancelling it keeps ClauAC from responding to that flag: it does not alert, and it sets the player back
+only when another flag of the same tick that nobody cancelled asks for it. The event is asynchronous: the simulation
+thread that finished the tick calls it as soon as the result is known, with ClauAC's plugin class loader as the
+thread's context class loader. A listener therefore has to be quick and must hand anything that touches the world or
+the player's state to the server thread. A plugin that listens for it depends on ClauAC in its `plugin.yml`
+(`depend: [ClauAC]`), so that it loads after ClauAC and sees its classes:
 
 ```java
 @EventHandler

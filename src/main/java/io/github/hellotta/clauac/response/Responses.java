@@ -6,10 +6,11 @@ import io.github.hellotta.clauac.simulation.api.Flag;
 import java.util.UUID;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
 // - What ClauAC does when a client tick fails checks: for every flag it calls ClauACFlagEvent and, unless a listener -
-// - cancelled it, alerts when the configuration says so. Ticks arrive on simulation threads -
+// - cancelled it, alerts and sets the player back as the configuration says. Ticks arrive on simulation threads -
 public final class Responses {
 
     private final JavaPlugin plugin;
@@ -23,20 +24,25 @@ public final class Responses {
         this.settings = settings;
     }
 
-    // - A tick of this player failed checks (report.flags() is not empty) -
-    public void onFailedTick(Player player, ClientTickReport report) {
+    // - A tick of this player failed checks (report.flags() is not empty). Returns whether the player has to be set -
+    // - back. Before the server has the player in its world there is nobody to call the event for or to name in an -
+    // - alert; the configuration alone then decides on the setback -
+    public boolean onFailedTick(@Nullable Player player, ClientTickReport report) {
         if (this.closed) {
-            return;
+            return false;
         }
         ClauACSettings current = this.settings;
+        boolean setBack = false;
         for (Flag flag : report.flags()) {
-            if (!this.call(new ClauACFlagEvent(player, flag.check(), flag.detail(), report.clientTick()))) {
+            if (player != null && !this.call(new ClauACFlagEvent(player, flag.check(), flag.detail(), report.clientTick()))) {
                 continue;
             }
-            if (current.alerts(flag.check())) {
+            if (player != null && current.alerts(flag.check())) {
                 this.alerts.flag(player, flag, report.clientTick(), current);
             }
+            setBack |= current.setsBack(flag.check());
         }
+        return setBack;
     }
 
     // - Calls the event with the plugin's class loader as the thread's context class loader: simulation threads -
@@ -52,6 +58,11 @@ public final class Responses {
             thread.setContextClassLoader(previous);
         }
         return !event.isCancelled();
+    }
+
+    // - The settings in effect; any thread -
+    public ClauACSettings settings() {
+        return this.settings;
     }
 
     // - On the server thread -

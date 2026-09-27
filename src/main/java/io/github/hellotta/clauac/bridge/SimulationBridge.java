@@ -26,7 +26,7 @@ import org.slf4j.Logger;
 
 // - Hands every relevant packet of a connection to its simulation, exactly as it travels on the wire; see -
 // - ConnectionSimulation for how the pings behind the server's packets tell the simulation how far the client has -
-// - processed them when it simulates the client's next tick -
+// - processed them when it simulates the client's next tick, and how the client's movement waits for its verdict -
 public final class SimulationBridge implements PacketListener {
 
     // - How far from the player's bounding box another entity counts as able to push or carry it -
@@ -35,16 +35,18 @@ public final class SimulationBridge implements PacketListener {
     private final Logger logger;
     private final Path reportDirectory;
     private final Responses responses;
+    private final Setbacks setbacks;
     private final Map<Object, ConnectionSimulation> connections = new ConcurrentHashMap<>();
     // - What the connections that wait for the runtime to start keep, together -
     private final AtomicLong totalWaitingBytes = new AtomicLong();
     private volatile @Nullable SimulationRuntime runtime;
     private volatile @Nullable String runtimeFailure;
 
-    public SimulationBridge(Logger logger, Path reportDirectory, Responses responses) {
+    public SimulationBridge(Logger logger, Path reportDirectory, Responses responses, Setbacks setbacks) {
         this.logger = logger;
         this.reportDirectory = reportDirectory;
         this.responses = responses;
+        this.setbacks = setbacks;
     }
 
     // - Waiting connections start on their own event loops; one created at the same moment sees the runtime with its -
@@ -73,11 +75,19 @@ public final class SimulationBridge implements PacketListener {
         this.observe(event, PacketDirection.SERVERBOUND);
     }
 
-    // - Called on the connection's event loop by OwnPongConsumer; a connection only starts with its configuration -
+    // - Called on the connection's event loop by OwnAnswerConsumer; a connection only starts with its configuration -
     void consumeOwnPong(PacketReceiveEvent event) {
         ConnectionSimulation connection = this.connections.get(event.getUser().getChannel());
         if (connection != null) {
             connection.consumeOwnPong(event);
+        }
+    }
+
+    // - Called on the connection's event loop by OwnAnswerConsumer -
+    void consumeOwnTeleportAnswer(PacketReceiveEvent event) {
+        ConnectionSimulation connection = this.connections.get(event.getUser().getChannel());
+        if (connection != null) {
+            connection.consumeOwnTeleportAnswer(event);
         }
     }
 
@@ -120,14 +130,14 @@ public final class SimulationBridge implements PacketListener {
     // - A connection is simulated from its first configuration packet on, or not at all; see ConnectionSimulation -
     private ConnectionSimulation startConnection(User user, ProtocolPhase phase) {
         if (phase != ProtocolPhase.CONFIGURATION) {
-            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.responses, this.totalWaitingBytes,
+            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.responses, this.setbacks, this.totalWaitingBytes,
                     "the connection was already playing when ClauAC started watching it");
         }
         String failure = this.runtimeFailure;
         if (failure != null) {
-            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.responses, this.totalWaitingBytes, failure);
+            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.responses, this.setbacks, this.totalWaitingBytes, failure);
         }
-        return ConnectionSimulation.begin(user, this.reportDirectory, this.logger, this.responses, this.totalWaitingBytes, this.runtime);
+        return ConnectionSimulation.begin(user, this.reportDirectory, this.logger, this.responses, this.setbacks, this.totalWaitingBytes, this.runtime);
     }
 
     @Override
@@ -147,11 +157,16 @@ public final class SimulationBridge implements PacketListener {
             if (statistics != null) {
                 this.logger.info("Simulation cost for {}", reporter.costSummary(statistics));
             }
+            this.logger.info("Held packets and setbacks of {}", connection.holdSummary());
         }
     }
 
     // - Called on the server thread at the end of every server tick -
     public void onServerTickEnd(Iterable<? extends Player> onlinePlayers) {
+        long now = System.nanoTime();
+        for (ConnectionSimulation connection : this.connections.values()) {
+            connection.checkHold(now);
+        }
         for (Player player : onlinePlayers) {
             User user = PacketEvents.getAPI().getPlayerManager().getUser(player);
             if (user == null) {
@@ -195,12 +210,20 @@ public final class SimulationBridge implements PacketListener {
                     if (statistics != null) {
                         lines.add(reporter.costSummary(statistics));
                     }
+                    lines.add(connection.holdSummary());
                 }
                 case WAITING -> lines.add(name + ": waiting for the vanilla runtime to start");
                 case NOT_SIMULATED -> lines.add(name + ": not simulated, " + connection.notSimulatedReason());
             }
         }
         return lines;
+    }
+
+    // - Before PacketEvents is terminated: every connection lets what it holds go on and holds nothing more -
+    public void stopHolding() {
+        for (ConnectionSimulation connection : this.connections.values()) {
+            connection.stopHolding();
+        }
     }
 
     public void closeAll() {

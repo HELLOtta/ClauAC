@@ -8,14 +8,23 @@ import com.github.retrooper.packetevents.protocol.ConnectionState;
 import com.github.retrooper.packetevents.protocol.packettype.PacketType;
 import com.github.retrooper.packetevents.protocol.packettype.PacketTypeCommon;
 import com.github.retrooper.packetevents.protocol.player.User;
+import com.github.retrooper.packetevents.protocol.teleport.RelativeFlag;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.PacketWrapper;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerBundle;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityVelocity;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPing;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerPositionAndLook;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerVehicleMove;
 import io.github.hellotta.clauac.response.Responses;
+import io.github.hellotta.clauac.simulation.api.ClientTickReport;
+import io.github.hellotta.clauac.simulation.api.Flag;
 import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationRuntime;
 import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
+import io.github.hellotta.clauac.simulation.api.TickEnd;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
@@ -27,9 +36,11 @@ import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
@@ -43,6 +54,12 @@ import org.slf4j.Logger;
 // - in one go (ClientPacketListener.handleBundlePacket runs all its packets in one task on the client's main thread) -
 // - and answers the ping right there, so no client tick can fall between a packet and the ping behind it. -
 // -
+// - The client's movement reaches the server only once the simulation has judged its tick (see TickHold). A tick -
+// - that is to be set back loses its movement, and so does every tick after it until the client has taken a -
+// - correction: a teleport to where the server has the player, or, when it steers a vehicle, the vehicle's position -
+// - as the server has it (see Setbacks). The correction goes out in one of the connection's own bundles, so that -
+// - the pong to the ping behind it shows when the client has taken it. -
+// -
 // - Everything except the getters runs on the connection's event loop, where all of its packets are handled one -
 // - after another -
 final class ConnectionSimulation {
@@ -52,6 +69,17 @@ final class ConnectionSimulation {
         WAITING,
         SIMULATED,
         NOT_SIMULATED
+    }
+
+    // - A setback: none under way, asked of the server thread, or its correction on the way to the client -
+    private enum SetbackPhase {
+        NONE,
+        REQUESTED,
+        CORRECTED
+    }
+
+    // - What the setbacks of the connection came to so far, for /clauac status -
+    record SetbackStatistics(long requested, long positionCorrections, long vehicleCorrections, long serverTeleports, long skipped) {
     }
 
     private static final DateTimeFormatter REPORT_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.ROOT);
@@ -64,26 +92,43 @@ final class ConnectionSimulation {
     // - The client refuses a bundle of more than BundlerInfo.BUNDLE_SIZE_LIMIT (4096) packets. A bundle is ended -
     // - before it would hold more than this, which leaves room for the ping that ends it -
     private static final int MAXIMUM_BUNDLE_PACKETS = 4000;
-    // - The ids of the connection's own pings: 2^30 ids from the lowest int up, far from the small counters around 0 -
-    // - that other plugins use for their pings, whose pongs must pass through untouched (see consumeOwnPong). Each -
-    // - connection starts at a random place among them -
-    private static final int OWN_PING_ID_BASE = Integer.MIN_VALUE;
-    private static final int OWN_PING_ID_MASK = (1 << 30) - 1;
+    // - The ids of the connection's own pings and teleports: 2^30 ids from the lowest int up, far from the small -
+    // - counters around 0 that the server uses for its teleports and other plugins for their pings, whose answers -
+    // - must pass through untouched (see consumeOwnPong). Each connection starts at a random place among them -
+    private static final int OWN_ID_BASE = Integer.MIN_VALUE;
+    private static final int OWN_ID_MASK = (1 << 30) - 1;
     // - The unanswered pings remembered at most; the pongs a client sends for older ones pass through to the server -
     private static final int MAXIMUM_OWN_PINGS = 100_000;
+    // - The unanswered teleports remembered at most; the connection has at most one correction on the way at a time -
+    private static final int MAXIMUM_OWN_TELEPORTS = 64;
     // - The payload of the play pong (serverbound minecraft:pong): the id as an int -
     private static final int PONG_PAYLOAD_BYTES = Integer.BYTES;
+    // - The payload of the teleport answer after its id (serverbound minecraft:accept_teleportation): the position -
+    // - as three doubles and the rotation as two floats -
+    private static final int TELEPORT_ANSWER_VALUE_BYTES = 3 * Double.BYTES + 2 * Float.BYTES;
+    // - A VarInt takes at most five bytes, each carrying seven bits and a continuation bit -
+    private static final int MAXIMUM_VARINT_BYTES = 5;
+    private static final int VARINT_VALUE_BITS = 7;
+    private static final int VARINT_VALUE_MASK = 0x7F;
+    private static final int VARINT_CONTINUE_BIT = 0x80;
+    private static final double NANOS_PER_MILLISECOND = 1.0E6;
 
     private record WaitingPacket(ProtocolPhase phase, PacketDirection direction, int packetId, byte[] encodedPacket) {
+    }
+
+    // - A tick that is to be set back, with what its setback needs -
+    private record FailedTick(ClientTickReport report, TickEnd end, boolean late) {
     }
 
     private final User user;
     private final Path reportDirectory;
     private final Logger logger;
     private final Responses responses;
+    private final Setbacks setbacks;
     // - Shared by all connections of the bridge -
     private final AtomicLong totalWaitingBytes;
     private final LocalDateTime startTime;
+    private final TickHold hold;
     private volatile State state;
     private volatile @Nullable String notSimulatedReason;
     private volatile @Nullable TickReporter reporter;
@@ -100,31 +145,66 @@ final class ConnectionSimulation {
     private int pingSequence = ThreadLocalRandom.current().nextInt();
     // - The ids of the connection's own pings that the client has not answered yet, oldest first -
     private final Set<Integer> ownPingIds = new LinkedHashSet<>();
+    private int teleportSequence = ThreadLocalRandom.current().nextInt();
+    // - The ids of the connection's own teleports that the client has not answered yet, oldest first -
+    private final Set<Integer> ownTeleportIds = new LinkedHashSet<>();
+    private SetbackPhase setbackPhase = SetbackPhase.NONE;
+    // - Counts the setbacks, so that an answer about an earlier one is recognized -
+    private int setbackGeneration;
+    // - The correction went into the open bundle, whose ping is still to be sent -
+    private boolean correctionInOpenBundle;
+    // - The ping behind the correction, whose pong ends the setback -
+    private boolean correctionPingAwaited;
+    private int correctionPingId;
+    // - Where the pong to that ping came among the serverbound packets (TickEnd.serverboundPackets), once it came: -
+    // - the client had taken the correction before every tick that ends after it -
+    private long correctionAnsweredAt = -1L;
+    // - The latest tick that failed after the client had taken the correction; its setback follows once the current -
+    // - one is over, since the simulation continued from what that tick reported -
+    private @Nullable FailedTick failedAfterCorrection;
+    // - Written on the event loop only; volatile for /clauac status -
+    private volatile long setbacksRequested;
+    private volatile long positionCorrections;
+    private volatile long vehicleCorrections;
+    private volatile long serverTeleports;
+    private volatile long setbacksSkipped;
 
     private ConnectionSimulation(
-            User user, Path reportDirectory, Logger logger, Responses responses, AtomicLong totalWaitingBytes, State state, @Nullable String notSimulatedReason
+            User user, Path reportDirectory, Logger logger, Responses responses, Setbacks setbacks, AtomicLong totalWaitingBytes, State state,
+            @Nullable String notSimulatedReason
     ) {
         this.user = user;
         this.reportDirectory = reportDirectory;
         this.logger = logger;
         this.responses = responses;
+        this.setbacks = setbacks;
         this.totalWaitingBytes = totalWaitingBytes;
         this.startTime = LocalDateTime.now();
         this.state = state;
         this.notSimulatedReason = notSimulatedReason;
+        this.hold = new TickHold(user);
     }
 
-    static ConnectionSimulation notSimulated(User user, Path reportDirectory, Logger logger, Responses responses, AtomicLong totalWaitingBytes, String reason) {
-        return new ConnectionSimulation(user, reportDirectory, logger, responses, totalWaitingBytes, State.NOT_SIMULATED, reason);
+    static ConnectionSimulation notSimulated(
+            User user, Path reportDirectory, Logger logger, Responses responses, Setbacks setbacks, AtomicLong totalWaitingBytes, String reason
+    ) {
+        return new ConnectionSimulation(user, reportDirectory, logger, responses, setbacks, totalWaitingBytes, State.NOT_SIMULATED, reason);
     }
 
     // - A connection that starts its configuration now: simulated right away, or waiting while the runtime starts -
     static ConnectionSimulation begin(
-            User user, Path reportDirectory, Logger logger, Responses responses, AtomicLong totalWaitingBytes, @Nullable SimulationRuntime runtime
+            User user, Path reportDirectory, Logger logger, Responses responses, Setbacks setbacks, AtomicLong totalWaitingBytes,
+            @Nullable SimulationRuntime runtime
     ) {
-        ConnectionSimulation connection = new ConnectionSimulation(user, reportDirectory, logger, responses, totalWaitingBytes, State.WAITING, null);
+        ConnectionSimulation connection = new ConnectionSimulation(user, reportDirectory, logger, responses, setbacks, totalWaitingBytes, State.WAITING, null);
         if (runtime != null) {
             connection.start(runtime);
+            // - Holding needs the simulation to count the same serverbound packets from the start; the waiting -
+            // - packets of a connection that started before the runtime are only handed over in part (see -
+            // - runtimeReady), so such a connection is never held -
+            if (connection.state == State.SIMULATED) {
+                connection.hold.enable();
+            }
         } else {
             logger.info("Keeping the packets of {} until the vanilla runtime has started", user.getName());
         }
@@ -184,13 +264,14 @@ final class ConnectionSimulation {
         };
         // - A connection that is not simulated only still ends a bundle it had opened -
         boolean managesBundles = clientboundPlay && (this.state != State.NOT_SIMULATED || this.bundleOpen);
-        if (!handedOver && !managesBundles) {
+        boolean held = direction == PacketDirection.SERVERBOUND && phase == ProtocolPhase.PLAY && this.hold.enabled();
+        if (!handedOver && !managesBundles && !held) {
             return;
         }
         boolean covered = clientboundPlay && handedOver && needsPing(type);
-        // - Post tasks run once the packet is final: after every listener and right before it is written, with the -
-        // - whole packet (id and payload) readable, or nothing readable when it was cancelled and therefore never -
-        // - sent or processed -
+        // - Post tasks run once the packet is final: after every listener and right before it is written or goes on -
+        // - to the server, with the whole packet (id and payload) readable, or nothing readable when it was cancelled -
+        // - and therefore never sent or processed -
         event.getPostTasks().add(() -> {
             Object buffer = event.getByteBuf();
             if (!ByteBufHelper.isReadable(buffer)) {
@@ -201,6 +282,13 @@ final class ConnectionSimulation {
             }
             if (handedOver) {
                 this.handOver(phase, direction, packetId, ByteBufHelper.copyBytes(buffer));
+            }
+            if (held) {
+                this.hold.onServerbound(type, buffer, System.nanoTime(), this.responses.settings().maximumHoldNanos());
+                if (type == PacketType.Play.Client.CONFIGURATION_ACK) {
+                    // - The client leaves the play phase; the next one starts where the server puts the player -
+                    this.endSetback(this.setbackGeneration);
+                }
             }
         });
     }
@@ -259,16 +347,26 @@ final class ConnectionSimulation {
     // - configuring while the start of a configuration phase is being sent (it switches before any listener runs), -
     // - so a listener would misread a ping sent then. The simulation gets the ping directly, in its place on the wire -
     private void endBundle() {
-        WrapperPlayServerPing ping = new WrapperPlayServerPing(this.nextPingId());
-        Object buffer = ChannelHelper.pooledByteBuf(this.user.getChannel());
-        ping.setBuffer(buffer);
-        ping.writeVarInt(ping.getNativePacketId());
-        ping.write();
-        this.handOver(ProtocolPhase.PLAY, PacketDirection.CLIENTBOUND, ping.getNativePacketId(), ByteBufHelper.copyBytes(buffer));
-        this.user.sendPacketSilently(buffer);
+        int pingId = this.nextPingId();
+        this.writeOwnPacket(new WrapperPlayServerPing(pingId));
         this.user.sendPacketSilently(new WrapperPlayServerBundle());
         this.bundleOpen = false;
         this.bundlePackets = 0;
+        if (this.correctionInOpenBundle) {
+            this.correctionInOpenBundle = false;
+            this.correctionPingAwaited = true;
+            this.correctionPingId = pingId;
+        }
+    }
+
+    // - Sends one of the connection's own packets silently and hands it to the simulation in its place on the wire -
+    private void writeOwnPacket(PacketWrapper<?> packet) {
+        Object buffer = ChannelHelper.pooledByteBuf(this.user.getChannel());
+        packet.setBuffer(buffer);
+        packet.writeVarInt(packet.getNativePacketId());
+        packet.write();
+        this.handOver(ProtocolPhase.PLAY, PacketDirection.CLIENTBOUND, packet.getNativePacketId(), ByteBufHelper.copyBytes(buffer));
+        this.user.sendPacketSilently(buffer);
     }
 
     // - Ends the open bundle once the event loop has written what it was already asked to, so that one bundle and -
@@ -290,30 +388,66 @@ final class ConnectionSimulation {
     // - The simulation matches every ping with its pong regardless of who sent it; the plugin remembers its own ids -
     // - to take their pongs out of the connection -
     private int nextPingId() {
-        int id = OWN_PING_ID_BASE + (this.pingSequence++ & OWN_PING_ID_MASK);
-        this.ownPingIds.add(id);
-        if (this.ownPingIds.size() > MAXIMUM_OWN_PINGS) {
-            Iterator<Integer> oldest = this.ownPingIds.iterator();
+        int id = OWN_ID_BASE + (this.pingSequence++ & OWN_ID_MASK);
+        remember(this.ownPingIds, id, MAXIMUM_OWN_PINGS);
+        return id;
+    }
+
+    private int nextTeleportId() {
+        int id = OWN_ID_BASE + (this.teleportSequence++ & OWN_ID_MASK);
+        remember(this.ownTeleportIds, id, MAXIMUM_OWN_TELEPORTS);
+        return id;
+    }
+
+    private static void remember(Set<Integer> ids, int id, int maximum) {
+        ids.add(id);
+        if (ids.size() > maximum) {
+            Iterator<Integer> oldest = ids.iterator();
             oldest.next();
             oldest.remove();
         }
-        return id;
     }
 
     // - Called on the event loop for every play pong of the client, with the priority that decides a packet's final -
     // - state. A pong that answers one of the connection's own pings goes to the simulation in its place and no -
     // - further: the server never sent that ping and ignores pongs anyway (ServerCommonPacketListenerImpl.handlePong), -
     // - while Paper's packet limiter, which counts every packet the server decodes (Connection.channelRead0), would -
-    // - count it against the client. Every other pong, a malformed one included, goes on to the server as it came -
+    // - count it against the client. Every other pong, a malformed one included, goes on to the server as it came. -
+    // - The pong to the ping behind a correction ends the setback once the packets before it went on -
     void consumeOwnPong(PacketReceiveEvent event) {
         Object buffer = event.getByteBuf();
         if (ByteBufHelper.readableBytes(buffer) != PONG_PAYLOAD_BYTES) {
             return;
         }
         byte[] payload = ByteBufHelper.copyBytes(buffer);
-        if (!this.ownPingIds.remove(ByteBuffer.wrap(payload).getInt())) {
+        int id = ByteBuffer.wrap(payload).getInt();
+        if (!this.ownPingIds.remove(id)) {
             return;
         }
+        this.consumeOwnAnswer(event, payload);
+        if (this.correctionPingAwaited && id == this.correctionPingId) {
+            this.correctionPingAwaited = false;
+            this.correctionAnsweredAt = this.hold.handedOver();
+            int generation = this.setbackGeneration;
+            this.hold.mark(() -> this.finishSetback(generation), System.nanoTime());
+        }
+    }
+
+    // - Called on the event loop for every teleport answer of the client, like consumeOwnPong: the answer to one of -
+    // - the connection's own teleports goes to the simulation and no further, since the server never sent that -
+    // - teleport. Every other answer goes on to the server as it came -
+    void consumeOwnTeleportAnswer(PacketReceiveEvent event) {
+        Object buffer = event.getByteBuf();
+        byte[] payload = ByteBufHelper.copyBytes(buffer);
+        OptionalInt id = readVarInt(payload);
+        if (id.isEmpty() || payload.length != varIntSize(id.getAsInt()) + TELEPORT_ANSWER_VALUE_BYTES || !this.ownTeleportIds.remove(id.getAsInt())) {
+            return;
+        }
+        this.consumeOwnAnswer(event, payload);
+    }
+
+    // - Takes an answer to one of the connection's own packets out of the connection and hands it to the simulation -
+    private void consumeOwnAnswer(PacketReceiveEvent event, byte[] payload) {
         event.setCancelled(true);
         int packetId = event.getPacketId();
         boolean handedOver = switch (this.state) {
@@ -333,13 +467,217 @@ final class ConnectionSimulation {
         }
     }
 
+    // - The VarInt at the start of the bytes; empty when they do not start with a complete one -
+    private static OptionalInt readVarInt(byte[] bytes) {
+        int value = 0;
+        for (int index = 0; index < MAXIMUM_VARINT_BYTES && index < bytes.length; index++) {
+            int current = bytes[index];
+            value |= (current & VARINT_VALUE_MASK) << (VARINT_VALUE_BITS * index);
+            if ((current & VARINT_CONTINUE_BIT) == 0) {
+                return OptionalInt.of(value);
+            }
+        }
+        return OptionalInt.empty();
+    }
+
+    private static int varIntSize(int value) {
+        int size = 1;
+        int rest = value >>> VARINT_VALUE_BITS;
+        while (rest != 0) {
+            size++;
+            rest >>>= VARINT_VALUE_BITS;
+        }
+        return size;
+    }
+
     private void handOver(ProtocolPhase phase, PacketDirection direction, int packetId, byte[] encodedPacket) {
         switch (this.state) {
-            case SIMULATED -> Objects.requireNonNull(this.simulation).handlePacket(phase, direction, encodedPacket);
+            case SIMULATED -> {
+                if (direction == PacketDirection.SERVERBOUND) {
+                    this.hold.countHandedOver();
+                }
+                Objects.requireNonNull(this.simulation).handlePacket(phase, direction, encodedPacket);
+            }
             case WAITING -> this.keepWaiting(new WaitingPacket(phase, direction, packetId, encodedPacket));
             case NOT_SIMULATED -> {
             }
         }
+    }
+
+    // - A tick's verdict, from the simulation thread, in the order of the client's ticks; setBack tells whether the -
+    // - tick is to be set back -
+    void onVerdict(ClientTickReport report, TickEnd end, boolean setBack) {
+        this.runInEventLoop(() -> this.judge(report, end, setBack));
+    }
+
+    // - The tick's packets go on to the server as far as the verdict allows, without their movement when the tick is -
+    // - set back. A tick that fails while a setback is under way needs no setback of its own when the client had not -
+    // - taken the correction yet before the tick: the correction on its way puts the client back anyway. After the -
+    // - correction, the simulation went on from where the correction put the player, so such a tick needs its own -
+    // - setback, which follows the current one -
+    private void judge(ClientTickReport report, TickEnd end, boolean setBack) {
+        boolean late = this.hold.wentOnUnjudged();
+        if (setBack) {
+            this.hold.dropMovementThrough(end.serverboundPackets());
+            if (this.setbackPhase == SetbackPhase.NONE) {
+                this.startSetback(report, end, late);
+            } else if (this.correctionAnsweredAt >= 0L && end.serverboundPackets() > this.correctionAnsweredAt) {
+                this.failedAfterCorrection = new FailedTick(report, end, late);
+            }
+        }
+        this.hold.judged(end.serverboundPackets(), System.nanoTime());
+    }
+
+    // - The client's movement stops reaching the server now, and the server thread decides how to put the client back -
+    private void startSetback(ClientTickReport report, TickEnd end, boolean late) {
+        if (!report.start().hasPosition() || this.user.getEncoderState() != ConnectionState.PLAY) {
+            // - Without a player in a level there is nothing to put back -
+            return;
+        }
+        this.setbackPhase = SetbackPhase.REQUESTED;
+        int generation = ++this.setbackGeneration;
+        this.correctionAnsweredAt = -1L;
+        this.failedAfterCorrection = null;
+        this.setbacksRequested++;
+        this.hold.setDroppingMovement(true);
+        String checks = report.flags().stream().map(Flag::check).distinct().map(check -> check.displayName()).collect(Collectors.joining(", "));
+        SetbackRequest request = new SetbackRequest(generation, report.clientTick(), checks, report.vehicle() != null, report.start(), end.arrivalNanos(), late);
+        if (!this.setbacks.request(this, request)) {
+            this.setbackSkipped(generation);
+        }
+    }
+
+    // - From the server thread: teleports the client to where the server has the player, with this velocity and its -
+    // - own rotation -
+    void correctPosition(int generation, double x, double y, double z, double velocityX, double velocityY, double velocityZ) {
+        this.runInEventLoop(() -> {
+            if (!this.awaitsCorrection(generation)) {
+                return;
+            }
+            this.writeCorrection(PacketType.Play.Server.PLAYER_POSITION_AND_LOOK, new WrapperPlayServerPlayerPositionAndLook(
+                    this.nextTeleportId(), new Vector3d(x, y, z), new Vector3d(velocityX, velocityY, velocityZ), 0.0F, 0.0F,
+                    RelativeFlag.YAW.or(RelativeFlag.PITCH)));
+            this.correctionSent();
+            this.positionCorrections++;
+        });
+    }
+
+    // - From the server thread: puts the vehicle the client steers where the server has it, as the server itself -
+    // - does after a vehicle moved wrongly (ServerGamePacketListenerImpl.handleMoveVehicle), and stops it. That -
+    // - packet only moves the vehicle; its velocity would stay what the client had and what the simulation estimated -
+    // - from the rejected movement, which differ, so both are set to none (ClientPacketListener.handleSetEntityMotion) -
+    void correctVehicle(int generation, int vehicleId, double x, double y, double z, float yRot, float xRot) {
+        this.runInEventLoop(() -> {
+            if (!this.awaitsCorrection(generation)) {
+                return;
+            }
+            this.writeCorrection(PacketType.Play.Server.VEHICLE_MOVE, new WrapperPlayServerVehicleMove(new Vector3d(x, y, z), yRot, xRot));
+            this.writeCorrection(PacketType.Play.Server.ENTITY_VELOCITY, new WrapperPlayServerEntityVelocity(vehicleId, Vector3d.zero()));
+            this.correctionSent();
+            this.vehicleCorrections++;
+        });
+    }
+
+    // - From the server thread: the server teleported the player itself (see Setbacks), and ignores the client's -
+    // - movement until the client answers the teleport, so that the setback is done here -
+    void setbackTeleported(int generation) {
+        this.runInEventLoop(() -> {
+            if (generation == this.setbackGeneration && this.setbackPhase == SetbackPhase.REQUESTED) {
+                this.serverTeleports++;
+                this.endSetback(generation);
+            }
+        });
+    }
+
+    // - The player cannot be set back (see Setbacks); its movement reaches the server again -
+    void setbackSkipped(int generation) {
+        this.runInEventLoop(() -> {
+            if (generation == this.setbackGeneration && this.setbackPhase == SetbackPhase.REQUESTED) {
+                this.setbacksSkipped++;
+                this.endSetback(generation);
+            }
+        });
+    }
+
+    // - Whether this setback still waits for its correction and the connection can take one. A setback that cannot -
+    // - is over -
+    private boolean awaitsCorrection(int generation) {
+        if (generation != this.setbackGeneration || this.setbackPhase != SetbackPhase.REQUESTED) {
+            return false;
+        }
+        if (this.state != State.SIMULATED || !ChannelHelper.isOpen(this.user.getChannel()) || this.user.getEncoderState() != ConnectionState.PLAY) {
+            this.setbacksSkipped++;
+            this.endSetback(generation);
+            return false;
+        }
+        return true;
+    }
+
+    // - A correction goes into one of the connection's own bundles like any packet the simulation needs -
+    private void writeCorrection(PacketTypeCommon type, PacketWrapper<?> correction) {
+        this.beforeWrite(type, true);
+        this.writeOwnPacket(correction);
+    }
+
+    // - The pong to the ping that ends the bundle with the correction ends the setback -
+    private void correctionSent() {
+        this.correctionInOpenBundle = true;
+        this.setbackPhase = SetbackPhase.CORRECTED;
+    }
+
+    // - The client has taken the correction: its movement reaches the server again, unless a tick after the -
+    // - correction failed as well, whose setback starts now -
+    private void finishSetback(int generation) {
+        if (generation != this.setbackGeneration || this.setbackPhase == SetbackPhase.NONE) {
+            return;
+        }
+        FailedTick next = this.failedAfterCorrection;
+        this.endSetback(generation);
+        if (next != null) {
+            this.startSetback(next.report(), next.end(), next.late());
+        }
+    }
+
+    private void endSetback(int generation) {
+        if (generation != this.setbackGeneration || this.setbackPhase == SetbackPhase.NONE) {
+            return;
+        }
+        this.setbackPhase = SetbackPhase.NONE;
+        this.correctionInOpenBundle = false;
+        this.correctionPingAwaited = false;
+        this.correctionAnsweredAt = -1L;
+        this.failedAfterCorrection = null;
+        this.hold.setDroppingMovement(false);
+    }
+
+    // - From the simulation thread: no more verdicts come, so nothing is held any more -
+    void onSimulationStopped() {
+        this.runInEventLoop(() -> {
+            this.hold.disable();
+            this.endSetback(this.setbackGeneration);
+        });
+    }
+
+    // - From the server thread at the end of each server tick: lets what is held go on once the oldest packet waited -
+    // - longer than allowed, also while the client sends nothing -
+    void checkHold(long now) {
+        long oldest = this.hold.oldestHeldNanos();
+        long maximumHoldNanos = this.responses.settings().maximumHoldNanos();
+        if (oldest != 0L && now - oldest > maximumHoldNanos) {
+            this.runInEventLoop(() -> this.hold.releaseOverdue(System.nanoTime(), maximumHoldNanos));
+        }
+    }
+
+    // - One line on what was held and set back so far; any thread -
+    String holdSummary() {
+        TickHold.Statistics held = this.hold.statistics();
+        double averageMillis = held.releasedPackets() > 0L ? held.holdNanos() / NANOS_PER_MILLISECOND / held.releasedPackets() : 0.0;
+        return String.format(Locale.ROOT,
+                "%s: %d packets held now, %d held so far for %.2f ms on average and at most %.1f ms, %d movement packets kept from the server, "
+                        + "%d times let go unjudged; %d setbacks: %d teleports, %d vehicle corrections, %d teleports on the server, %d skipped",
+                this.user.getName(), held.heldNow(), held.releasedPackets(), averageMillis, held.longestHoldNanos() / NANOS_PER_MILLISECOND,
+                held.droppedMovement(), held.unjudgedReleases(), this.setbacksRequested, this.positionCorrections, this.vehicleCorrections,
+                this.serverTeleports, this.setbacksSkipped);
     }
 
     private void keepWaiting(WaitingPacket packet) {
@@ -396,7 +734,7 @@ final class ConnectionSimulation {
         Path csvFile = this.reportDirectory.resolve(this.startTime.format(REPORT_TIME) + "-" + name + ".csv");
         TickReporter newReporter;
         try {
-            newReporter = new TickReporter(this.user, name, csvFile, this.logger, this.responses);
+            newReporter = new TickReporter(this.user, name, csvFile, this.logger, this.responses, this);
         } catch (IOException exception) {
             this.logger.error("Could not create {}", csvFile, exception);
             this.notSimulatedReason = "its report file could not be created";
@@ -410,7 +748,18 @@ final class ConnectionSimulation {
         this.logger.info("Simulating {} ({}), recording to {}", name, this.user.getUUID(), csvFile);
     }
 
+    // - From the server thread before PacketEvents is terminated: whatever is held goes on while PacketEvents' decoder, -
+    // - which it goes on from, is still there -
+    void stopHolding() {
+        this.runInEventLoop(() -> {
+            this.hold.disable();
+            this.endSetback(this.setbackGeneration);
+        });
+    }
+
+    // - On the event loop when the connection closed, or from the server thread when the plugin disables -
     void close() {
+        this.runInEventLoop(this.hold::close);
         this.totalWaitingBytes.addAndGet(-this.waitingBytes);
         this.waitingBytes = 0L;
         this.waitingPackets.clear();

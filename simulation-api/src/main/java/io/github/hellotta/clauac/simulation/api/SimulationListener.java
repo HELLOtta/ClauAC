@@ -5,8 +5,9 @@ package io.github.hellotta.clauac.simulation.api;
 public interface SimulationListener {
 
     // - simulationNanos is the tick's time as SimulationStatistics counts it: what the simulation spent on the -
-    // - connection since the previous tick, the tick itself included -
-    void onClientTick(ClientTickReport report, long simulationNanos);
+    // - connection since the previous tick, the tick itself included. end tells where the tick ended in the -
+    // - connection -
+    void onClientTick(ClientTickReport report, long simulationNanos, TickEnd end);
 
     // - The simulation found that its items differ from the client's, and cannot know the client's. The server -
     // - should send the client its whole inventory and open menu again, as Paper's Player.updateInventory does; the -

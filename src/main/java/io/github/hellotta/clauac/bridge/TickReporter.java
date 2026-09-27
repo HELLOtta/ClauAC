@@ -9,6 +9,7 @@ import io.github.hellotta.clauac.simulation.api.ClientTickReport;
 import io.github.hellotta.clauac.simulation.api.Flag;
 import io.github.hellotta.clauac.simulation.api.SimulationListener;
 import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
+import io.github.hellotta.clauac.simulation.api.TickEnd;
 import io.github.hellotta.clauac.simulation.api.TickOutcome;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -28,8 +29,8 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
 // - Records the simulation results of one connection: every client tick as a CSV line, mismatches in the server log, -
-// - and, while enabled, the latest result in the player's action bar. A failed tick also goes to the responses once -
-// - the server has the player -
+// - and, while enabled, the latest result in the player's action bar. A failed tick also goes to the responses, and -
+// - every tick's verdict goes to the connection, which lets the tick's packets on to the server -
 final class TickReporter implements SimulationListener {
 
     private static final String CSV_HEADER = "clientTick,outcome,predictedX,predictedY,predictedZ,predictedOnGround,predictedHorizontalCollision,"
@@ -48,6 +49,7 @@ final class TickReporter implements SimulationListener {
     private final String playerName;
     private final Logger logger;
     private final Responses responses;
+    private final ConnectionSimulation connection;
     // - Set by the server thread once the player is in the world -
     private volatile @Nullable Player player;
     private final Path csvFile;
@@ -61,11 +63,12 @@ final class TickReporter implements SimulationListener {
     // - Why the simulation stopped, once it has -
     private @Nullable String stopReason;
 
-    TickReporter(User user, String playerName, Path csvFile, Logger logger, Responses responses) throws IOException {
+    TickReporter(User user, String playerName, Path csvFile, Logger logger, Responses responses, ConnectionSimulation connection) throws IOException {
         this.user = user;
         this.playerName = playerName;
         this.logger = logger;
         this.responses = responses;
+        this.connection = connection;
         this.csvFile = csvFile;
         Files.createDirectories(csvFile.getParent());
         this.csv = Files.newBufferedWriter(csvFile, StandardCharsets.UTF_8);
@@ -102,7 +105,7 @@ final class TickReporter implements SimulationListener {
     }
 
     @Override
-    public void onClientTick(ClientTickReport report, long simulationNanos) {
+    public void onClientTick(ClientTickReport report, long simulationNanos, TickEnd end) {
         boolean nearby = this.entityNearby;
         synchronized (this) {
             if (this.closed) {
@@ -132,10 +135,8 @@ final class TickReporter implements SimulationListener {
         if (this.actionBarEnabled) {
             this.showInActionBar(report);
         }
-        Player known = this.player;
-        if (report.outcome() == TickOutcome.MISMATCHED && known != null) {
-            this.responses.onFailedTick(known, report);
-        }
+        boolean setBack = report.outcome() == TickOutcome.MISMATCHED && this.responses.onFailedTick(this.player, report);
+        this.connection.onVerdict(report, end, setBack);
     }
 
     private static String csvLine(ClientTickReport report, boolean entityNearby, long simulationNanos) {
@@ -222,7 +223,8 @@ final class TickReporter implements SimulationListener {
         double shownOffset = vehicle != null ? vehicle.offset() : report.offset();
         String offset = Double.isNaN(shownOffset) ? "-" : String.format(Locale.ROOT, "%.3e", shownOffset);
         String subject = vehicle != null ? " vehicle offset " : " offset ";
-        Component text = Component.text("ClauAC tick " + report.clientTick() + " " + report.outcome() + subject + offset, color);
+        String checks = report.flags().isEmpty() ? "" : " " + String.join(", ", report.flags().stream().map(flag -> flag.check().displayName()).distinct().toList());
+        Component text = Component.text("ClauAC tick " + report.clientTick() + " " + report.outcome() + checks + subject + offset, color);
         Object channel = this.user.getChannel();
         // - Only valid in the play phase; checked on the connection's event loop, where the phase changes -
         ChannelHelper.runInEventLoop(channel, () -> {
@@ -238,6 +240,7 @@ final class TickReporter implements SimulationListener {
             this.stopReason = message + ": " + cause;
         }
         this.logger.error("Simulation of {} stopped: {}", this.playerName, message, cause);
+        this.connection.onSimulationStopped();
     }
 
     synchronized String summary() {

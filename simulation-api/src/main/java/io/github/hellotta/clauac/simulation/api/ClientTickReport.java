@@ -31,6 +31,8 @@ public record ClientTickReport(
         double offset,
         // - The vehicle the player steered this tick; null when it steered none -
         VehicleState vehicle,
+        // - The player when the tick began -
+        Start start,
         // - The checks the tick failed; empty unless the outcome is MISMATCHED -
         List<Flag> flags,
         List<String> notes
@@ -39,6 +41,22 @@ public record ClientTickReport(
     // - The checks an uncertainty can explain: it leaves what the player and its vehicle did unknown, but never a -
     // - packet no vanilla client sends or anything else the tick failed -
     private static final Set<Check> MOVEMENT_CHECKS = EnumSet.of(Check.SIMULATION, Check.VEHICLE);
+
+    // - The player when the tick began, before the client's actions and its movement: its position and velocity, NaN -
+    // - when the client had no player, and whether a teleport, respawn or configuration of the server was still on -
+    // - its way to the client then. Such a packet moves the player after this start, so that putting the player back -
+    // - to the start would undo it -
+    public record Start(double x, double y, double z, double velocityX, double velocityY, double velocityZ, boolean repositionPending) {
+
+        // - A tick without a player -
+        public static Start none(boolean repositionPending) {
+            return new Start(Double.NaN, Double.NaN, Double.NaN, Double.NaN, Double.NaN, Double.NaN, repositionPending);
+        }
+
+        public boolean hasPosition() {
+            return !Double.isNaN(this.x) && !Double.isNaN(this.y) && !Double.isNaN(this.z);
+        }
+    }
 
     // - A vehicle the player steers, as the simulation moved it and as the client reported it -
     // - (ServerboundMoveVehiclePacket). Positions are the vehicle's own position in world coordinates -
@@ -98,7 +116,7 @@ public record ClientTickReport(
                 this.clientTick, newOutcome,
                 this.predictedX, this.predictedY, this.predictedZ, this.predictedOnGround, this.predictedHorizontalCollision, this.predictedSprinting,
                 this.positionReported, this.reportedX, this.reportedY, this.reportedZ, this.reportedOnGround, this.reportedHorizontalCollision, this.reportedSprinting,
-                this.offset, this.vehicle, newFlags, newNotes
+                this.offset, this.vehicle, this.start, newFlags, newNotes
         );
     }
 }
