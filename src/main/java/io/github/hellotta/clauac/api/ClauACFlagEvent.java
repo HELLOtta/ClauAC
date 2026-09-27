@@ -10,7 +10,8 @@ import org.bukkit.event.HandlerList;
 // - ClauAC responds to it. It is asynchronous: ClauAC calls it from a simulation thread right when the tick's result -
 // - is known, so listeners have to be quick and must not touch the world or the player's state, only read what the -
 // - event holds and the player's name and id. Cancelling it keeps ClauAC from responding to this flag: no alert, and -
-// - no setback unless another flag of the same tick that is not cancelled asks for one -
+// - neither a setback nor the tick's attacks and interactions kept from the server unless another flag of the same -
+// - tick that is not cancelled asks for it -
 public final class ClauACFlagEvent extends Event implements Cancellable {
 
     private static final HandlerList HANDLERS = new HandlerList();

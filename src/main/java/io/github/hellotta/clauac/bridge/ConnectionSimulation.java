@@ -17,6 +17,7 @@ import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPi
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerPositionAndLook;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerVehicleMove;
 import io.github.hellotta.clauac.response.Responses;
+import io.github.hellotta.clauac.response.TickResponse;
 import io.github.hellotta.clauac.simulation.api.ClientTickReport;
 import io.github.hellotta.clauac.simulation.api.Flag;
 import io.github.hellotta.clauac.simulation.api.PacketDirection;
@@ -54,7 +55,8 @@ import org.slf4j.Logger;
 // - in one go (ClientPacketListener.handleBundlePacket runs all its packets in one task on the client's main thread) -
 // - and answers the ping right there, so no client tick can fall between a packet and the ping behind it. -
 // -
-// - The client's movement reaches the server only once the simulation has judged its tick (see TickHold). A tick -
+// - The client's movement, attacks and interactions with entities reach the server only once the simulation has -
+// - judged their tick (see TickHold). A tick whose attacks and interactions fail a check loses them. A tick -
 // - that is to be set back loses its movement, and so does every tick after it until the client has taken a -
 // - correction: a teleport to where the server has the player, or, when it steers a vehicle, the vehicle's position -
 // - as the server has it (see Setbacks). The correction goes out in one of the connection's own bundles, so that -
@@ -76,10 +78,6 @@ final class ConnectionSimulation {
         NONE,
         REQUESTED,
         CORRECTED
-    }
-
-    // - What the setbacks of the connection came to so far, for /clauac status -
-    record SetbackStatistics(long requested, long positionCorrections, long vehicleCorrections, long serverTeleports, long skipped) {
     }
 
     private static final DateTimeFormatter REPORT_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.ROOT);
@@ -505,20 +503,24 @@ final class ConnectionSimulation {
         }
     }
 
-    // - A tick's verdict, from the simulation thread, in the order of the client's ticks; setBack tells whether the -
-    // - tick is to be set back -
-    void onVerdict(ClientTickReport report, TickEnd end, boolean setBack) {
-        this.runInEventLoop(() -> this.judge(report, end, setBack));
+    // - A tick's verdict, from the simulation thread, in the order of the client's ticks, with what happens to the -
+    // - tick's packets -
+    void onVerdict(ClientTickReport report, TickEnd end, TickResponse response) {
+        this.runInEventLoop(() -> this.judge(report, end, response));
     }
 
     // - The tick's packets go on to the server as far as the verdict allows, without their movement when the tick is -
-    // - set back. A tick that fails while a setback is under way needs no setback of its own when the client had not -
-    // - taken the correction yet before the tick: the correction on its way puts the client back anyway. After the -
-    // - correction, the simulation went on from where the correction put the player, so such a tick needs its own -
-    // - setback, which follows the current one -
-    private void judge(ClientTickReport report, TickEnd end, boolean setBack) {
+    // - set back and without its attacks and interactions when those are kept from the server. A tick that fails -
+    // - while a setback is under way needs no setback of its own when the client had not taken the correction yet -
+    // - before the tick: the correction on its way puts the client back anyway. After the correction, the simulation -
+    // - went on from where the correction put the player, so such a tick needs its own setback, which follows the -
+    // - current one. Attacks and interactions that went on unjudged already reached the server -
+    private void judge(ClientTickReport report, TickEnd end, TickResponse response) {
         boolean late = this.hold.wentOnUnjudged();
-        if (setBack) {
+        if (response.dropActions()) {
+            this.hold.dropActionsThrough(end.serverboundPackets());
+        }
+        if (response.setBack()) {
             this.hold.dropMovementThrough(end.serverboundPackets());
             if (this.setbackPhase == SetbackPhase.NONE) {
                 this.startSetback(report, end, late);
@@ -669,16 +671,17 @@ final class ConnectionSimulation {
         }
     }
 
-    // - One line on what was held and set back so far; any thread -
+    // - One line on what was held, kept from the server and set back so far; any thread -
     String holdSummary() {
         TickHold.Statistics held = this.hold.statistics();
         double averageMillis = held.releasedPackets() > 0L ? held.holdNanos() / NANOS_PER_MILLISECOND / held.releasedPackets() : 0.0;
         return String.format(Locale.ROOT,
-                "%s: %d packets held now, %d held so far for %.2f ms on average and at most %.1f ms, %d movement packets kept from the server, "
-                        + "%d times let go unjudged; %d setbacks: %d teleports, %d vehicle corrections, %d teleports on the server, %d skipped",
+                "%s: %d packets held now, %d held so far for %.2f ms on average and at most %.1f ms, %d movement packets and "
+                        + "%d attacks and interactions kept from the server, %d times let go unjudged; %d setbacks: %d teleports, "
+                        + "%d vehicle corrections, %d teleports on the server, %d skipped",
                 this.user.getName(), held.heldNow(), held.releasedPackets(), averageMillis, held.longestHoldNanos() / NANOS_PER_MILLISECOND,
-                held.droppedMovement(), held.unjudgedReleases(), this.setbacksRequested, this.positionCorrections, this.vehicleCorrections,
-                this.serverTeleports, this.setbacksSkipped);
+                held.droppedMovement(), held.droppedActions(), held.unjudgedReleases(), this.setbacksRequested, this.positionCorrections,
+                this.vehicleCorrections, this.serverTeleports, this.setbacksSkipped);
     }
 
     private void keepWaiting(WaitingPacket packet) {

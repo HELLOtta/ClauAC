@@ -68,6 +68,10 @@ Findings from running the official 26.3 client in a cloud container without a GP
   they killed an idle test player: turn `spawn_phantoms` off, clear the weather and turn `advance_weather` off.
 - **Console commands:** `~ ~ ~` in a console command means the console's position (the world spawn); run relative
   commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`.
+- **Aiming the test player:** `tp ... facing` and `rotate ... facing` turn the player from the command source's anchor,
+  which is the feet for the console (`LookAt`, `ServerPlayer.lookAt`), so a player told to face a cow's eyes looks well
+  above it. Aim from the eyes with `execute anchored eyes run tp Tester <pos> facing <point>`. `rotate` turns a riding
+  player without taking it off its vehicle.
 - **Key presses:** `xdotool key` releases the key within the same client tick, which the client's per-tick key polling
   can miss (a double tap of jump to fly never registers). Hold keys with `keydown`, `sleep 0.1`, `keyup`.
 - **Stopping the client:** `pkill -f <pattern>` also matches the shell that runs the command when the pattern appears

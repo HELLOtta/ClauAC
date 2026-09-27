@@ -61,6 +61,8 @@ public final class SandboxPlayer extends Player {
     private PermissionSet permissions = PermissionSet.NO_PERMISSIONS;
     private Input reportedKeys = Input.EMPTY;
     private boolean crouching;
+    // - LocalPlayer.handsBusy -
+    private boolean handsBusy;
     private boolean flashOnSetHealth;
     private boolean startedUsingItem;
     // - LocalPlayer's charge of the jump of a vehicle that can jump (horses, camels) -
@@ -114,8 +116,13 @@ public final class SandboxPlayer extends Player {
     // - LocalPlayer.raycastHitResult: what the crosshair points at, which Minecraft.pick computes at the start of -
     // - every tick with a partial tick of 1 -
     public HitResult raycastHitResult(float partialTicks, Entity cameraEntity) {
-        ItemStack itemStack = this.getActiveItem();
-        AttackRange itemAttackRange = itemStack.get(DataComponents.ATTACK_RANGE);
+        return this.raycastHitResult(partialTicks, cameraEntity, this.getActiveItem());
+    }
+
+    // - The same for a player holding out this item instead (LivingEntity.getActiveItem): an item with an attack -
+    // - range picks along that range first -
+    public HitResult raycastHitResult(float partialTicks, Entity cameraEntity, ItemStack activeItem) {
+        AttackRange itemAttackRange = activeItem.get(DataComponents.ATTACK_RANGE);
         double blockInteractionRange = this.blockInteractionRange();
         HitResult hitResult = null;
         if (itemAttackRange != null) {
@@ -191,14 +198,29 @@ public final class SandboxPlayer extends Player {
         }
     }
 
-    // - LocalPlayer.rideTick hands the keys to a boat the player steers; the hands-busy flag it also sets only -
-    // - gates the client's own attack and use key handling, which the sandbox learns from the client's packets -
+    // - LocalPlayer.rideTick hands the keys to a boat the player steers, whose paddles keep the player's hands busy: -
+    // - Minecraft.startAttack and startUseItem then do nothing -
     @Override
     public void rideTick() {
         super.rideTick();
+        this.handsBusy = false;
         if (this.getControlledVehicle() instanceof AbstractBoat boat) {
             boat.setInput(this.input.keyPresses.left(), this.input.keyPresses.right(), this.input.keyPresses.forward(), this.input.keyPresses.backward());
+            this.handsBusy = this.handsBusy
+                    | (this.input.keyPresses.left() || this.input.keyPresses.right() || this.input.keyPresses.forward() || this.input.keyPresses.backward());
         }
+    }
+
+    // - LocalPlayer.removeVehicle -
+    @Override
+    public void removeVehicle() {
+        super.removeVehicle();
+        this.handsBusy = false;
+    }
+
+    // - LocalPlayer.isHandsBusy -
+    public boolean isHandsBusy() {
+        return this.handsBusy;
     }
 
     @Override
@@ -320,6 +342,27 @@ public final class SandboxPlayer extends Player {
     // - Gives the player the attack strength ticker the client may have had instead, before its attack runs again -
     public void useAttackStrengthTicker(int ticker) {
         this.attackStrengthTicker = ticker;
+    }
+
+    // - Player.cannotAttackWithItem as Minecraft.startAttack asks it, under this player's ticker and under every -
+    // - alternative one (see alternativeAttackStrengths): true only when the client's player could not attack with -
+    // - the item whichever of them it had -
+    public boolean cannotAttackWithItemUnderAnyTicker(ItemStack itemStack) {
+        int ownTicker = this.attackStrengthTicker;
+        try {
+            if (!this.cannotAttackWithItem(itemStack, 0)) {
+                return false;
+            }
+            for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
+                this.attackStrengthTicker = alternative.ticker;
+                if (!this.cannotAttackWithItem(itemStack, 0)) {
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            this.attackStrengthTicker = ownTicker;
+        }
     }
 
     // - Player.getAttackStrengthScale as Player.attack uses it, for any ticker -

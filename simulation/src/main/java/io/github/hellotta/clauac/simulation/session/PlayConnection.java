@@ -29,6 +29,8 @@ import java.util.UUID;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.PositionAndRotation;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.HashedPatchMap;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundPingPacket;
@@ -127,6 +129,8 @@ import net.minecraft.world.Difficulty;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.TickRateManager;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySelector;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.Relative;
@@ -141,6 +145,7 @@ import net.minecraft.world.entity.vehicle.minecart.Minecart;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.AttackRange;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
@@ -148,6 +153,8 @@ import net.minecraft.world.level.border.WorldBorder;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
 import net.minecraft.world.level.storage.TagValueInput;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.scores.PlayerTeam;
@@ -1544,6 +1551,31 @@ final class PlayConnection implements ClientContext {
         }
     }
 
+    // - The player as Minecraft.handleKeybinds finds it, before any action of the tick, and what the crosshair pointed -
+    // - at. While the player uses an item, the attack and use keys do nothing; a hotbar switch that starts the tick -
+    // - may have stopped a use of the main hand during the previous tick already (see leadingHotbarSwitch), so only a -
+    // - use that such a switch leaves alone counts. Paddling a boat keeps the player's hands busy. The crosshair is -
+    // - what Minecraft.pick found from the camera before the key handling, so later actions of the tick do not change -
+    // - it. It depends on the item the player holds out (SandboxPlayer.raycastHitResult): after such a switch, the -
+    // - client's player held the new item already, unless it switched during this tick's key handling, so where the -
+    // - two items pick differently either crosshair is possible. The interaction ranges the pick uses are the -
+    // - attributes the server sent, as the client applies an item's attribute modifiers only when the server sends -
+    // - them (LivingEntity.detectEquipmentUpdates runs on the server), so a switch does not change them -
+    private record KeyHandlingStart(boolean usingItem, boolean handsBusy, Entity camera, HitResult crosshair, @Nullable HitResult crosshairWithSwitchedItem) {
+
+        // - Where the crosshair met the entity with each item the client may have held out; empty when it did not -
+        List<EntityHitResult> hitsOn(Entity target) {
+            List<EntityHitResult> hits = new ArrayList<>(2);
+            if (this.crosshair instanceof EntityHitResult hit && hit.getEntity() == target) {
+                hits.add(hit);
+            }
+            if (this.crosshairWithSwitchedItem instanceof EntityHitResult hit && hit.getEntity() == target) {
+                hits.add(hit);
+            }
+            return hits;
+        }
+    }
+
     // - Replays Minecraft.handleKeybinds and MultiPlayerGameMode.tick for this tick from the packets they sent. An -
     // - action the sandbox's vanilla code cannot perform is rejected, and the others go on -
     private void performTickActions(SandboxLevel level, SandboxPlayer player) {
@@ -1552,14 +1584,25 @@ final class PlayConnection implements ClientContext {
             return;
         }
         ServerboundSetCarriedItemPacket leadingSwitch = this.leadingHotbarSwitch(player);
-        // - Minecraft.pick runs before the key handling, so later actions of the tick do not change what it found -
+        ItemStack switchedTo = leadingSwitch != null ? player.getInventory().getItem(leadingSwitch.getSlot()) : null;
+        // - LivingEntity.updatingUsingItem stops the use once the used hand holds another item -
+        boolean useMayHaveStopped = switchedTo != null && player.isUsingItem() && player.getUsedItemHand() == InteractionHand.MAIN_HAND
+                && !ItemStack.isSameItem(switchedTo, player.getUseItem());
         Entity camera = this.cameraEntity != null ? this.cameraEntity : player;
-        HitResult crosshair = player.raycastHitResult(TICK_PARTIAL_TICK, camera);
+        ItemStack activeItem = player.getActiveItem();
+        // - LivingEntity.getActiveItem holds out the new main hand item unless the player is a spectator or goes on -
+        // - using an item -
+        HitResult crosshairWithSwitchedItem = switchedTo != null && !player.isSpectator() && (!player.isUsingItem() || useMayHaveStopped)
+                && !Objects.equals(switchedTo.get(DataComponents.ATTACK_RANGE), activeItem.get(DataComponents.ATTACK_RANGE))
+                ? player.raycastHitResult(TICK_PARTIAL_TICK, camera, switchedTo)
+                : null;
+        KeyHandlingStart start = new KeyHandlingStart(player.isUsingItem() && !useMayHaveStopped, player.isHandsBusy(), camera,
+                player.raycastHitResult(TICK_PARTIAL_TICK, camera), crosshairWithSwitchedItem);
         boolean swingAccompanied = false;
         for (int index = 0; index < actions.size(); index++) {
             Packet<?> action = actions.get(index);
             try {
-                swingAccompanied = this.performTickAction(action, index, leadingSwitch, crosshair, swingAccompanied, level, player);
+                swingAccompanied = this.performTickAction(action, index, leadingSwitch, start, swingAccompanied, level, player);
             } catch (RuntimeException problem) {
                 this.problemLog.log("rejected " + action.type() + " replayed at the end of a client tick", problem);
                 this.tickPackets.reject(Check.BAD_PACKETS, action.type() + " could not be performed (" + problem + ")");
@@ -1572,7 +1615,7 @@ final class PlayConnection implements ClientContext {
             Packet<?> action,
             int index,
             @Nullable ServerboundSetCarriedItemPacket leadingSwitch,
-            HitResult crosshair,
+            KeyHandlingStart start,
             boolean swingAccompanied,
             SandboxLevel level,
             SandboxPlayer player
@@ -1599,6 +1642,7 @@ final class PlayConnection implements ClientContext {
                 if (target == null) {
                     this.attackUnknownEntity(player, this.onlySwingsFollow(index));
                 } else {
+                    this.checkAttack(level, player, target, start);
                     this.attackEntity(level, player, target, this.onlySwingsFollow(index));
                 }
                 return true;
@@ -1611,6 +1655,7 @@ final class PlayConnection implements ClientContext {
                     this.tickPackets.notes.add("interacted with entity " + interact.entityId() + ", which the sandbox does not know");
                     this.markInventoryUnknown(InventoryMenu.CONTAINER_ID);
                 } else {
+                    this.checkInteraction(level, player, target, interact.hand(), start);
                     this.gameMode.interact(player, target, interact.hand(), interact.location());
                 }
             }
@@ -1618,13 +1663,169 @@ final class PlayConnection implements ClientContext {
                 if (!swingAccompanied) {
                     // - What the crosshair pointed at depends on the player's rotation -
                     this.checkActionRotation(player, "swung at what the crosshair pointed at");
-                    this.gameMode.swingAlone(level, player, crosshair);
+                    this.gameMode.swingAlone(level, player, start.crosshair());
                 }
                 return false;
             }
             default -> throw new IllegalArgumentException("No handler for the action " + action.type());
         }
         return swingAccompanied;
+    }
+
+    // - Minecraft.startAttack, the only place a vanilla client attacks from (MultiPlayerGameMode.attack). The attack -
+    // - key does nothing while the player uses an item or paddles a boat (see checkHandsFree), and a spectator -
+    // - spectates the entity instead. An item the level's features do not enable does not attack, a piercing weapon -
+    // - stabs instead, and a weapon charged less than its minimum attack charge does nothing. Otherwise the player -
+    // - attacks the entity the crosshair points at, with a weapon that has an attack range only within that range. -
+    // - The sandbox still performs the attack as the client did, since the client's player went on from it -
+    private void checkAttack(SandboxLevel level, SandboxPlayer player, Entity target, KeyHandlingStart start) {
+        String action = "attacked " + describeEntity(target);
+        this.checkHandsFree(action, "attack", start);
+        if (this.gameMode.isSpectator()) {
+            this.tickPackets.reject(Check.INTERACTION, action + " as a spectator, who spectates an entity instead");
+        }
+        ItemStack weapon = player.getMainHandItem();
+        if (!weapon.isItemEnabled(level.enabledFeatures())) {
+            this.tickPackets.reject(Check.INTERACTION, action + " with " + describeItem(weapon) + ", which the level's features do not enable");
+        } else if (weapon.has(DataComponents.PIERCING_WEAPON)) {
+            // - Charged too little, a piercing weapon does nothing at all -
+            this.tickPackets.reject(Check.INTERACTION, action + " with " + describeItem(weapon) + ", which a vanilla client stabs with instead");
+        } else if (player.cannotAttackWithItem(weapon, 0)) {
+            // - The attack strength ticker depends on when the client switched its hotbar slot (see -
+            // - SandboxPlayer.considerEarlierHotbarSwitch); the attack speed is the attribute the server sent -
+            if (player.cannotAttackWithItemUnderAnyTicker(weapon)) {
+                this.tickPackets.reject(Check.INTERACTION, action + " with " + describeItem(weapon) + " charged less than its minimum attack charge");
+            } else {
+                this.tickPackets.notes.add("not checked: " + action + " with " + describeItem(weapon)
+                        + ", whose charge depends on when the client switched its hotbar slot");
+            }
+        }
+        AttackRange weaponRange = weapon.get(DataComponents.ATTACK_RANGE);
+        List<EntityHitResult> hits = start.hitsOn(target);
+        if (!hits.isEmpty()) {
+            // - AttackRange.isInRange measures from the player's eyes to the point the crosshair met -
+            if (weaponRange != null && hits.stream().noneMatch(hit -> weaponRange.isInRange(player, hit.getLocation()))) {
+                this.tickPackets.reject(Check.REACH, String.format(Locale.ROOT, "%s %.2f blocks away, outside the %.2f to %.2f blocks %s reaches",
+                        action, hits.getFirst().getLocation().distanceTo(player.getEyePosition()),
+                        weaponRange.effectiveMinRange(player) - weaponRange.hitboxMargin(),
+                        weaponRange.effectiveMaxRange(player) + weaponRange.hitboxMargin(), describeItem(weapon)));
+            }
+            return;
+        }
+        // - Minecraft.pick meets the entity's box grown by its pick radius closer than the entity interaction range to -
+        // - the camera's eyes, and a weapon with an attack range then needs the point it met within that range -
+        double distance = Math.sqrt(target.getBoundingBox().inflate(target.getPickRadius()).distanceToSqr(start.camera().getEyePosition(TICK_PARTIAL_TICK)));
+        if (weaponRange != null) {
+            double maximumRange = weaponRange.effectiveMaxRange(player) + weaponRange.hitboxMargin();
+            if (distance > maximumRange) {
+                this.rejectOutOfReach(action, distance, maximumRange, describeItem(weapon));
+            } else {
+                this.rejectCrosshairMiss(action, player, target, start, maximumRange);
+            }
+        } else if (distance >= player.entityInteractionRange()) {
+            this.rejectOutOfReach(action, distance, player.entityInteractionRange(), "the player");
+        } else {
+            this.rejectCrosshairMiss(action, player, target, start, player.entityInteractionRange());
+        }
+    }
+
+    // - Minecraft.startUseItem, the only place a vanilla client interacts with an entity from -
+    // - (MultiPlayerGameMode.interact, which sends the interaction for a spectator as well). The use key does nothing -
+    // - while the player uses an item or paddles a boat (see checkHandsFree) or breaks a block. The hands are tried -
+    // - main hand first, and an item the level's features do not enable ends the key's handling. The player interacts -
+    // - with the entity the crosshair points at, within the world border, while the entity's box lies closer than the -
+    // - player's entity interaction range (Player.isWithinEntityInteractionRange). The sandbox still performs the -
+    // - interaction as the client did, since the client's player went on from it -
+    private void checkInteraction(SandboxLevel level, SandboxPlayer player, Entity target, InteractionHand hand, KeyHandlingStart start) {
+        String action = "interacted with " + describeEntity(target);
+        this.checkHandsFree(action, "use", start);
+        if (this.gameMode.isDestroying()) {
+            this.tickPackets.reject(Check.INTERACTION, action + " while breaking a block, when a vanilla client ignores the use key");
+        }
+        for (InteractionHand tried : InteractionHand.values()) {
+            ItemStack held = player.getItemInHand(tried);
+            if (!held.isItemEnabled(level.enabledFeatures())) {
+                this.tickPackets.reject(Check.INTERACTION, action + " while holding " + describeItem(held) + ", which the level's features do not enable");
+                break;
+            }
+            if (tried == hand) {
+                break;
+            }
+        }
+        if (!level.getWorldBorder().isWithinBounds(target.blockPosition())) {
+            this.tickPackets.reject(Check.INTERACTION, action + " outside the world border");
+        }
+        double reach = player.entityInteractionRange();
+        if (!player.isWithinEntityInteractionRange(target, 0.0)) {
+            this.rejectOutOfReach(action, Math.sqrt(target.getBoundingBox().distanceToSqr(player.getEyePosition())), reach, "the player");
+        } else if (start.hitsOn(target).isEmpty()) {
+            this.rejectCrosshairMiss(action, player, target, start, reach);
+        }
+    }
+
+    // - Minecraft.handleKeybinds consumes the attack and use key clicks without acting while the player uses an item, -
+    // - and Minecraft.startAttack and startUseItem do nothing while paddling a boat keeps the player's hands busy -
+    private void checkHandsFree(String action, String key, KeyHandlingStart start) {
+        if (start.usingItem()) {
+            this.tickPackets.reject(Check.INTERACTION, action + " while using an item, when a vanilla client ignores the " + key + " key");
+        }
+        if (start.handsBusy()) {
+            this.tickPackets.reject(Check.INTERACTION, action + " while paddling a boat, which keeps a vanilla client's hands busy");
+        }
+    }
+
+    private void rejectOutOfReach(String action, double distance, double reach, String reacher) {
+        this.tickPackets.reject(Check.REACH, String.format(Locale.ROOT, "%s %.2f blocks away, beyond the %.2f blocks %s reaches", action, distance, reach, reacher));
+    }
+
+    // - The crosshair did not point at the target, although the target lay within reach: it is an entity the crosshair -
+    // - never points at (EntitySelector.CAN_BE_PICKED), or the crosshair pointed at something in front of it or beside -
+    // - it. The sight line reaches as far as the action does. Where the player rides a minecart that may have turned -
+    // - it (see passengerTurnUnknown), the rotation the player acted with is unknown, and so is where the crosshair -
+    // - pointed -
+    private void rejectCrosshairMiss(String action, SandboxPlayer player, Entity target, KeyHandlingStart start, double reach) {
+        if (passengerTurnUnknown(player)) {
+            this.tickPackets.notes.add("not checked: " + action + " with a rotation the minecart may have turned");
+            return;
+        }
+        HitResult crosshair = start.crosshair();
+        if (!EntitySelector.CAN_BE_PICKED.test(target)) {
+            this.tickPackets.reject(Check.HITBOX, action + ", which the crosshair never points at");
+            return;
+        }
+        Vec3 eyes = start.camera().getEyePosition(TICK_PARTIAL_TICK);
+        Vec3 sightEnd = eyes.add(start.camera().getViewVector(TICK_PARTIAL_TICK).scale(reach));
+        boolean inSight = target.getBoundingBox().inflate(target.getPickRadius()).clip(eyes, sightEnd).isPresent();
+        if (inSight && crosshair.getType() != HitResult.Type.MISS) {
+            this.tickPackets.reject(Check.HITBOX, action + " behind " + describeCrosshair(start) + ", which the crosshair pointed at");
+        } else {
+            this.tickPackets.reject(Check.HITBOX, action + ", which the crosshair did not point at: it pointed at " + describeCrosshair(start));
+        }
+    }
+
+    // - What the crosshair pointed at, and with the item the client may have switched to already where that one -
+    // - picks differently -
+    private static String describeCrosshair(KeyHandlingStart start) {
+        HitResult withSwitchedItem = start.crosshairWithSwitchedItem();
+        String pointedAt = describeHit(start.crosshair());
+        return withSwitchedItem == null ? pointedAt : pointedAt + " (with the item the client switched to: " + describeHit(withSwitchedItem) + ")";
+    }
+
+    private static String describeEntity(Entity entity) {
+        return EntityType.getKey(entity.getType()) + " (entity " + entity.getId() + ")";
+    }
+
+    private static String describeItem(ItemStack stack) {
+        return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+    }
+
+    // - What Minecraft.pick found -
+    private static String describeHit(HitResult hit) {
+        return switch (hit) {
+            case EntityHitResult entityHit -> describeEntity(entityHit.getEntity());
+            case BlockHitResult blockHit when hit.getType() == HitResult.Type.BLOCK -> "the block at " + blockHit.getBlockPos().toShortString();
+            default -> "nothing within reach";
+        };
     }
 
     // - Whether nothing after this action of the tick changes the player: only swings follow, which belong to it or -

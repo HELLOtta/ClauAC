@@ -20,7 +20,9 @@ setbacks:
   maximum-hold-millis: 1000
 
 # - What ClauAC does when a client tick fails a check, per check. alert: whether players with alerts on hear of it. -
-# - setback: whether the tick's movement is thrown away and the client put back where the server has the player -
+# - setback: for a check of the movement, whether the tick's movement is thrown away and the client put back where -
+# - the server has the player; for a check of the actions (Reach, Hitbox, Interaction), whether the tick's attacks -
+# - and interactions with entities are kept from the server -
 checks:
   # - The player did not move the way the vanilla client moves it -
   Simulation:
@@ -44,6 +46,19 @@ checks:
     setback: true
   # - The client held back its answers to the server's packets -
   Pings:
+    alert: true
+    setback: true
+  # - The client attacked or interacted with an entity farther away than the player reaches -
+  Reach:
+    alert: true
+    setback: true
+  # - The client attacked or interacted with an entity its crosshair did not point at -
+  Hitbox:
+    alert: true
+    setback: true
+  # - The client attacked or interacted with an entity when a vanilla client does not: while using an item, while -
+  # - paddling a boat, as a spectator, while breaking a block, or with a weapon that cannot attack -
+  Interaction:
     alert: true
     setback: true
   # - The simulation itself failed during a tick; nothing the client sent could be checked -

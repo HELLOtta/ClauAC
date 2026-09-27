@@ -62,6 +62,11 @@ final class SandboxGameMode {
         return this.localPlayerMode;
     }
 
+    // - MultiPlayerGameMode.isDestroying -
+    boolean isDestroying() {
+        return this.isDestroying;
+    }
+
     boolean isSpectator() {
         return this.localPlayerMode == GameType.SPECTATOR;
     }

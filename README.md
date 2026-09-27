@@ -4,9 +4,11 @@ A predictive (simulation-based) anticheat plugin for [Paper](https://papermc.io/
 [PacketEvents](https://github.com/retrooper/packetevents).
 
 > **Status:** prototype. ClauAC simulates every client tick of a player's movement with Minecraft's own code and
-> compares the result with what the client sent. It names the checks a tick failed, keeps the movement of a failed tick
-> from the server and sets the player back, alerts the players who watch for failed checks and calls an event other
-> plugins can act on (see "Responses"). It does not kick or punish anyone.
+> compares the result with what the client sent, including the attacks and interactions with entities the client's
+> key handling allows. It names the checks a tick failed, keeps the movement of a failed tick from the server and sets
+> the player back, keeps attacks and interactions no vanilla client makes from the server, alerts the players who
+> watch for failed checks and calls an event other plugins can act on (see "Responses"). It does not kick or punish
+> anyone.
 
 ## Target platform
 
@@ -355,6 +357,13 @@ Every `MISMATCHED` tick names the checks it failed, each with what exactly faile
 | `Timer`             | The client ended its ticks faster than the timer of a vanilla client runs (see below)        |
 | `Pings`             | The client left so many of the server's packets unconfirmed that the older half was applied  |
 |                     | without its answers (see "Cost and limits")                                                  |
+| `Reach`             | The client attacked or interacted with an entity farther away than the player or its weapon  |
+|                     | reaches (see "Attacks and interactions")                                                     |
+| `Hitbox`            | The client attacked or interacted with an entity its crosshair did not point at: one behind  |
+|                     | a block or another entity, one beside where the player looked, or one no crosshair meets     |
+| `Interaction`       | The client attacked or interacted with an entity when a vanilla client does not: while it    |
+|                     | used an item, paddled a boat or broke a block, as a spectator, outside the world border, or  |
+|                     | with an item that cannot attack                                                              |
 | `SimulationFailure` | The simulation itself failed during the tick, so nothing the client sent in it was checked   |
 
 Something the simulation cannot know (see "What the simulation cannot know") only ever explains a difference in the
@@ -383,17 +392,81 @@ traced them, whose ticks got 455 to 577 ms ahead at most. One extra tick end inj
 fast, failed `Timer` from 137 ticks (6.9 seconds) on, 50 times in 15 seconds, and once more right after it stopped.
 1500 tick ends injected at once failed it 1502 times.
 
+### Attacks and interactions
+
+A vanilla client attacks an entity only from `Minecraft.startAttack` and interacts with one only from
+`Minecraft.startUseItem` (the only callers of `MultiPlayerGameMode.attack` and `interact`), both during its key
+handling, before the player's tick. The simulation replays that key handling from the tick's packets and checks every
+attack and interaction against what these methods allow:
+
+- The target is the entity the crosshair pointed at. `Minecraft.pick` runs at the start of the tick, before the keys,
+  from the camera with the rotation the tick's movement packet reports; the sandbox runs the same vanilla code, so the
+  blocks and entities in front of the target count, and so do its pick radius and its position as the client
+  interpolated it. When the crosshair did not point at the target, the tick fails `Reach` if the target lay out of
+  reach even for a crosshair on it, and `Hitbox` otherwise.
+- The crosshair meets an entity's box, grown by its pick radius, closer than the player's entity interaction range,
+  and a weapon with an attack range (`minecraft:attack_range`) attacks only where that point lies within its range.
+  An interaction also needs the entity's box itself closer than that range (`Player.isWithinEntityInteractionRange`)
+  and the entity inside the world border.
+- The attack and use keys do nothing while the player uses an item or paddles a boat, and the use key nothing while
+  it breaks a block. A spectator spectates an entity instead of attacking it. An item the level's features do not
+  enable ends the key's handling, a piercing weapon (a spear) stabs instead of attacking, and a weapon charged less
+  than its minimum attack charge does nothing.
+
+Where the packets leave the client's situation open, the check takes whatever a vanilla client may have done:
+
+- A hotbar switch the tick starts with may have happened before this tick's key handling or during it (see "What the
+  simulation cannot know"). Where the old and the new item pick differently (an attack range), a crosshair on the
+  target with either counts, and a use of the main hand that the switch may have stopped does not keep the keys from
+  acting. The minimum attack charge is checked against every value the client's attack strength may have.
+- The interaction ranges and the attack speed are the attributes the server sent: the client applies an item's
+  attribute modifiers only when the server sends them (`LivingEntity.detectEquipmentUpdates` runs on the server), so a
+  hotbar switch does not change them.
+- In a minecart with the experimental movement, the rotation the player acted with is unknown (see "What the
+  simulation cannot know"), and what the crosshair pointed at is not checked; the tick's notes say so.
+- An attack or interaction on an entity the sandbox does not know is not checked (see "What the simulation cannot
+  know").
+
+Attacks and interactions are held like the movement (see "Setbacks"). A tick that fails `Reach`, `Hitbox` or
+`Interaction` with `setback` on loses all of its attacks and interactions: none of them reaches the server, and the
+tick's movement goes on unless another check of the tick sets it back. The client keeps what it did on its own when
+it attacked (its swing, the end of its sprint). An attack that went on unjudged, because the simulation fell further
+behind than `setbacks.maximum-hold-millis`, has reached the server and cannot be taken back. Paper's own check lets an
+attack or interaction through within the player's range plus 3 blocks (`misc.client-interaction-leniency-distance` in
+`paper-global.yml`) and does not look at the crosshair.
+
+In game, a cow without AI and with 1000 health stood on the floor. Three attacks from 1.6 blocks away, one from 2.9
+blocks and feeding it wheat matched, and the attacks took 4 of its health. A proxy between the client and the server
+then sent the client's attack on the cow again where no vanilla client makes it: 4.56 blocks away (`Reach`), with the
+cow behind the player and behind glass (`Hitbox`), while the player looked through a spyglass, paddled a boat (also
+`Hitbox`: the crosshair pointed at the floor) or was a spectator (`Interaction`), and it sent the client's interaction
+with the cow again while the player broke obsidian (`Interaction` and `Hitbox`). Each failed its check in exactly one
+tick, and none of them reached the server: the cow kept its health, `/clauac status` counted 7 attacks and
+interactions kept from the server and no setback, and two more attacks made the vanilla way took 2 health again. An
+alert reads:
+
+    [ClauAC] Tester failed Hitbox x1 attacked minecraft:cow (entity 1051) behind the block at 103, 101, 119, which the crosshair pointed at
+
+A ninth test course attacks and interacts the vanilla way, and all of its 1506 ticks matched. It made 25 attacks: while
+backing away from a cow until it was out of reach, on a cow the server moved every 100 ms as it crossed the crosshair,
+right after hotbar keys, crouching 2.86 blocks away, in creative mode from 4.5 blocks, from a boat the player did not
+paddle, and on an interaction entity, an armor stand, an item frame, a slime and a calf. It made 5 interactions:
+milking a cow, shearing a sheep, naming and feeding the calf, and using the interaction entity. The eight other
+courses matched in all of their ticks as well.
+
 ### Setbacks
 
 A tick that fails a check whose `setback` is on (every check but `SimulationFailure` by default) is set back: its
-movement never reaches the server, and the client is put back where the server has the player.
+movement never reaches the server, and the client is put back where the server has the player. The checks of
+attacks and interactions (`Reach`, `Hitbox`, `Interaction`) move nobody: their `setback` keeps the tick's attacks and
+interactions from the server instead (see "Attacks and interactions").
 
 - The server applies the client's movement only once the simulation has judged its tick. From a tick's first movement
-  packet on (a position, rotation or ground update of the player, or a vehicle position), ClauAC keeps the client's
-  packets from the server until that tick's verdict, and then lets them go on in the order the client sent them. A
-  packet that is no movement goes on right away while nothing is held, and waits behind what is held otherwise, so
-  that the server gets everything in its order. The packets go on from PacketEvents' decoder, past every packet
-  listener, as if they arrived just then.
+  packet on (a position, rotation or ground update of the player, or a vehicle position), or from its first attack or
+  interaction with an entity, ClauAC keeps the client's packets from the server until that tick's verdict, and then
+  lets them go on in the order the client sent them. A packet that is neither goes on right away while nothing is
+  held, and waits behind what is held otherwise, so that the server gets everything in its order. The packets go on
+  from PacketEvents' decoder, past every packet listener, as if they arrived just then.
 - The movement packets of a failed tick are thrown away, and so are those of every tick after it until the client has
   taken a correction: a teleport to where the server has the player, which keeps the client's own rotation and gives
   it the velocity it had when the failed tick began (none when the server has the player elsewhere by now). When the
@@ -417,7 +490,8 @@ movement never reaches the server, and the client is put back where the server h
   server decides.
 
 Every setback is logged. `/clauac status` adds a line per connection with the packets held so far and for how long,
-the movement packets kept from the server, how often packets went on unjudged, and the setbacks by kind.
+the movement packets and the attacks and interactions kept from the server, how often packets went on unjudged, and
+the setbacks by kind.
 
 Setbacks were tried in game with a proxy between the client and the server that shifted the positions in the
 client's movement packets for three seconds while the player moved on, as a movement cheat would, and with the
@@ -477,7 +551,9 @@ reads it again while the server runs.
 | `setbacks.maximum-hold-millis` | `1000`      | How long the client's packets wait for their tick's verdict at most        |
 | `checks.<name>.alert`          | `true`      | Whether failing the check of that name (see the table above) alerts        |
 | `checks.<name>.setback`        | `true`      | Whether failing it sets the player back; `false` for `SimulationFailure`,  |
-|                                |             | a failure of ClauAC's own that says nothing about the client               |
+|                                |             | a failure of ClauAC's own that says nothing about the client. For `Reach`, |
+|                                |             | `Hitbox` and `Interaction` it keeps the tick's attacks and interactions    |
+|                                |             | from the server instead, and nobody is moved                               |
 
 The format is [MiniMessage](https://docs.papermc.io/adventure/minimessage/format/) text. The filled-in values are
 escaped, so that a detail with a `<` in it shows as it is instead of becoming a MiniMessage tag. A value ClauAC cannot
@@ -491,7 +567,8 @@ the `config.yml` of an earlier version keeps working. The alerts go out through 
 ClauAC calls `io.github.hellotta.clauac.api.ClauACFlagEvent` once for every check a tick failed, before it responds to
 it. The event holds the player, the check (`io.github.hellotta.clauac.simulation.api.Check`), the detail and the
 client tick; cancelling it keeps ClauAC from responding to that flag: it does not alert, and it sets the player back
-only when another flag of the same tick that nobody cancelled asks for it. The event is asynchronous: the simulation
+or keeps the tick's attacks and interactions from the server only when another flag of the same tick that nobody
+cancelled asks for it. The event is asynchronous: the simulation
 thread that finished the tick calls it as soon as the result is known, with ClauAC's plugin class loader as the
 thread's context class loader. A listener therefore has to be quick and must hand anything that touches the world or
 the player's state to the server thread. A plugin that listens for it depends on ClauAC in its `plugin.yml`

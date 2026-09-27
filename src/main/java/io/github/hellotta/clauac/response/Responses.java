@@ -10,7 +10,9 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
 // - What ClauAC does when a client tick fails checks: for every flag it calls ClauACFlagEvent and, unless a listener -
-// - cancelled it, alerts and sets the player back as the configuration says. Ticks arrive on simulation threads -
+// - cancelled it, alerts and responds as the configuration says: a check of the movement sets the player back, and a -
+// - check of the actions keeps the tick's attacks and interactions from the server. Ticks arrive on simulation -
+// - threads -
 public final class Responses {
 
     private final JavaPlugin plugin;
@@ -24,15 +26,16 @@ public final class Responses {
         this.settings = settings;
     }
 
-    // - A tick of this player failed checks (report.flags() is not empty). Returns whether the player has to be set -
-    // - back. Before the server has the player in its world there is nobody to call the event for or to name in an -
-    // - alert; the configuration alone then decides on the setback -
-    public boolean onFailedTick(@Nullable Player player, ClientTickReport report) {
+    // - A tick of this player failed checks (report.flags() is not empty). Returns what happens to the tick's packets. -
+    // - Before the server has the player in its world there is nobody to call the event for or to name in an alert; -
+    // - the configuration alone then decides on the response -
+    public TickResponse onFailedTick(@Nullable Player player, ClientTickReport report) {
         if (this.closed) {
-            return false;
+            return TickResponse.NONE;
         }
         ClauACSettings current = this.settings;
         boolean setBack = false;
+        boolean dropActions = false;
         for (Flag flag : report.flags()) {
             if (player != null && !this.call(new ClauACFlagEvent(player, flag.check(), flag.detail(), report.clientTick()))) {
                 continue;
@@ -40,9 +43,15 @@ public final class Responses {
             if (player != null && current.alerts(flag.check())) {
                 this.alerts.flag(player, flag, report.clientTick(), current);
             }
-            setBack |= current.setsBack(flag.check());
+            if (current.setsBack(flag.check())) {
+                if (flag.check().concernsActions()) {
+                    dropActions = true;
+                } else {
+                    setBack = true;
+                }
+            }
         }
-        return setBack;
+        return new TickResponse(setBack, dropActions);
     }
 
     // - Calls the event with the plugin's class loader as the thread's context class loader: simulation threads -

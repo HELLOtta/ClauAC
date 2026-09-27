@@ -5,6 +5,7 @@ import com.github.retrooper.packetevents.protocol.player.User;
 import com.github.retrooper.packetevents.netty.channel.ChannelHelper;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerActionBar;
 import io.github.hellotta.clauac.response.Responses;
+import io.github.hellotta.clauac.response.TickResponse;
 import io.github.hellotta.clauac.simulation.api.ClientTickReport;
 import io.github.hellotta.clauac.simulation.api.Flag;
 import io.github.hellotta.clauac.simulation.api.SimulationListener;
@@ -135,8 +136,8 @@ final class TickReporter implements SimulationListener {
         if (this.actionBarEnabled) {
             this.showInActionBar(report);
         }
-        boolean setBack = report.outcome() == TickOutcome.MISMATCHED && this.responses.onFailedTick(this.player, report);
-        this.connection.onVerdict(report, end, setBack);
+        TickResponse response = report.outcome() == TickOutcome.MISMATCHED ? this.responses.onFailedTick(this.player, report) : TickResponse.NONE;
+        this.connection.onVerdict(report, end, response);
     }
 
     private static String csvLine(ClientTickReport report, boolean entityNearby, long simulationNanos) {

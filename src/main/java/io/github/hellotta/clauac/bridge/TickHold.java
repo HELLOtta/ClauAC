@@ -7,13 +7,16 @@ import com.github.retrooper.packetevents.protocol.packettype.PacketTypeCommon;
 import com.github.retrooper.packetevents.protocol.player.User;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.Set;
 import org.jspecify.annotations.Nullable;
 
-// - Keeps the client's play packets from the server from a tick's first movement packet until the simulation has -
-// - judged that tick, so that the server only applies movement ClauAC has checked, and throws the movement of a tick -
-// - away when the tick is to be set back. The packets go on to the server in the order the client sent them: a -
-// - packet that is no movement goes on right away while nothing is held, and otherwise waits behind what is held. -
+// - Keeps the client's play packets from the server from a tick's first movement packet, attack or interaction with -
+// - an entity until the simulation has judged that tick, so that the server only applies movement and actions ClauAC -
+// - has checked. It throws the movement of a tick away when the tick is to be set back, and its attacks and -
+// - interactions when those failed a check. The packets go on to the server in the order the client sent them: a -
+// - packet a verdict cannot throw away goes on right away while nothing is held, and otherwise waits behind what is -
+// - held. -
 // - A held packet is copied and its buffer emptied, which the vanilla decoder after PacketEvents' passes over, and -
 // - it goes on later from PacketEvents' decoder, past every packet listener, as if it came just then. -
 // -
@@ -23,8 +26,8 @@ import org.jspecify.annotations.Nullable;
 // - that everything behind it has to reach the server after it. Everything runs on the connection's event loop -
 final class TickHold {
 
-    // - The packets a tick's verdict can throw away. They wait for their tick's verdict, and so does everything the -
-    // - client sent after them -
+    // - The packets a tick's verdict can throw away: its movement, and its attacks and interactions with entities -
+    // - (Minecraft.startAttack and startUseItem, through MultiPlayerGameMode.attack and interact) -
     private static final Set<PacketTypeCommon> MOVEMENT = Set.of(
             PacketType.Play.Client.PLAYER_POSITION,
             PacketType.Play.Client.PLAYER_POSITION_AND_ROTATION,
@@ -32,6 +35,12 @@ final class TickHold {
             PacketType.Play.Client.PLAYER_FLYING,
             PacketType.Play.Client.VEHICLE_MOVE
     );
+    private static final Set<PacketTypeCommon> ACTIONS = Set.of(
+            PacketType.Play.Client.ATTACK,
+            PacketType.Play.Client.INTERACT_ENTITY
+    );
+    // - Both wait for their tick's verdict, and so does everything the client sent after them -
+    private static final Set<PacketTypeCommon> JUDGED = union(MOVEMENT, ACTIONS);
     // - What one connection may hold at most. A client sends a few packets per tick, and even the packets of a second -
     // - with the simulation behind stay far below; a client flooding the server is not held back, so that the -
     // - server's own packet limiter sees the flood -
@@ -44,7 +53,10 @@ final class TickHold {
     }
 
     // - What the hold did so far, for /clauac status -
-    record Statistics(int heldNow, long oldestHeldNanos, long releasedPackets, long holdNanos, long longestHoldNanos, long droppedMovement, long unjudgedReleases) {
+    record Statistics(
+            int heldNow, long oldestHeldNanos, long releasedPackets, long holdNanos, long longestHoldNanos, long droppedMovement, long droppedActions,
+            long unjudgedReleases
+    ) {
     }
 
     private final User user;
@@ -60,7 +72,10 @@ final class TickHold {
     private boolean droppingMovement;
     // - The movement of the client's packets through this one never reaches the server: they belong to ticks that -
     // - are set back -
-    private long droppedThrough;
+    private long droppedMovementThrough;
+    // - The attacks and interactions of the client's packets through this one never reach the server: they belong -
+    // - to ticks whose actions failed a check -
+    private long droppedActionsThrough;
     // - Written on the event loop only; volatile for the server thread and /clauac status -
     private volatile long oldestHeldNanos;
     private volatile int heldNow;
@@ -68,6 +83,7 @@ final class TickHold {
     private volatile long holdNanos;
     private volatile long longestHoldNanos;
     private volatile long droppedMovement;
+    private volatile long droppedActions;
     private volatile long unjudgedReleases;
 
     // - Off until the connection turns out to be simulated from its start (see enable) -
@@ -103,7 +119,7 @@ final class TickHold {
             this.releaseUnjudged();
             return;
         }
-        if (this.held.isEmpty() && !MOVEMENT.contains(type)) {
+        if (this.held.isEmpty() && !JUDGED.contains(type)) {
             return;
         }
         byte[] packet = ByteBufHelper.copyBytes(buffer);
@@ -138,7 +154,13 @@ final class TickHold {
     // - The movement of a tick that is set back, through its end packet (TickEnd.serverboundPackets), does not reach -
     // - the server either, even when a setback ends before its packets go on -
     void dropMovementThrough(long through) {
-        this.droppedThrough = Math.max(this.droppedThrough, through);
+        this.droppedMovementThrough = Math.max(this.droppedMovementThrough, through);
+    }
+
+    // - The attacks and interactions of a tick whose actions failed a check, through its end packet -
+    // - (TickEnd.serverboundPackets), do not reach the server. Asked before the tick is judged -
+    void dropActionsThrough(long through) {
+        this.droppedActionsThrough = Math.max(this.droppedActionsThrough, through);
     }
 
     // - Runs the action once everything held now went on: right away when nothing is held -
@@ -180,15 +202,15 @@ final class TickHold {
 
     Statistics statistics() {
         return new Statistics(this.heldNow, this.oldestHeldNanos, this.releasedPackets, this.holdNanos, this.longestHoldNanos,
-                this.droppedMovement, this.unjudgedReleases);
+                this.droppedMovement, this.droppedActions, this.unjudgedReleases);
     }
 
     // - The packets at the head go on as far as the verdicts allow: everything through the last judged tick, and -
-    // - after it whatever is no movement, up to the next movement packet -
+    // - after it whatever no verdict can throw away, up to the next packet one can -
     private void releaseJudged(long now) {
         Held head;
         while ((head = this.held.peekFirst()) != null
-                && (head.sequence() <= this.judgedThrough || head.type() == null || !MOVEMENT.contains(head.type()))) {
+                && (head.sequence() <= this.judgedThrough || head.type() == null || !JUDGED.contains(head.type()))) {
             this.release(this.held.removeFirst(), now);
         }
         this.updateOldest();
@@ -225,13 +247,23 @@ final class TickHold {
         this.releasedPackets++;
         this.holdNanos += heldFor;
         this.longestHoldNanos = Math.max(this.longestHoldNanos, heldFor);
-        if ((this.droppingMovement || entry.sequence() <= this.droppedThrough) && MOVEMENT.contains(entry.type())) {
+        if ((this.droppingMovement || entry.sequence() <= this.droppedMovementThrough) && MOVEMENT.contains(entry.type())) {
             this.droppedMovement++;
+            return;
+        }
+        if (entry.sequence() <= this.droppedActionsThrough && ACTIONS.contains(entry.type())) {
+            this.droppedActions++;
             return;
         }
         Object buffer = ChannelHelper.pooledByteBuf(this.user.getChannel());
         ByteBufHelper.writeBytes(buffer, packet);
         this.user.receivePacketSilently(buffer);
+    }
+
+    private static Set<PacketTypeCommon> union(Set<PacketTypeCommon> first, Set<PacketTypeCommon> second) {
+        Set<PacketTypeCommon> union = new HashSet<>(first);
+        union.addAll(second);
+        return Set.copyOf(union);
     }
 
     private void updateOldest() {
