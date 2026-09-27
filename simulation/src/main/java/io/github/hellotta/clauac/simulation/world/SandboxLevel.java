@@ -1,5 +1,6 @@
 package io.github.hellotta.clauac.simulation.world;
 
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -8,6 +9,7 @@ import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.SectionPos;
 import net.minecraft.core.particles.ExplosionParticleInfo;
 import net.minecraft.core.particles.ParticleOptions;
 import net.minecraft.core.registries.Registries;
@@ -44,6 +46,7 @@ import net.minecraft.world.level.entity.LevelCallback;
 import net.minecraft.world.level.entity.LevelEntityGetter;
 import net.minecraft.world.level.entity.TransientEntitySectionManager;
 import net.minecraft.world.level.gameevent.GameEvent;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.saveddata.maps.MapId;
 import net.minecraft.world.level.saveddata.maps.MapItemSavedData;
@@ -61,6 +64,21 @@ import org.jspecify.annotations.Nullable;
 // - simulated player. What the client renders, plays or shows (particles, sounds, block breaking progress, tints, -
 // - sky) has no effect here -
 public final class SandboxLevel extends Level {
+
+    // - The client catches its sky light up with its blocks only once a frame (Minecraft.renderFrame calls -
+    // - ClientLevel.update, which runs the light engine's updates), and a frame comes at least every ten client ticks -
+    // - (Minecraft.runTick runs at most ten before it renders). The light data of a chunk and the server's updates of -
+    // - it wait in a queue, of which each frame runs a tenth, at least ten, and from 1000 on all -
+    // - (ClientLevel.pollLightUpdates). Until then the client's sky light may show a column as it was before its blocks -
+    // - changed, or a chunk that has just come without light. SKY_LIGHT_SETTLE_TICKS is how long that takes at most -
+    // - after the change or the chunk: the frames a queue just short of 1000 takes, ten ticks each. The server lights -
+    // - a change within its next ticks, so its update reaches the client well within that time -
+    private static final int MAX_TICKS_PER_FRAME = 10;
+    private static final int LIGHT_QUEUE_RUN_AT_ONCE = 1000;
+    private static final int LIGHT_QUEUE_LEAST_PER_FRAME = 10;
+    private static final int LIGHT_QUEUE_SHARE_PER_FRAME = 10;
+    public static final long SKY_LIGHT_SETTLE_TICKS = (long) framesToRunLightQueue(LIGHT_QUEUE_RUN_AT_ONCE - 1) * MAX_TICKS_PER_FRAME;
+    private static final long NEVER = Long.MIN_VALUE;
 
     private final EntityTickList tickingEntities = new EntityTickList();
     private final TransientEntitySectionManager<Entity> entityStorage = new TransientEntitySectionManager<>(Entity.class, new EntityCallbacks());
@@ -82,6 +100,12 @@ public final class SandboxLevel extends Level {
     private @Nullable Player localPlayer;
     // - Ticks the local player at its place among the entities instead of tickNonPassenger (see setLocalPlayerTick) -
     private @Nullable Consumer<Entity> localPlayerTick;
+    // - Client ticks this level ran (see tick), the clock of the two maps below: when each chunk the client has -
+    // - arrived, by ChunkPos.pack, and when the lowest sky light source of each column last moved, by columnKey. -
+    // - Entries older than SKY_LIGHT_SETTLE_TICKS no longer matter and are dropped every SKY_LIGHT_SETTLE_TICKS -
+    private long ticks;
+    private final Long2LongOpenHashMap chunkArrivals = new Long2LongOpenHashMap();
+    private final Long2LongOpenHashMap skyLightSourceMoves = new Long2LongOpenHashMap();
 
     // - clockManager and scoreboard belong to the connection and outlive levels, like on the client -
     public SandboxLevel(
@@ -111,6 +135,17 @@ public final class SandboxLevel extends Level {
         this.serverSimulationDistance = serverSimulationDistance;
         // - The client adds two sky flash layers on top of the default ones; they only change sky colors -
         this.environmentAttributes = EnvironmentAttributeSystem.builder().addDefaultLayers(this).build();
+        this.chunkArrivals.defaultReturnValue(NEVER);
+        this.skyLightSourceMoves.defaultReturnValue(NEVER);
+    }
+
+    // - The frames ClientLevel.pollLightUpdates takes to run a queue of this many light updates -
+    private static int framesToRunLightQueue(int queued) {
+        int frames = 0;
+        for (int left = queued; left > 0; left -= left < LIGHT_QUEUE_RUN_AT_ONCE ? Math.max(LIGHT_QUEUE_LEAST_PER_FRAME, left / LIGHT_QUEUE_SHARE_PER_FRAME) : left) {
+            frames++;
+        }
+        return frames;
     }
 
     // - The player whose movement is simulated; the client's equivalent is Minecraft.player -
@@ -126,6 +161,11 @@ public final class SandboxLevel extends Level {
 
     // - ClientLevel.tick without the renderer's sky, particle and sound handling -
     public void tick() {
+        this.ticks++;
+        if (this.ticks % SKY_LIGHT_SETTLE_TICKS == 0L) {
+            this.chunkArrivals.values().removeIf((long arrival) -> !this.settling(arrival));
+            this.skyLightSourceMoves.values().removeIf((long move) -> !this.settling(move));
+        }
         if (this.tickRateManager().runsNormally()) {
             this.getWorldBorder().tick();
             this.tickTime();
@@ -207,6 +247,7 @@ public final class SandboxLevel extends Level {
 
     public void onChunkLoaded(ChunkPos pos) {
         this.entityStorage.startTicking(pos);
+        this.chunkArrivals.put(pos.pack(), this.ticks);
     }
 
     // - Deprecated in vanilla, but the client still overrides it: every chunk counts as present, which for example -
@@ -252,10 +293,14 @@ public final class SandboxLevel extends Level {
         this.blockPredictions.endPredictionsUpTo(sequence, this);
     }
 
-    // - The server's block changes wait while the client predicts something else at the same position -
+    // - The server's block changes wait while the client predicts something else at the same position. Like -
+    // - ClientLevel's, they bypass the prediction bookkeeping of setBlock -
     public void setServerVerifiedBlockState(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlag) {
         if (!this.blockPredictions.updateKnownServerState(pos, blockState)) {
-            super.setBlock(pos, blockState, updateFlag, 512);
+            int sourceBefore = this.lowestSkyLightSource(pos);
+            if (super.setBlock(pos, blockState, updateFlag, 512)) {
+                this.noteSkyLightSourceMove(pos, sourceBefore);
+            }
         }
     }
 
@@ -271,8 +316,26 @@ public final class SandboxLevel extends Level {
         }
     }
 
+    // - Every block change of the level but the server's (see setServerVerifiedBlockState) goes through here -
     @Override
     public boolean setBlock(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlags, int updateLimit) {
+        int sourceBefore = this.lowestSkyLightSource(pos);
+        boolean success = this.setBlockAndRetainPrediction(pos, blockState, updateFlags, updateLimit);
+        if (success) {
+            this.noteSkyLightSourceMove(pos, sourceBefore);
+        }
+        return success;
+    }
+
+    // - A block change that moved its column's lowest sky light source (LevelChunk.setBlockState) is noted for -
+    // - skyLightMayLag -
+    private void noteSkyLightSourceMove(BlockPos pos, int sourceBefore) {
+        if (this.lowestSkyLightSource(pos) != sourceBefore) {
+            this.skyLightSourceMoves.put(columnKey(pos), this.ticks);
+        }
+    }
+
+    private boolean setBlockAndRetainPrediction(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlags, int updateLimit) {
         if (this.blockPredictions.isPredicting()) {
             BlockState oldState = this.getBlockState(pos);
             boolean success = super.setBlock(pos, blockState, updateFlags, updateLimit);
@@ -430,6 +493,47 @@ public final class SandboxLevel extends Level {
     @Override
     public int getSeaLevel() {
         return this.seaLevel;
+    }
+
+    // - BlockAndLightGetter.canSeeSky asks whether the sky light at the position is full (15), which decides whether -
+    // - rain falls there (Level.precipitationAt) and so whether a riptide trident works out of water. The sandbox keeps -
+    // - no light (see SandboxChunkSource), but the client's sky light engine gives 15 exactly to the positions at or -
+    // - above their column's lowest sky light source (SkyLightEngine.checkNode), which the chunk keeps up to date with -
+    // - its blocks (LevelChunk.setBlockState, ChunkSkyLightSources.update). A dimension without sky light has none -
+    // - anywhere, and a chunk the client does not have has no light -
+    @Override
+    public boolean canSeeSky(BlockPos pos) {
+        return this.dimensionType().hasSkyLight() && pos.getY() >= this.lowestSkyLightSource(pos);
+    }
+
+    // - The lowest y of the column that the sky lights fully, from the chunk's sky light sources; above every y where -
+    // - the client has no chunk -
+    private int lowestSkyLightSource(BlockPos pos) {
+        LevelChunk chunk = this.chunkSource.getChunkNow(SectionPos.blockToSectionCoord(pos.getX()), SectionPos.blockToSectionCoord(pos.getZ()));
+        return chunk != null
+                ? chunk.getSkyLightSources().getLowestSourceY(SectionPos.sectionRelative(pos.getX()), SectionPos.sectionRelative(pos.getZ()))
+                : Integer.MAX_VALUE;
+    }
+
+    // - Whether the client's sky light at this column may not show what canSeeSky finds yet: its chunk arrived, or -
+    // - its lowest sky light source moved, within SKY_LIGHT_SETTLE_TICKS -
+    public boolean skyLightMayLag(BlockPos pos) {
+        return this.settling(this.chunkArrivals.get(ChunkPos.pack(pos))) || this.settling(this.skyLightSourceMoves.get(columnKey(pos)));
+    }
+
+    private boolean settling(long since) {
+        return since != NEVER && this.ticks - since <= SKY_LIGHT_SETTLE_TICKS;
+    }
+
+    // - Level.precipitationAt without its sky light: whether rain falls at the position if the sky lights it fully -
+    public boolean rainsIfSkyLit(BlockPos pos) {
+        return this.isRaining()
+                && this.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, pos).getY() <= pos.getY()
+                && this.getBiome(pos).value().getPrecipitationAt(pos, this.getSeaLevel()) == Biome.Precipitation.RAIN;
+    }
+
+    private static long columnKey(BlockPos pos) {
+        return BlockPos.asLong(pos.getX(), 0, pos.getZ());
     }
 
     @Override

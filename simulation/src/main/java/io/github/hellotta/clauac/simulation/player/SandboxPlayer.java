@@ -65,6 +65,9 @@ public final class SandboxPlayer extends Player {
     private boolean handsBusy;
     private boolean flashOnSetHealth;
     private boolean startedUsingItem;
+    // - The answer isInWaterOrRain gives while an alternative tries the other outcome of rain that the client's -
+    // - lagging sky light may have given (see withWaterOrRain); null otherwise -
+    private @Nullable Boolean forcedWaterOrRain;
     // - LocalPlayer's charge of the jump of a vehicle that can jump (horses, camels) -
     private int jumpRidingTicks;
     private float jumpRidingScale;
@@ -762,6 +765,32 @@ public final class SandboxPlayer extends Player {
     public void stopUsingItem() {
         super.stopUsingItem();
         this.startedUsingItem = false;
+    }
+
+    // - startUsingItem for a use the client began this many ticks ago: LivingEntity.updatingUsingItem has counted its -
+    // - remaining ticks down once a tick since -
+    public void startUsingItemSince(InteractionHand hand, int ticksUsed) {
+        this.startUsingItem(hand);
+        if (this.isUsingItem()) {
+            this.useItemRemaining -= ticksUsed;
+        }
+    }
+
+    @Override
+    public boolean isInWaterOrRain() {
+        Boolean forced = this.forcedWaterOrRain;
+        return forced != null ? forced : super.isInWaterOrRain();
+    }
+
+    // - Runs the action with isInWaterOrRain giving this answer -
+    public void withWaterOrRain(boolean wet, Runnable action) {
+        Boolean previous = this.forcedWaterOrRain;
+        this.forcedWaterOrRain = wet;
+        try {
+            action.run();
+        } finally {
+            this.forcedWaterOrRain = previous;
+        }
     }
 
     @Override

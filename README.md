@@ -261,11 +261,23 @@ of them runs from the saved state, and the first that matches what the client re
   again with the other strength.
 - An attack on an entity the sandbox does not know, which no vanilla client makes, may have slowed the player down or
   not, depending on the entity.
+- A riptide trident begins its use and throws its user only in water or rain (`TridentItem.use`, `releaseUsing`), and
+  whether rain falls on the player depends on the sky light at its feet and at the top of its box
+  (`Level.precipitationAt`, `Entity.isInRain`). The sandbox keeps no light, but the client's sky light is full
+  exactly at and above each column's lowest sky light source (`SkyLightEngine`), which the chunks keep up to date with
+  their blocks, so the sandbox answers from those (`SandboxLevel.canSeeSky`). The client, though, catches its light up
+  with its blocks only once a frame (`ClientLevel.update`), and at least every ten ticks, and a chunk's light data and
+  the server's light updates through a queue that each frame runs a tenth of (`ClientLevel.pollLightUpdates`): for up
+  to 330 ticks after a column's lowest source moved or its chunk arrived, the client may still see the column as it
+  was. Where a riptide trident's start depends on rain in such a column, the client's use may not have begun where the
+  sandbox's did, or the other way round; every tick of the use tries the other state until a tick matches only with
+  it, or the client's next item use, release or hotbar switch shows its state. Where the release depends on it, the
+  release with the other outcome of rain is tried.
 
 What cannot be tried that way leaves the tick `UNVERIFIED` instead of `MISMATCHED`:
 
 - The alternatives above while the player rides, while blocks move next to it (a piston, a shulker box), which move
-  it only after its tick, and in a tick whose actions after the attack changed the player.
+  it only after its tick, and in a tick whose actions after the attack or the trident's release changed the player.
 - The client's velocity is never reported. After a difference the sandbox estimates it from the reported movement;
   the rounding of that estimate can move later positions by a few units in the last place, and after an `UNVERIFIED`
   tick, a difference that keeps shrinking in the ticks right after it stays `UNVERIFIED`.
@@ -331,6 +343,32 @@ sprinting over soul sand and soul soil, swift sneak, frost walker over water and
 The client works out powder snow from the boots it wears; everything else here comes from the server, which the
 sandbox applied at the same point as the client: the attributes (the equipment's modifiers, the enchantments' effects
 and the frost), the ice frost walker makes and the push of the lunge.
+
+Climbing, blocks that slow the player and ice matched too: climbing a ladder and over the wall it hangs on,
+stopping on it by sneaking and sliding down, jumping onto it and climbing with jump held, climbing vines and sliding
+down them, climbing a scaffolding tower with jump held, jumping on its top and sneaking down through it, walking
+through scaffolding on the floor, crawling through a tunnel one block high after the server closed a trapdoor above
+the player's head, walking through sweet berry bushes, walking and jumping through a cobweb and falling into one,
+sprinting over packed and blue ice and sliding on into a wall, sprint jumping on blue ice, and turning on packed ice.
+
+So did fluids and the world around the player: rising in a bubble column over soul sand and out of its top, sinking
+in one over magma and swimming against it, standing in, walking against and with flowing water, walking into a lava
+pool and swimming out of it, walking through flowing lava, a riptide trident launching the player from water and in
+the rain, ender pearls thrown standing and walking, walking and sprint jumping into the world border, whose collision
+the client rounds out to whole blocks (`WorldBorder.getCollisionShape`), and a world border shrinking past a player
+that walked into it. The riptide trident in the rain first failed: the sandbox, keeping no light, never saw rain on
+the player, while the client launched. It now answers from the chunks' sky light sources (see "What the simulation
+cannot know"). With a roof above a walking player taken away in the rain while it held the use button, the client's
+use began a frame after the sandbox's in one of three runs, and the alternative of its use not having begun matched.
+
+A round trip through a nether portal matched, with the player walking out of the portal it arrived in and back; the
+ticks while the client loaded the terrain after each change of dimension are `NOT_SIMULATED`, as the client does not
+tick its player then. With the client's auto-jump option on, the player walked onto a single block, up a staircase of
+three steps and against a wall two blocks high without jumping at it, jumped onto a block while sprinting, and not
+while sneaking: the client decides an auto-jump on its own (`LocalPlayer.updateAutoJump`) and reports only the jump
+in its input. Levitation and slow falling are part of the fourth test course, over a connection with latency. With
+these four courses added, the thirteen test courses matched in all of their 19 727 simulated ticks; the other 67 were
+the loading of the terrain after the portal's changes of dimension.
 
 Menu clicks matched the client's hashes in chests, the player's inventory (crafting included), furnaces, stonecutters,
 anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.

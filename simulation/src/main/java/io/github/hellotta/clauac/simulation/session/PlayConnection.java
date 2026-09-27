@@ -147,7 +147,9 @@ import net.minecraft.world.entity.vehicle.minecart.Minecart;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.TridentItem;
 import net.minecraft.world.item.component.AttackRange;
+import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
@@ -273,6 +275,15 @@ final class PlayConnection implements ClientContext {
     // - The items the player used during the tick while a boat turns it, whose yaw only the tick decides on (see -
     // - checkUseItem and checkRiderUses) -
     private final List<RiderUse> riderUses = new ArrayList<>();
+    // - A riptide trident use whose start depended on rain the client's sky light may not have shown yet (see -
+    // - rainDependsOnLaggingSkyLight): the client's use may have begun where the sandbox's did not, or the other way -
+    // - round. Every tick tries the other state (see otherTridentUse) until a tick matches only with it, the client's -
+    // - next use or release of an item shows its state, or the hand no longer holds the trident -
+    private @Nullable UncertainTridentUse uncertainTridentUse;
+    // - The alternative of the uncertain trident use that the current tick offers -
+    private @Nullable TickAlternative tridentUseAlternative;
+    // - The client tick being simulated -
+    private long currentClientTick;
     private int ticksSinceVelocityEstimate = VELOCITY_ESTIMATE_TICKS;
     // - The difference and the outcome of the tick whose resync estimated the velocity last -
     private double estimatedAfterOffset;
@@ -531,6 +542,7 @@ final class PlayConnection implements ClientContext {
             loginPlayer = this.createPlayer(newLevel, Input.EMPTY, false);
             loginPlayer.setYRot(-180.0F);
             this.player = loginPlayer;
+            this.uncertainTridentUse = null;
         }
 
         this.clientLoaded = false;
@@ -575,6 +587,7 @@ final class PlayConnection implements ClientContext {
         this.clientLoaded = false;
         newPlayer.setId(oldPlayer.getId());
         this.player = newPlayer;
+        this.uncertainTridentUse = null;
         this.cameraEntity = newPlayer;
         if (keepEntityData) {
             List<SynchedEntityData.DataValue<?>> data = oldPlayer.getEntityData().getNonDefaultValues();
@@ -997,6 +1010,8 @@ final class PlayConnection implements ClientContext {
         if (tickLevel == null || tickPlayer == null) {
             throw new IllegalStateException("the client ended a tick before it joined a level, which a vanilla client never does");
         }
+        this.currentClientTick = clientTick;
+        this.tridentUseAlternative = null;
         this.releaseHeldReport(tickPlayer, reports);
         tickLevel.tickRateManager().tick();
         // - The rotation of the whole tick, which the client's key and mouse actions already used. A riding player -
@@ -1053,6 +1068,10 @@ final class PlayConnection implements ClientContext {
                         heldStoppedItem = alternative.stoppedItem();
                     }
                 }
+                // - The tick matched only with the other state of the uncertain trident use, which the sandbox now has -
+                if (this.tridentUseAlternative != null && matched.combination().contains(this.tridentUseAlternative)) {
+                    this.uncertainTridentUse = null;
+                }
             } else if (report.outcome() == TickOutcome.MISMATCHED && this.tickPackets.rejections.isEmpty()) {
                 heldUsedItem = usedMainHandItem;
             }
@@ -1076,6 +1095,16 @@ final class PlayConnection implements ClientContext {
     // - after this point, so the tick is not judged here then; neither is it once snapshots failed on this connection -
     private void tickLocalPlayer(SandboxLevel level, SandboxPlayer player) {
         List<TickAlternative> alternatives = this.tickPackets.alternatives;
+        UncertainTridentUse uncertainUse = this.uncertainTridentUse;
+        if (uncertainUse != null) {
+            if (ItemStack.isSameItem(player.getItemInHand(uncertainUse.hand()), uncertainUse.trident())) {
+                this.tridentUseAlternative = this.otherTridentUse(uncertainUse, player);
+                alternatives.add(this.tridentUseAlternative);
+            } else {
+                // - The hand holds another item now, which ends the use on both sides (LivingEntity.updatingUsingItem) -
+                this.uncertainTridentUse = null;
+            }
+        }
         if (player.isUsingItem() && player.getUsedItemHand() == InteractionHand.MAIN_HAND) {
             alternatives.add(stoppedItemUse(player));
         }
@@ -1637,6 +1666,11 @@ final class PlayConnection implements ClientContext {
     private record RiderUse(CheckedAction action, float yRot, float xRot, AbstractBoat boat) {
     }
 
+    // - A trident use the sandbox is unsure of (see uncertainTridentUse): the hand, the trident, and the client tick in -
+    // - whose key handling the use began or failed to -
+    private record UncertainTridentUse(InteractionHand hand, ItemStack trident, long startTick) {
+    }
+
     // - Replays Minecraft.handleKeybinds and MultiPlayerGameMode.tick for this tick from the packets they sent. An -
     // - action the sandbox's vanilla code cannot perform is rejected, and the others go on. The hotbar keys come -
     // - first in the key handling and nothing else in a tick changes the selected slot, so every action of the key -
@@ -1667,7 +1701,10 @@ final class PlayConnection implements ClientContext {
                 ? player.raycastHitResult(TICK_PARTIAL_TICK, camera, switchedTo)
                 : null;
         double pickReach = switchedItemHeldOut ? Math.max(pickReach(player, activeItem), pickReach(player, switchedTo)) : pickReach(player, activeItem);
-        KeyHandlingStart start = new KeyHandlingStart(player.isUsingItem() && !useMayHaveStopped, useMayHaveStopped, player.isHandsBusy(), camera,
+        // - While the sandbox is unsure whether the client's trident use began, the client may use no item where the -
+        // - sandbox's player uses the trident -
+        boolean useUncertain = useMayHaveStopped || this.uncertainTridentUse != null && player.isUsingItem();
+        KeyHandlingStart start = new KeyHandlingStart(player.isUsingItem() && !useUncertain, useUncertain, player.isHandsBusy(), camera,
                 player.raycastHitResult(TICK_PARTIAL_TICK, camera), crosshairWithSwitchedItem, pickReach);
         int keyHandlingReport = keyHandlingReport(actions);
         int firstKeyHandlingAction = actions.getFirst() instanceof ServerboundSetCarriedItemPacket ? 1 : 0;
@@ -1711,7 +1748,7 @@ final class PlayConnection implements ClientContext {
             case ServerboundPlayerActionPacket playerAction -> {
                 this.checkPlayerAction(level, player, playerAction, packet, keyHandlingSlotKnown, start);
                 Packet<?> next = index + 1 < actions.size() ? actions.get(index + 1) : null;
-                return this.performPlayerAction(playerAction, next, keyHandlingSlotKnown, level, player) || swingAccompanied;
+                return this.performPlayerAction(playerAction, next, keyHandlingSlotKnown, this.onlySwingsFollow(index), level, player) || swingAccompanied;
             }
             case ServerboundUseItemOnPacket useItemOn -> {
                 this.checkUseItemOn(level, player, useItemOn, packet, start);
@@ -1723,7 +1760,7 @@ final class PlayConnection implements ClientContext {
                 // - The rotation the packet carries is the player's own, which the tick's movement reported (see -
                 // - checkUseItem); the player keeps that one -
                 this.checkUseItem(level, player, useItem, packet, start);
-                this.gameMode.useItem(level, player, useItem.hand(), useItem.sequence(), this.tickPackets);
+                this.useItem(level, player, useItem);
             }
             case ServerboundAttackPacket attack -> {
                 Entity target = level.getEntity(attack.entityId());
@@ -2334,6 +2371,110 @@ final class PlayConnection implements ClientContext {
         return true;
     }
 
+    // - MultiPlayerGameMode.useItem. A vanilla client uses an item only while it uses none (Minecraft.handleKeybinds), -
+    // - so a use during a trident use the sandbox is unsure of shows that the client's never began. Where a riptide -
+    // - trident's start depends on rain the client's sky light may not show yet, the sandbox is unsure of the client's -
+    // - use from here on -
+    private void useItem(SandboxLevel level, SandboxPlayer player, ServerboundUseItemPacket useItem) {
+        UncertainTridentUse uncertain = this.uncertainTridentUse;
+        if (uncertain != null) {
+            this.uncertainTridentUse = null;
+            if (player.isUsingItem() && ItemStack.isSameItem(player.getUseItem(), uncertain.trident())) {
+                player.stopUsingItem();
+                this.tickPackets.notes.add("the client's use of " + describeItem(uncertain.trident()) + " had not begun, as its next use of an item shows");
+            }
+        }
+        ItemStack item = player.getItemInHand(useItem.hand());
+        boolean rainUncertain = tridentStartDependsOnLaggingRain(level, player, item);
+        ItemStack trident = item.copy();
+        this.gameMode.useItem(level, player, useItem.hand(), useItem.sequence(), this.tickPackets);
+        if (rainUncertain) {
+            this.uncertainTridentUse = new UncertainTridentUse(useItem.hand(), trident, this.currentClientTick);
+        }
+    }
+
+    // - MultiPlayerGameMode.releaseUsingItem. A vanilla client releases only an item it uses, so a release ends a -
+    // - trident use the sandbox is unsure of: the client's had begun. Where a riptide trident's throw of the player -
+    // - depends on rain the client's sky light may not show yet, the release with the other outcome is the -
+    // - alternative, made again from a snapshot of the player taken before the release. It needs the release to be -
+    // - the last thing of the tick that changes the player -
+    private void releaseUsingItem(SandboxLevel level, SandboxPlayer player, boolean lastChange) {
+        UncertainTridentUse uncertain = this.uncertainTridentUse;
+        if (uncertain != null) {
+            this.uncertainTridentUse = null;
+            if (!player.isUsingItem() && ItemStack.isSameItem(player.getItemInHand(uncertain.hand()), uncertain.trident())) {
+                player.startUsingItemSince(uncertain.hand(), (int) (this.currentClientTick - uncertain.startTick()));
+                this.tickPackets.notes.add("the client's use of " + describeItem(uncertain.trident()) + " had begun, as its release shows");
+            }
+        }
+        if (!tridentReleaseDependsOnLaggingRain(level, player)) {
+            this.gameMode.releaseUsingItem(player);
+            return;
+        }
+        String uncertainty = "whether rain fell on the player as it let go of the riptide trident, which the client's sky light may not have shown yet";
+        StateSnapshot beforeRelease = null;
+        if (lastChange && this.alternativesDisabled == null) {
+            try {
+                beforeRelease = this.captureState(List.of(player, level.getRandom()));
+            } catch (StateSnapshot.SnapshotException problem) {
+                this.disableAlternatives("the player's state before a trident release could not be saved", problem);
+            }
+        }
+        boolean wet = player.isInWaterOrRain();
+        this.gameMode.releaseUsingItem(player);
+        if (beforeRelease == null) {
+            this.tickPackets.uncertainties.add(uncertainty);
+            return;
+        }
+        StateSnapshot savedBeforeRelease = beforeRelease;
+        this.tickPackets.alternatives.add(new TickAlternative(uncertainty, wet ? "the trident's release without rain" : "the trident's release in rain",
+                ItemStack.EMPTY, releasing -> {
+                    this.restoreState(savedBeforeRelease);
+                    releasing.withWaterOrRain(!wet, () -> this.gameMode.releaseUsingItem(releasing));
+                }));
+    }
+
+    // - The other state of an uncertain trident use, as a change right before the player's tick: the client's use not -
+    // - having begun where the sandbox's did, or having begun where the sandbox's did not, with the ticks it has run -
+    // - since (LivingEntity.updatingUsingItem counts once a tick) -
+    private TickAlternative otherTridentUse(UncertainTridentUse uncertain, SandboxPlayer player) {
+        String uncertainty = "whether the client's use of the riptide trident began, which depended on rain its sky light may not have shown yet";
+        if (player.isUsingItem() && ItemStack.isSameItem(player.getUseItem(), uncertain.trident())) {
+            return new TickAlternative(uncertainty, "the trident use not having begun", ItemStack.EMPTY, SandboxPlayer::stopUsingItem);
+        }
+        int ticksUsed = (int) (this.currentClientTick - uncertain.startTick());
+        return new TickAlternative(uncertainty, "the trident use having begun", ItemStack.EMPTY,
+                using -> using.startUsingItemSince(uncertain.hand(), ticksUsed));
+    }
+
+    // - Whether TridentItem.use decides on rain the client's sky light may not show yet: a trident off cooldown (which -
+    // - MultiPlayerGameMode.useItem asks first) that is not about to break and throws its user begins only where water -
+    // - or rain wets the player -
+    private static boolean tridentStartDependsOnLaggingRain(SandboxLevel level, SandboxPlayer player, ItemStack item) {
+        return item.getItem() instanceof TridentItem && !player.getCooldowns().isOnCooldown(item) && !item.nextDamageWillBreak()
+                && EnchantmentHelper.getTridentSpinAttackStrength(item, player) > 0.0F && rainDependsOnLaggingSkyLight(level, player);
+    }
+
+    // - Whether TridentItem.releaseUsing does: a trident used long enough to throw, that throws its user, who rides -
+    // - nothing, and that is not about to break -
+    private static boolean tridentReleaseDependsOnLaggingRain(SandboxLevel level, SandboxPlayer player) {
+        ItemStack item = player.getUseItem();
+        return player.isUsingItem() && item.getItem() instanceof TridentItem && player.getTicksUsingItem() >= TridentItem.THROW_THRESHOLD_TIME
+                && EnchantmentHelper.getTridentSpinAttackStrength(item, player) > 0.0F && !player.isPassenger() && !item.nextDamageWillBreak()
+                && rainDependsOnLaggingSkyLight(level, player);
+    }
+
+    // - Whether rain on the player (Entity.isInRain: at its feet or at the top of its box, one column) depends on sky -
+    // - light the client may not have caught up with (see SandboxLevel.skyLightMayLag); water wets it regardless -
+    private static boolean rainDependsOnLaggingSkyLight(SandboxLevel level, SandboxPlayer player) {
+        if (player.isInWater()) {
+            return false;
+        }
+        BlockPos feet = player.blockPosition();
+        BlockPos top = BlockPos.containing(feet.getX(), player.getBoundingBox().maxY, feet.getZ());
+        return level.skyLightMayLag(feet) && (level.rainsIfSkyLit(feet) || level.rainsIfSkyLit(top));
+    }
+
     // - MultiPlayerGameMode.attack on an entity the sandbox knows. The client's player may have held its main hand -
     // - item one tick longer (see SandboxPlayer.considerEarlierHotbarSwitch); with the attack strength that left, the -
     // - attack may have slowed the player down where the sandbox's did not, or the other way round. That attack is -
@@ -2399,9 +2540,11 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - Returns whether the action belongs to a swing, which then needs no further interpretation -
+    // - Returns whether the action belongs to a swing, which then needs no further interpretation. lastChange tells -
+    // - whether only swings follow it in the tick (see onlySwingsFollow) -
     private boolean performPlayerAction(
-            ServerboundPlayerActionPacket action, @Nullable Packet<?> next, boolean keyHandlingSlotKnown, SandboxLevel level, SandboxPlayer player
+            ServerboundPlayerActionPacket action, @Nullable Packet<?> next, boolean keyHandlingSlotKnown, boolean lastChange, SandboxLevel level,
+            SandboxPlayer player
     ) {
         switch (action.getAction()) {
             case START_DESTROY_BLOCK -> {
@@ -2432,7 +2575,7 @@ final class PlayConnection implements ClientContext {
                 return false;
             }
             case RELEASE_USE_ITEM -> {
-                this.gameMode.releaseUsingItem(player);
+                this.releaseUsingItem(level, player, lastChange);
                 return false;
             }
             case STAB -> {
