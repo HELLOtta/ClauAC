@@ -287,7 +287,6 @@ Known limits:
   Paper disconnects a client that sends more than 500 packets per second over 7 seconds (`packet-limiter` in
   `paper-global.yml`); the packets a connection stall of 25 seconds held back went over that once they arrived,
   where without the pongs they would have stayed far below it.
-- Not verified yet: equipment effects such as leather boots on powder snow.
 
 ### Verified so far
 
@@ -310,6 +309,17 @@ pulling it down again, a honey block carrying it, a slime block launching it up 
 powered in pulses from one tick up while the player walked backwards into them, and a piston and a slime block
 pushing a boat the player rode. Paper's own movement check logged some of these as `moved wrongly` and teleported the
 player back to where the server's pistons had put it; the sandbox followed those teleports as the client did.
+
+Equipment effects matched as well. Without boots, the player sank into powder snow, moved and jumped slowly in it,
+and the frost slowed it down until it wore off. With leather boots it walked over powder snow, sneaked down through
+it, climbed out of it, and landed on it from a fall: a falling player is caught 0.9 blocks up and then sinks, with the
+boots down onto the next block and without them to the bottom. Boots put on from the hand at the bottom of the snow
+let the player climb out, and boots the server took away while the player stood on the snow let it sink in. Depth
+strider on a pool's bottom and while swimming up, with the boots taken away mid-walk, soul speed walking, jumping and
+sprinting over soul sand and soul soil, swift sneak, frost walker over water and the lunge of a spear matched too.
+The client works out powder snow from the boots it wears; everything else here comes from the server, which the
+sandbox applied at the same point as the client: the attributes (the equipment's modifiers, the enchantments' effects
+and the frost), the ice frost walker makes and the push of the lunge.
 
 Menu clicks matched the client's hashes in chests, the player's inventory (crafting included), furnaces, stonecutters,
 anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.
