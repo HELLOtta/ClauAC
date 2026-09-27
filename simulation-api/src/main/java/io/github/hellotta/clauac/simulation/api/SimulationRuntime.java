@@ -7,6 +7,9 @@ public interface SimulationRuntime extends AutoCloseable {
     // - Minecraft version of the vanilla code running the simulation -
     String minecraftVersion();
 
+    // - How many threads simulate the connections, all of them together -
+    int simulationThreads();
+
     // - Whether a packet with this network id must be forwarded; ids are the vanilla protocol's own ids -
     boolean isRelevant(ProtocolPhase phase, PacketDirection direction, int packetId);
 

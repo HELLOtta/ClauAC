@@ -205,6 +205,8 @@ final class PlayConnection implements ClientContext {
     private final HashedPatchMap.HashGenerator hashGenerator;
     private final Runnable inventoryResyncRequest;
     private final ProblemLog problemLog;
+    // - Counts what the snapshots of the player's state cost (see captureState and restoreState) -
+    private final SimulationCost cost;
     private final SandboxClockManager clockManager = new SandboxClockManager();
     private final Scoreboard scoreboard = new Scoreboard();
     private final Map<UUID, SandboxPlayerInfo> playerInfoMap = new HashMap<>();
@@ -247,13 +249,15 @@ final class PlayConnection implements ClientContext {
     private final LastSentState lastSent = new LastSentState();
 
     PlayConnection(
-            GameProfile localGameProfile, ReceivedRegistries registries, FeatureFlagSet enabledFeatures, Runnable inventoryResyncRequest, ProblemLog problemLog
+            GameProfile localGameProfile, ReceivedRegistries registries, FeatureFlagSet enabledFeatures, Runnable inventoryResyncRequest, ProblemLog problemLog,
+            SimulationCost cost
     ) {
         this.localGameProfile = localGameProfile;
         this.registries = registries;
         this.enabledFeatures = enabledFeatures;
         this.inventoryResyncRequest = inventoryResyncRequest;
         this.problemLog = problemLog;
+        this.cost = cost;
         RegistryOps<HashCode> hashOps = registries.access().createSerializationContext(HashOps.CRC32C_INSTANCE);
         this.hashGenerator = component -> component.encodeValue(hashOps)
                 .getOrThrow(message -> new IllegalArgumentException("Failed to hash " + component + ": " + message))
@@ -874,6 +878,12 @@ final class PlayConnection implements ClientContext {
             }
         } catch (RuntimeException problem) {
             this.problemLog.log("failed to simulate client tick " + clientTick, problem);
+            // - A report held back from the previous tick that this tick failed before deciding on still goes first, -
+            // - so that the reports stay in the order of the client's ticks -
+            ClientTickReport held = this.takeHeldReport("the next tick, which had to report the hotbar switch this tick assumed, could not be simulated");
+            if (held != null) {
+                reports.add(held);
+            }
             reports.add(this.failedTick(clientTick, problem));
         }
         // - ClientLevel.tick, after the player sent its movement; a failure here shows in the next tick -
@@ -1023,14 +1033,14 @@ final class PlayConnection implements ClientContext {
                     this.alternativeResult = new AlternativeResult.SimulatedMatched();
                 }
                 if (VERIFY_REPEATED_TICKS) {
-                    String difference = this.repeatTick(level, player, start, StateSnapshot.capture(start.roots()));
+                    String difference = this.repeatTick(level, player, start, this.captureState(start.roots()));
                     if (difference != null) {
                         this.disableAlternatives("a repeated tick came out differently", new StateSnapshot.SnapshotException(difference));
                     }
                 }
                 return;
             }
-            StateSnapshot simulatedEnd = StateSnapshot.capture(start.roots());
+            StateSnapshot simulatedEnd = this.captureState(start.roots());
             for (List<TickAlternative> combination : combinationsOf(alternatives)) {
                 this.restoreTickStart(start, player);
                 for (TickAlternative alternative : combination) {
@@ -1060,7 +1070,7 @@ final class PlayConnection implements ClientContext {
     private @Nullable String repeatTick(SandboxLevel level, SandboxPlayer player, TickStart start, StateSnapshot firstEnd) throws StateSnapshot.SnapshotException {
         this.restoreTickStart(start, player);
         level.tickNonPassenger(player);
-        return firstEnd.firstDifference(StateSnapshot.capture(start.roots()));
+        return firstEnd.firstDifference(this.captureState(start.roots()));
     }
 
     // - What the player's tick starts from: the player with the level's random, which its tick may draw from, what the -
@@ -1073,12 +1083,26 @@ final class PlayConnection implements ClientContext {
             pushable.add(new EntityMotion(entity, entity.getDeltaMovement(), entity.needsSync));
         }
         ClientTickPackets packets = this.tickPackets;
-        return new TickStart(roots, StateSnapshot.capture(roots), packets.predictedAbilitiesSent, packets.predictedFallFlyingStart,
+        return new TickStart(roots, this.captureState(roots), packets.predictedAbilitiesSent, packets.predictedFallFlyingStart,
                 packets.predictedRidingJump, pushable);
     }
 
+    // - Every snapshot of the player's state is taken and restored through these two, which count what they cost -
+    private StateSnapshot captureState(List<Object> roots) throws StateSnapshot.SnapshotException {
+        long start = System.nanoTime();
+        StateSnapshot snapshot = StateSnapshot.capture(roots);
+        this.cost.snapshotTaken(System.nanoTime() - start, snapshot.objectCount());
+        return snapshot;
+    }
+
+    private void restoreState(StateSnapshot snapshot) throws StateSnapshot.SnapshotException {
+        long start = System.nanoTime();
+        snapshot.restore();
+        this.cost.snapshotRestored(System.nanoTime() - start);
+    }
+
     private void restoreTickStart(TickStart start, SandboxPlayer player) throws StateSnapshot.SnapshotException {
-        start.snapshot().restore();
+        this.restoreState(start.snapshot());
         ClientTickPackets packets = this.tickPackets;
         packets.predictedAbilitiesSent = start.predictedAbilitiesSent();
         packets.predictedFallFlyingStart = start.predictedFallFlyingStart();
@@ -1394,9 +1418,10 @@ final class PlayConnection implements ClientContext {
         return steers == inferred.steers();
     }
 
-    // - The report held back when the play phase or the connection ends, when no further tick can explain it. A -
-    // - hotbar switch the sandbox inferred for its tick was never reported -
-    @Nullable ClientTickReport takeHeldReport() {
+    // - The report held back, taken when no further tick can decide on it: the play phase or the connection ended, -
+    // - or the simulation of the next tick failed first. The hotbar switch the sandbox assumed for its tick was then -
+    // - never checked, for this reason -
+    @Nullable ClientTickReport takeHeldReport(String undecidedReason) {
         ClientTickReport held = this.heldReport;
         InferredHotbarSwitch inferredSwitch = this.heldReportInferredSwitch;
         ItemStack stoppedItem = this.heldReportStoppedItem;
@@ -1406,8 +1431,7 @@ final class PlayConnection implements ClientContext {
         this.heldReportStoppedItem = ItemStack.EMPTY;
         this.heldReportInferredSwitch = null;
         if (held != null && (inferredSwitch != null || !stoppedItem.isEmpty())) {
-            return held.withOutcome(TickOutcome.UNVERIFIED,
-                    "not simulated: the play phase ended before the client reported the hotbar switch this tick assumed");
+            return held.withOutcome(TickOutcome.UNVERIFIED, "not simulated: " + undecidedReason);
         }
         return held;
     }
@@ -1571,7 +1595,7 @@ final class PlayConnection implements ClientContext {
         StateSnapshot beforeAttack = null;
         if (lastChange && player.isSprinting() && player.hasAlternativeAttackStrengths() && this.alternativesDisabled == null) {
             try {
-                beforeAttack = StateSnapshot.capture(List.of(player, level.getRandom()));
+                beforeAttack = this.captureState(List.of(player, level.getRandom()));
             } catch (StateSnapshot.SnapshotException problem) {
                 this.disableAlternatives("the player's state before an attack could not be saved", problem);
             }
@@ -1590,7 +1614,7 @@ final class PlayConnection implements ClientContext {
         int ticker = otherTicker.getAsInt();
         this.tickPackets.alternatives.add(new TickAlternative(uncertainty, "the attack strength a hotbar switch in the previous tick left", ItemStack.EMPTY,
                 attacking -> {
-                    savedBeforeAttack.restore();
+                    this.restoreState(savedBeforeAttack);
                     attacking.useAttackStrengthTicker(ticker);
                     this.gameMode.attack(attacking, target);
                 }));

@@ -176,6 +176,11 @@ final class StateSnapshot {
         return snapshot;
     }
 
+    // - How many objects the snapshot saved -
+    int objectCount() {
+        return this.states.size();
+    }
+
     // - Puts every saved object back: first the fields, arrays and atomic values, then the contents of collections -
     // - and maps, whose hash codes may depend on the objects restored first -
     void restore() throws SnapshotException {

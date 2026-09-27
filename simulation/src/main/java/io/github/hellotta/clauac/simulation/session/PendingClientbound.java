@@ -12,16 +12,28 @@ import org.jspecify.annotations.Nullable;
 // - Clientbound packets the server sent that the client has not provably processed yet, in network order. The -
 // - client processes received packets before each of its ticks, and answers some of them right away (a ping with -
 // - a pong, a teleport with its acceptance). Such an answer proves that the client processed every packet up to -
-// - the answered one, so they are released up to there, and never earlier -
+// - the answered one, so they are released up to there, and never earlier. Only the connection's tasks change it; -
+// - its size and bytes may be read from any thread -
 final class PendingClientbound {
 
     record PendingPacket(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket) {
     }
 
     private final Deque<PendingPacket> packets = new ArrayDeque<>();
+    private volatile int count;
+    private volatile long bytes;
 
     void add(PendingPacket packet) {
         this.packets.addLast(packet);
+        this.count++;
+        this.bytes += packet.encodedPacket().length;
+    }
+
+    private PendingPacket removeFirst() {
+        PendingPacket removed = this.packets.removeFirst();
+        this.count--;
+        this.bytes -= removed.encodedPacket().length;
+        return removed;
     }
 
     boolean isEmpty() {
@@ -60,7 +72,7 @@ final class PendingClientbound {
         List<PendingPacket> released = new ArrayList<>();
         PendingPacket next;
         do {
-            next = this.packets.removeFirst();
+            next = this.removeFirst();
             released.add(next);
         } while (next != answered);
         return released;
@@ -70,16 +82,32 @@ final class PendingClientbound {
     List<PendingPacket> takeLeading(Predicate<PendingPacket> condition) {
         List<PendingPacket> released = new ArrayList<>();
         while (!this.packets.isEmpty() && condition.test(this.packets.peekFirst())) {
-            released.add(this.packets.removeFirst());
+            released.add(this.removeFirst());
+        }
+        return released;
+    }
+
+    // - Removes and returns the oldest packets until no more than these bytes and packets are left -
+    List<PendingPacket> takeOldest(long bytesLeft, int packetsLeft) {
+        List<PendingPacket> released = new ArrayList<>();
+        while (!this.packets.isEmpty() && (this.bytes > bytesLeft || this.count > packetsLeft)) {
+            released.add(this.removeFirst());
         }
         return released;
     }
 
     int size() {
-        return this.packets.size();
+        return this.count;
+    }
+
+    // - The encoded size of the pending packets -
+    long bytes() {
+        return this.bytes;
     }
 
     void clear() {
         this.packets.clear();
+        this.count = 0;
+        this.bytes = 0L;
     }
 }

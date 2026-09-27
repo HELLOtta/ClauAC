@@ -74,7 +74,8 @@ Findings from running the official 26.3 client in a cloud container without a GP
   in it, and kills that shell. Kill the client by the PID of its `net.minecraft.client.main.Main` process instead.
 - **Simulation results:** `run/plugins/ClauAC/reports/*.csv` has one line per client tick; `/clauac debug` shows the
   outcome of every tick in the action bar. The CSV is written through a buffer and lags a few seconds behind; for the
-  current client tick, run `clauac status` on the console, which prints one line per connection.
+  current client tick, run `clauac status` on the console, which prints a line with the outcomes of every connection
+  and, for a simulated one, a second line with what its simulation costs.
 - **Rebuilding:** `runServer` loads the plugin jar straight from `build/libs`. Building while the server runs replaces
   the jar under it and later fails with `NoClassDefFoundError`, so stop the server before building.
 - **A second player:** start another client with its own game directory (a copy of `options.txt` with a low

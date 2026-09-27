@@ -11,6 +11,7 @@ import com.github.retrooper.packetevents.protocol.player.User;
 import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationRuntime;
+import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -131,6 +132,10 @@ public final class SimulationBridge implements PacketListener {
         TickReporter reporter = connection.reporter();
         if (reporter != null) {
             this.logger.info("Simulation summary for {}", reporter.summary());
+            SimulationStatistics statistics = connection.statistics();
+            if (statistics != null) {
+                this.logger.info("Simulation cost for {}", reporter.costSummary(statistics));
+            }
         }
     }
 
@@ -165,16 +170,23 @@ public final class SimulationBridge implements PacketListener {
         return enabled;
     }
 
+    // - One line per connection, and for a simulated one a second line with what its simulation costs -
     public List<String> status() {
         List<String> lines = new ArrayList<>();
         for (ConnectionSimulation connection : this.connections.values()) {
-            TickReporter reporter = connection.reporter();
             String name = connection.user().getName();
-            lines.add(switch (connection.state()) {
-                case SIMULATED -> Objects.requireNonNull(reporter, "a simulated connection has a reporter").summary();
-                case WAITING -> name + ": waiting for the vanilla runtime to start";
-                case NOT_SIMULATED -> name + ": not simulated, " + connection.notSimulatedReason();
-            });
+            switch (connection.state()) {
+                case SIMULATED -> {
+                    TickReporter reporter = Objects.requireNonNull(connection.reporter(), "a simulated connection has a reporter");
+                    lines.add(reporter.summary());
+                    SimulationStatistics statistics = connection.statistics();
+                    if (statistics != null) {
+                        lines.add(reporter.costSummary(statistics));
+                    }
+                }
+                case WAITING -> lines.add(name + ": waiting for the vanilla runtime to start");
+                case NOT_SIMULATED -> lines.add(name + ": not simulated, " + connection.notSimulatedReason());
+            }
         }
         return lines;
     }

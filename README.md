@@ -146,7 +146,7 @@ Each client tick gets one outcome:
 
 - Every connection is recorded to `plugins/ClauAC/reports/<time>-<player>.csv`, one line per client tick, with the
   predicted and reported values, the offset, whether another entity was within one block, the predicted and reported
-  state of a vehicle the player steers, and notes.
+  state of a vehicle the player steers, the time the simulation spent on the tick (see below), and notes.
 - `MISMATCHED` ticks are logged to the server console, and a summary is logged when the player leaves; so is every
   inventory resend.
 - `/clauac debug` shows the outcome of every tick in your action bar, `/clauac status` summarises all connections
@@ -160,6 +160,51 @@ where the client is and is not taken over. A failure of the simulation itself du
 `MISMATCHED` as well. Each distinct problem is logged once with its stack trace. A server packet the sandbox cannot
 apply would make the real client fail too, since the sandbox runs the client's own handlers; it stops the simulation
 of the connection, and `/clauac status` shows why.
+
+### Cost and limits
+
+The connections are simulated on half of the server's processors (the runtime logs how many threads when it starts),
+each connection's packets one after another. What that costs is measured all the time:
+
+- The report's `simulationNanos` column holds the time of each client tick: what the simulation spent on the
+  connection since the previous tick, the server's packets in between and the tick itself.
+- `/clauac status` adds a line for every simulated connection: its share of one simulation thread, the average time
+  per client tick with the median and the 99th percentile of the last minute and the longest tick, the packets waiting
+  for the simulation and how long the oldest has waited, the server's packets the client has not confirmed yet, and
+  the snapshots taken for the alternatives of uncertain ticks. The same line is logged when the player leaves.
+
+Two limits keep one connection from taking the server's memory:
+
+- A simulation that falls behind its connection, with more than 64 MiB of packets waiting for it or a packet waiting
+  longer than 30 seconds, is stopped: the waiting packets are dropped, and the reason is logged and shown by
+  `/clauac status`. Results that late would help nobody.
+- A client that leaves more than 32 MiB or 100 000 of the server's packets unconfirmed, which only a client that hangs
+  or does not answer the pings does, gets the older half applied as if it had answered; a vanilla client handles
+  everything it received before its next tick anyway. That tick is `MISMATCHED`, and the simulation goes on, so that
+  holding back the answers cannot switch it off.
+
+The system properties `clauac.maximumQueuedMebibytes`, `clauac.maximumLagMillis`, `clauac.maximumUnconfirmedMebibytes`
+and `clauac.maximumUnconfirmedPackets` change these limits; the runtime logs the ones in effect when it starts.
+
+Measured on the development server in a container with 4 processors (2 simulation threads) with a real 26.3 client,
+over the seven test courses (walking, swimming, effects, flight, entities, menus, gliding, riding, pistons):
+
+- A client tick took 1.1 to 1.7 ms on average, depending on the course, with a median of about 1 ms and a 99th
+  percentile of 4.5 to 9.5 ms; single ticks took up to about 50 ms. That is about 2.5% of one simulation thread per
+  player. A Java Flight Recorder profile showed most of it going into ticking the entities and block entities the
+  client knows, as the client itself does; 30 chickens next to the player added 0.2 to 1 ms per tick.
+- Joining is the most expensive part: the configuration phase with the registries and the first chunks took about
+  1.3 to 1.6 s of simulation time, which left the simulation up to 0.4 s behind for a moment.
+- A snapshot of the player's state (about 300 objects) took about 1 ms once warmed up, and up to 3 ms on average
+  where only a few were taken. Snapshots are only taken in ticks with alternatives, such as every tick an item is
+  used in the main hand, which then took 0.5 to 2 ms more. With `clauac.verifyRepeatedTicks=true`, which repeats
+  every tick from a snapshot, a tick took 4 to 6 ms on average.
+
+Both limits were tried with lowered values. With `clauac.maximumLagMillis=100` the configuration phase of a joining
+client left a packet waiting longer than that, and the simulation stopped with the reason in the log and in
+`/clauac status`. With `clauac.maximumUnconfirmedPackets=2000` and a proxy dropping the client's pongs next to 30
+chickens, the older half was applied about every 25 ticks, each time with a `MISMATCHED` tick, the ticks in between
+matched unless the chickens pushed the player, and every tick matched again once the pongs got through.
 
 ### What the simulation cannot know
 
@@ -209,6 +254,8 @@ Known limits:
   at the next pong instead.
 - A connection that was already playing when ClauAC started watching it (after a plugin reload) is not simulated:
   the simulation has to see a connection from its first configuration packet on.
+- A client that sends its ticks much faster than a vanilla client makes its simulation do that much more work; one
+  that makes it fall behind the limit above stops it, with the reason in the log and in `/clauac status`.
 - Not verified yet: equipment effects such as leather boots on powder snow.
 
 ### Verified so far

@@ -13,6 +13,7 @@ import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationRuntime;
+import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
@@ -69,7 +70,8 @@ final class ConnectionSimulation {
     private volatile State state;
     private volatile @Nullable String notSimulatedReason;
     private volatile @Nullable TickReporter reporter;
-    private @Nullable PlayerSimulation simulation;
+    // - Set on the event loop; read by statistics from any thread -
+    private volatile @Nullable PlayerSimulation simulation;
     private @Nullable SimulationRuntime runtime;
     private final Deque<WaitingPacket> waitingPackets = new ArrayDeque<>();
     private long waitingBytes;
@@ -119,6 +121,12 @@ final class ConnectionSimulation {
 
     @Nullable String notSimulatedReason() {
         return this.notSimulatedReason;
+    }
+
+    // - What the simulation has cost so far; null while the connection is not simulated -
+    @Nullable SimulationStatistics statistics() {
+        PlayerSimulation current = this.simulation;
+        return current != null ? current.statistics() : null;
     }
 
     void runInEventLoop(Runnable task) {
@@ -342,8 +350,9 @@ final class ConnectionSimulation {
         this.totalWaitingBytes.addAndGet(-this.waitingBytes);
         this.waitingBytes = 0L;
         this.waitingPackets.clear();
-        if (this.simulation != null) {
-            this.simulation.close();
+        PlayerSimulation closingSimulation = this.simulation;
+        if (closingSimulation != null) {
+            closingSimulation.close();
         }
         TickReporter closing = this.reporter;
         if (closing != null) {

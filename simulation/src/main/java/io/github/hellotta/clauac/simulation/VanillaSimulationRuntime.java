@@ -9,6 +9,7 @@ import io.github.hellotta.clauac.simulation.api.SimulationRuntime;
 import io.github.hellotta.clauac.simulation.registry.ServerRegistryCache;
 import io.github.hellotta.clauac.simulation.session.ClientSession;
 import io.github.hellotta.clauac.simulation.session.RelevantPackets;
+import io.github.hellotta.clauac.simulation.session.SimulationLimits;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -27,17 +28,26 @@ final class VanillaSimulationRuntime implements SimulationRuntime {
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 10L;
     private final RelevantPackets relevantPackets = new RelevantPackets();
     private final ServerRegistryCache registryCache = new ServerRegistryCache();
+    private final int threadCount;
     private final ExecutorService simulationThreads;
+    private final SimulationLimits limits;
 
     VanillaSimulationRuntime() {
         // - Half of the processors, so that simulating never takes all of them from the server -
-        int threads = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
-        this.simulationThreads = Executors.newFixedThreadPool(threads, new SimulationThreadFactory());
+        this.threadCount = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+        this.simulationThreads = Executors.newFixedThreadPool(this.threadCount, new SimulationThreadFactory());
+        this.limits = SimulationLimits.fromSystemProperties(LOGGER);
+        LOGGER.info("Simulation limits: {}", this.limits.describe());
     }
 
     @Override
     public String minecraftVersion() {
         return SharedConstants.getCurrentVersion().name();
+    }
+
+    @Override
+    public int simulationThreads() {
+        return this.threadCount;
     }
 
     @Override
@@ -47,7 +57,7 @@ final class VanillaSimulationRuntime implements SimulationRuntime {
 
     @Override
     public PlayerSimulation createPlayer(UUID profileId, String profileName, SimulationListener listener) {
-        return new ClientSession(profileId, profileName, listener, this.registryCache, this.simulationThreads);
+        return new ClientSession(profileId, profileName, listener, this.registryCache, this.simulationThreads, this.limits);
     }
 
     @Override

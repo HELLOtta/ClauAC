@@ -6,15 +6,19 @@ import io.github.hellotta.clauac.simulation.api.PacketDirection;
 import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationListener;
+import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
 import io.github.hellotta.clauac.simulation.api.TickOutcome;
 import io.github.hellotta.clauac.simulation.registry.ConfigurationSession;
 import io.github.hellotta.clauac.simulation.registry.ReceivedRegistries;
 import io.github.hellotta.clauac.simulation.registry.ServerRegistryCache;
 import io.netty.buffer.Unpooled;
+import java.io.Serial;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.Packet;
@@ -62,9 +66,13 @@ import org.jspecify.annotations.Nullable;
 // - network order the packets were handed in -
 public final class ClientSession implements PlayerSimulation {
 
+    private static final double NANOS_PER_SECOND = 1.0E9;
+
     private final GameProfile profile;
     private final SimulationListener listener;
     private final ServerRegistryCache registryCache;
+    private final SimulationLimits limits;
+    private final SimulationCost cost = new SimulationCost();
     private final SerialExecutor executor;
     private final ProtocolDecoders decoders = new ProtocolDecoders();
     private final PendingClientbound pending = new PendingClientbound();
@@ -73,19 +81,27 @@ public final class ClientSession implements PlayerSimulation {
     private final List<String> pendingNotes = new ArrayList<>();
     private final List<String> pendingRejections = new ArrayList<>();
     private volatile boolean closed;
+    // - Set on the connection's event loop once the simulation fell too far behind (see checkKeepingUp) -
+    private volatile boolean fellBehind;
     private boolean failed;
     private ReceivedRegistries registries;
     private FeatureFlagSet enabledFeatures;
     private @Nullable ConfigurationSession configuration;
     private @Nullable PlayConnection play;
     private long clientTick;
+    // - The tick whose report the play connection holds back, and that tick's time, which goes with the report -
+    private long heldTick = -1L;
+    private long heldTickNanos;
 
-    public ClientSession(UUID profileId, String profileName, SimulationListener listener, ServerRegistryCache registryCache, Executor simulationThreads) {
+    public ClientSession(
+            UUID profileId, String profileName, SimulationListener listener, ServerRegistryCache registryCache, Executor simulationThreads, SimulationLimits limits
+    ) {
         this.profile = new GameProfile(profileId, profileName);
         this.listener = listener;
         this.problemLog = new ProblemLog(profileName);
         this.registryCache = registryCache;
-        this.executor = new SerialExecutor(simulationThreads);
+        this.limits = limits;
+        this.executor = new SerialExecutor(simulationThreads, this.cost);
         this.registries = ConfigurationSession.initialRegistries();
         this.enabledFeatures = ConfigurationSession.initialFeatures();
         this.configuration = new ConfigurationSession(registryCache, this.registries.access(), this.enabledFeatures);
@@ -93,15 +109,39 @@ public final class ClientSession implements PlayerSimulation {
 
     @Override
     public void handlePacket(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket) {
-        if (!this.closed) {
-            this.executor.execute(() -> this.process(phase, direction, encodedPacket));
+        if (this.closed || this.fellBehind) {
+            return;
         }
+        this.executor.execute(() -> this.process(phase, direction, encodedPacket), encodedPacket.length);
+        this.checkKeepingUp();
+    }
+
+    // - Stops the simulation once it fell too far behind the connection (see SimulationLimits), before the waiting -
+    // - packets take the server's memory. The waiting packets are dropped, and the failure is reported after the task -
+    // - that runs now, on the simulation thread like every other result -
+    private void checkKeepingUp() {
+        long queuedBytes = this.executor.queuedBytes();
+        long lagNanos = this.executor.lagNanos(System.nanoTime());
+        if (queuedBytes <= this.limits.maximumQueuedBytes() && lagNanos <= this.limits.maximumLagNanos()) {
+            return;
+        }
+        this.fellBehind = true;
+        String details = String.format(Locale.ROOT, "%d packets (%.1f MiB) waited for it, the oldest for %.3f s; the limits are %d MiB and %d ms",
+                this.executor.queuedTasks(), (double) queuedBytes / SimulationLimits.MEBIBYTE, lagNanos / NANOS_PER_SECOND,
+                this.limits.maximumQueuedBytes() / SimulationLimits.MEBIBYTE, TimeUnit.NANOSECONDS.toMillis(this.limits.maximumLagNanos()));
+        this.executor.abandonWaitingTasks(() -> this.fail("The simulation fell behind the connection", new FellBehindException(details)));
+    }
+
+    @Override
+    public SimulationStatistics statistics() {
+        return this.cost.statistics(this.executor.queuedTasks(), this.executor.queuedBytes(), this.executor.lagNanos(System.nanoTime()),
+                this.pending.size(), this.pending.bytes());
     }
 
     @Override
     public void close() {
         this.closed = true;
-        this.executor.execute(this::release);
+        this.executor.execute(this::release, 0L);
     }
 
     private void release() {
@@ -117,11 +157,20 @@ public final class ClientSession implements PlayerSimulation {
         PlayConnection ending = this.play;
         this.play = null;
         if (ending != null) {
-            ClientTickReport held = ending.takeHeldReport();
+            ClientTickReport held = ending.takeHeldReport("the play phase ended before the client reported the hotbar switch this tick assumed");
             if (held != null) {
-                this.listener.onClientTick(held);
+                this.listener.onClientTick(held, this.heldTickNanos(held));
             }
         }
+        this.heldTick = -1L;
+    }
+
+    // - The time of the tick whose report the play connection held back -
+    private long heldTickNanos(ClientTickReport report) {
+        if (report.clientTick() != this.heldTick) {
+            throw new IllegalStateException("the report of client tick " + report.clientTick() + " was not held back");
+        }
+        return this.heldTickNanos;
     }
 
     // - A packet from the client that the sandbox cannot decode or apply is one no vanilla client sends in the -
@@ -196,6 +245,25 @@ public final class ClientSession implements PlayerSimulation {
         if (phase == ProtocolPhase.CONFIGURATION) {
             this.applyLeadingConfigurationPackets();
         }
+        this.limitUnconfirmed();
+    }
+
+    // - A vanilla client answers the ping behind a bundle while it handles the bundle, so the server's packets only -
+    // - pile up unconfirmed while the client does not answer, whether it hangs or refuses to. Past the limits the -
+    // - older half is applied as if the client had answered, as a vanilla client handles everything it received -
+    // - before its next tick, and the next tick is MISMATCHED; the simulation goes on, so that holding back the -
+    // - answers cannot switch it off -
+    private void limitUnconfirmed() {
+        long maximumBytes = this.limits.maximumUnconfirmedBytes();
+        int maximumPackets = this.limits.maximumUnconfirmedPackets();
+        if (this.pending.bytes() <= maximumBytes && this.pending.size() <= maximumPackets) {
+            return;
+        }
+        for (PendingClientbound.PendingPacket released : this.pending.takeOldest(maximumBytes / 2, maximumPackets / 2)) {
+            this.apply(released);
+        }
+        this.reject(String.format(Locale.ROOT, "the client left more than %d MiB or %d of the server's packets unconfirmed; the older half was applied without its answer",
+                maximumBytes / SimulationLimits.MEBIBYTE, maximumPackets));
     }
 
     // - The client handles configuration packets as they arrive: it has no level, so there is no tick to line -
@@ -270,7 +338,8 @@ public final class ClientSession implements PlayerSimulation {
         this.enabledFeatures = session.enabledFeatures();
         this.configuration = null;
         this.decoders.bindPlay(this.registries.access());
-        PlayConnection newPlay = new PlayConnection(this.profile, this.registries, this.enabledFeatures, this.listener::onInventoryResyncNeeded, this.problemLog);
+        PlayConnection newPlay = new PlayConnection(
+                this.profile, this.registries, this.enabledFeatures, this.listener::onInventoryResyncNeeded, this.problemLog, this.cost);
         newPlay.tickPackets().notes.addAll(this.pendingNotes);
         newPlay.tickPackets().rejections.addAll(this.pendingRejections);
         this.pendingNotes.clear();
@@ -365,11 +434,27 @@ public final class ClientSession implements PlayerSimulation {
         this.clientTick++;
         PlayConnection connection = this.play;
         if (connection == null) {
-            this.listener.onClientTick(this.tickOutsidePlay());
+            ClientTickReport report = this.tickOutsidePlay();
+            this.listener.onClientTick(report, this.cost.endTick(System.nanoTime()));
             return;
         }
-        for (ClientTickReport report : connection.tick(this.clientTick)) {
-            this.listener.onClientTick(report);
+        List<ClientTickReport> reports = connection.tick(this.clientTick);
+        long tickNanos = this.cost.endTick(System.nanoTime());
+        boolean delivered = false;
+        for (ClientTickReport report : reports) {
+            if (report.clientTick() == this.clientTick) {
+                this.listener.onClientTick(report, tickNanos);
+                delivered = true;
+            } else {
+                this.listener.onClientTick(report, this.heldTickNanos(report));
+            }
+        }
+        if (delivered) {
+            this.heldTick = -1L;
+        } else {
+            // - The play connection held this tick's report back -
+            this.heldTick = this.clientTick;
+            this.heldTickNanos = tickNanos;
         }
     }
 
@@ -387,5 +472,17 @@ public final class ClientSession implements PlayerSimulation {
                 false, Double.NaN, Double.NaN, Double.NaN, false, false, false,
                 Double.NaN, null, notes
         );
+    }
+
+    // - Why the simulation stopped when it fell behind. The message tells everything, a stack trace would not; a -
+    // - problem while releasing the simulation can still be attached (see fail) -
+    private static final class FellBehindException extends Exception {
+
+        @Serial
+        private static final long serialVersionUID = 1L;
+
+        private FellBehindException(String message) {
+            super(message, null, true, false);
+        }
     }
 }

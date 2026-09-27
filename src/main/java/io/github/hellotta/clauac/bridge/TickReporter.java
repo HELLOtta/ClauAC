@@ -6,6 +6,7 @@ import com.github.retrooper.packetevents.netty.channel.ChannelHelper;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerActionBar;
 import io.github.hellotta.clauac.simulation.api.ClientTickReport;
 import io.github.hellotta.clauac.simulation.api.SimulationListener;
+import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
 import io.github.hellotta.clauac.simulation.api.TickOutcome;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -29,9 +30,13 @@ final class TickReporter implements SimulationListener {
             + "predictedSprinting,positionReported,reportedX,reportedY,reportedZ,reportedOnGround,reportedHorizontalCollision,reportedSprinting,"
             + "offset,entityNearby,vehicle,vehiclePredictedX,vehiclePredictedY,vehiclePredictedZ,vehiclePredictedYRot,vehiclePredictedXRot,"
             + "vehiclePredictedOnGround,vehiclePositionReported,vehicleReportedX,vehicleReportedY,vehicleReportedZ,vehicleReportedYRot,"
-            + "vehicleReportedXRot,vehicleReportedOnGround,vehicleOffset,notes";
+            + "vehicleReportedXRot,vehicleReportedOnGround,vehicleOffset,simulationNanos,notes";
     // - The vehicle columns of a tick without a steered vehicle -
     private static final String NO_VEHICLE_COLUMNS = ",".repeat(14);
+    private static final double NANOS_PER_MILLISECOND = 1.0E6;
+    private static final double NANOS_PER_SECOND = 1.0E9;
+    private static final double BYTES_PER_KIBIBYTE = 1024.0;
+    private static final double PERCENT = 100.0;
 
     private final User user;
     private final String playerName;
@@ -83,7 +88,7 @@ final class TickReporter implements SimulationListener {
     }
 
     @Override
-    public void onClientTick(ClientTickReport report) {
+    public void onClientTick(ClientTickReport report, long simulationNanos) {
         boolean nearby = this.entityNearby;
         synchronized (this) {
             if (this.closed) {
@@ -95,7 +100,7 @@ final class TickReporter implements SimulationListener {
             }
             if (this.csv != null) {
                 try {
-                    this.csv.write(csvLine(report, nearby));
+                    this.csv.write(csvLine(report, nearby, simulationNanos));
                     this.csv.newLine();
                 } catch (IOException exception) {
                     this.logger.error("Could not write {}; no further ticks of {} are recorded", this.csvFile, this.playerName, exception);
@@ -115,7 +120,7 @@ final class TickReporter implements SimulationListener {
         }
     }
 
-    private static String csvLine(ClientTickReport report, boolean entityNearby) {
+    private static String csvLine(ClientTickReport report, boolean entityNearby, long simulationNanos) {
         return String.join(",",
                 Long.toString(report.clientTick()),
                 report.outcome().name(),
@@ -135,6 +140,7 @@ final class TickReporter implements SimulationListener {
                 Double.toString(report.offset()),
                 Boolean.toString(entityNearby),
                 vehicleColumns(report.vehicle()),
+                Long.toString(simulationNanos),
                 quote(String.join("; ", report.notes()))
         );
     }
@@ -216,6 +222,28 @@ final class TickReporter implements SimulationListener {
                 this.outcomeCounts.getOrDefault(TickOutcome.UNVERIFIED, 0L),
                 this.outcomeCounts.getOrDefault(TickOutcome.NOT_SIMULATED, 0L));
         return this.stopReason != null ? summary + ", stopped (" + this.stopReason + ")" : summary;
+    }
+
+    // - What the simulation has cost, in one line: its share of a simulation thread, the time per client tick, the -
+    // - packets waiting for it and how far it is behind, the server's packets the client has not confirmed, and the -
+    // - snapshots of the player's state -
+    String costSummary(SimulationStatistics statistics) {
+        double threadShare = statistics.elapsedNanos() > 0L ? PERCENT * statistics.busyNanos() / statistics.elapsedNanos() : 0.0;
+        double averageTick = statistics.ticks() > 0L ? statistics.busyNanos() / NANOS_PER_MILLISECOND / statistics.ticks() : 0.0;
+        String recentTicks = statistics.recentTicks() > 0
+                ? String.format(Locale.ROOT, "median %.2f ms and 99th percentile %.2f ms of the last %d",
+                        statistics.recentMedianTickNanos() / NANOS_PER_MILLISECOND, statistics.recentPercentile99TickNanos() / NANOS_PER_MILLISECOND,
+                        statistics.recentTicks())
+                : "no tick yet";
+        double averageSnapshot = statistics.snapshots() > 0L ? statistics.snapshotNanos() / NANOS_PER_MILLISECOND / statistics.snapshots() : 0.0;
+        return String.format(Locale.ROOT,
+                "%s: %.1f%% of a simulation thread, %.2f ms per client tick on average (%s, longest %.2f ms); "
+                        + "%d packets (%.1f KiB) waiting, %.2f s behind (at most %.2f s); %d server packets (%.1f KiB) unconfirmed; "
+                        + "%d snapshots of the player, %.3f ms each on average, up to %d objects",
+                this.playerName, threadShare, averageTick, recentTicks, statistics.maxTickNanos() / NANOS_PER_MILLISECOND,
+                statistics.queuedPackets(), statistics.queuedBytes() / BYTES_PER_KIBIBYTE, statistics.lagNanos() / NANOS_PER_SECOND,
+                statistics.maxLagNanos() / NANOS_PER_SECOND, statistics.unconfirmedPackets(), statistics.unconfirmedBytes() / BYTES_PER_KIBIBYTE,
+                statistics.snapshots(), averageSnapshot, statistics.maxSnapshotObjects());
     }
 
     synchronized void close() {
