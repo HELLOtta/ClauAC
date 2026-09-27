@@ -365,17 +365,23 @@ packets (a pong, the acceptance of a teleport, a rotation, the acknowledgement o
 processed that packet, so its timer is at least at the time the server sent it; every tick it ends afterwards advances
 the timer by a tick target (50 ms, or the server's slower tick rate while its level runs normally), less 1% for clocks
 that run fast. A tick end cannot arrive before the client ended the tick, and a vanilla client never gets ahead of
-real time: after a pause it runs at most 10 ticks at once and drops the rest (`Minecraft.runTick`,
-`DeltaTracker.Timer`), so that its ticks get at most 11 tick targets ahead of the real time between them. A tick end
-that arrives more than 12 tick targets (600 ms) earlier than the timer can have reached therefore fails `Timer`, and the
-timer is put back to that limit, so that only a tick further ahead fails next. A connection that stalls only makes the
-tick ends arrive later, and a client that holds back its answers only keeps the timer from being moved up.
+real time: a frame counts the ticks it owes when it starts, handles the server's packets and then runs at most 10 of
+those ticks, dropping the rest (`Minecraft.runTick`, `DeltaTracker.Timer`). The ticks right after an answer can
+therefore be owed for up to 10 tick targets before the frame started. The frame also handles every packet that arrives
+while it handles packets (`PacketProcessor.processQueuedPackets` runs until the queue is empty), which took up to
+650 ms in test joins while chunks kept arriving, and the next frame owes up to 10 more ticks for that time. With the
+tick the leftover fraction completes, the ticks after an answer can get 21 tick targets ahead of the real time since
+the server sent the answered packet. A tick end that arrives more than 22 tick targets (1.1 s) earlier than the timer
+can have reached therefore fails `Timer`, and the timer is put back to that limit, so that only a tick further ahead
+fails next. A connection that stalls only makes the tick ends arrive later, and a client that holds back its answers
+only keeps the timer from being moved up. An earlier limit of 12 tick targets, which counted only the first frame,
+failed 3 of 4 test joins through a proxy, whose ticks got 600 to 618 ms ahead while the client loaded the world.
 
 In game, with the player walking back and forth through a proxy, no tick failed `Timer` in normal play, nor while the
-proxy held the client's packets for 25 seconds and then sent them at once, nor in the 1644 ticks of the flight test
-course. One extra tick end injected every 250 ms, a client about 20% fast, failed `Timer` from 72 ticks (3.6 seconds)
-on, 67 times in 15 seconds, and once more right after it stopped. 1500 tick ends injected at once failed it 1503
-times.
+proxy held the client's packets for 25 seconds and then sent them at once, nor in four joins through a proxy that
+traced them, whose ticks got 455 to 577 ms ahead at most. One extra tick end injected every 250 ms, a client about 20%
+fast, failed `Timer` from 137 ticks (6.9 seconds) on, 50 times in 15 seconds, and once more right after it stopped.
+1500 tick ends injected at once failed it 1502 times.
 
 ### Setbacks
 

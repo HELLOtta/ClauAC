@@ -5,16 +5,22 @@ package io.github.hellotta.clauac.simulation.session;
 // - client answers one of the server's packets (a pong, the acceptance of a teleport, a rotation, the start of a -
 // - configuration phase), it has processed that packet, so its timer has reached at least the time the server sent -
 // - it; each tick it ends after that advances its timer by the tick target. A tick end cannot arrive before the -
-// - client ended that tick, so a tick end that arrives earlier than the timer can have reached it was ended sooner -
-// - than a vanilla client's timer allows. A connection that stalls only makes the tick ends arrive later. Used by the -
+// - client ended that tick, so a tick end that arrives earlier than the timer can have reached it, by more than the -
+// - ticks a vanilla client may still owe for the time before its answer (see SLACK_TICKS), was ended sooner than a -
+// - vanilla client's timer allows. A connection that stalls only makes the tick ends arrive later. Used by the -
 // - connection's tasks only, which run one at a time -
 final class ClientClock {
 
     private static final double NANOS_PER_MILLISECOND = 1.0E6;
-    // - After a pause a vanilla client runs up to 10 ticks at once, and the tick its leftover fraction completes may -
-    // - follow right away (Minecraft.runTick, DeltaTracker.Timer.advanceGameTime), so its ticks can get 11 tick -
-    // - targets ahead of the real time between them; one more tick target of margin -
-    static final int SLACK_TICKS = 12;
+    // - How many tick targets a vanilla client's ticks can get ahead of the real time since the server sent a packet -
+    // - the client answered. A frame counts the ticks it owes when it starts, handles the server's packets and then -
+    // - runs those ticks, at most 10 at once (Minecraft.runTick, DeltaTracker.Timer.advanceGameTime): the ticks right -
+    // - after an answer can be owed for up to 10 tick targets before the frame started. The frame handles every packet -
+    // - that arrives while it handles packets (PacketProcessor.processQueuedPackets runs until the queue is empty), -
+    // - which took up to 650 ms in test joins, whose chunks arrived meanwhile; the next frame owes ticks for that time, -
+    // - up to 10 more. The tick the leftover fraction completes may follow right away, and one more tick target of -
+    // - margin -
+    static final int SLACK_TICKS = 22;
     // - The timer advances 1% less than the tick target per tick, for a client whose clock runs faster than the -
     // - server's, as TickBudget.REFILL_RATE allows -
     private static final double TICK_SHARE = 1.0 / TickBudget.REFILL_RATE;
