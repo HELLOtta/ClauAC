@@ -422,6 +422,16 @@ player took over with a hotbar key, most of all over the round trip of 2 s and t
 ghast as `moved wrongly`, as they do over a direct connection. The sandbox followed every one of these corrections as
 the client did.
 
+The final runs with the check of the answers to teleports, the setbacks left out for ticks that ended before a teleport,
+and the client's interpolation at a faster tick rate (see "Setbacks" and above) matched as well. The thirteen courses
+matched in all of their 19 867 simulated ticks and in all 19 768 of another run in which every tick of the player on
+foot ran a second time from its snapshot and ended the same, and the test of the tick rates, at 20 and at 40, matched in
+all of its 727. Over the five connections above, the courses and the block and combat tests matched in all of their
+36 463 simulated ticks but the 47 with the cheats of those tests, which ClauAC refused as over a direct connection. Over
+a direct connection, ClauAC refused every cheat of the combat and block tests, and the tests of `NoSwing`, `Timer`, the
+tick budget, alerts and setbacks, held and late, passed as before; while positions were shifted, the server's position
+of the player did not change in either setback test, and all 67 shifted answers of the held one failed `Simulation`.
+
 ## Responses
 
 Every `MISMATCHED` tick names the checks it failed, each with what exactly failed; a tick can fail several at once.
