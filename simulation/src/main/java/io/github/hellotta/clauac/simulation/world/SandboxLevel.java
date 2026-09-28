@@ -280,6 +280,22 @@ public final class SandboxLevel extends Level {
         return this.getEntities().get(id);
     }
 
+    // - ServerLevel.getEntityOrPart: the entity with this id, or else the part of an ender dragon with it. The client's -
+    // - crosshair meets the parts, not the dragon (Level.getEntities adds them), so its attacks and interactions carry -
+    // - a part's id, which the server looks up this way (ServerGamePacketListenerImpl.handleAttack and handleInteract) -
+    public @Nullable Entity getEntityOrPart(int id) {
+        Entity entity = this.getEntity(id);
+        if (entity != null) {
+            return entity;
+        }
+        for (EnderDragonPart part : this.dragonParts) {
+            if (part.getId() == id) {
+                return part;
+            }
+        }
+        return null;
+    }
+
     public SandboxBlockPredictions getBlockPredictions() {
         return this.blockPredictions;
     }

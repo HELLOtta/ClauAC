@@ -127,6 +127,13 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
   resulting position in a movement packet right after it, which such a proxy shifts as well (26.3 puts the position into
   the acceptance). With `setbacks.maximum-hold-millis` at 1, shifted answers reach the server unjudged and keep the
   player floating over the floor, and the server kicks it after 80 ticks (`ServerGamePacketListenerImpl.tick`).
+- **Testing disablers:** a cheat that leaves the sandbox unsure of what the client did, so that the tick's movement goes
+  unchecked, has to be tested the way a cheat uses it. The proxy's `after-tick-end` sends its packet behind every tick
+  end, where it leads the next tick's key handling, from a second before the shifted positions start, and the answers
+  to the corrections stay unshifted (`shift-answers off`): otherwise the first shifted tick fails before the sandbox is
+  unsure, and the check of the answers keeps the player in its setback, which hid the disabler in a first try. A
+  sprint attack slows its attacker down only when charged (`after-tick-end every N` leaves time to charge), and a
+  knockback enchantment never does on the client: `LivingEntity.getKnockback` adds it only in a `ServerLevel`.
 - **Pipelines under `pipefail`:** `producer | grep -q` fails whenever grep stops reading before the producer has written
   everything, since the producer then dies of SIGPIPE. A check of the client's command line
   (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input

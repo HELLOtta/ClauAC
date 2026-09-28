@@ -937,7 +937,9 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - The sandbox cannot know which items the client has; it asks the plugin to have the server send them all -
+    // - The sandbox cannot know which items the client has; it asks the plugin to have the server send them all. Until -
+    // - they arrive, the ticks note that the items may differ, but their movement and actions are checked as ever -
+    // - (see collectOngoingUncertainties and reject) -
     private void markInventoryUnknown(int menuId) {
         boolean alreadyUnknown = this.unknownInventoryMenu.isPresent();
         this.unknownInventoryMenu = OptionalInt.of(menuId);
@@ -1492,8 +1494,9 @@ final class PlayConnection implements ClientContext {
 
     private static void addUncertainties(List<String> uncertainties, List<TickAlternative> alternatives) {
         for (TickAlternative alternative : alternatives) {
-            if (!uncertainties.contains(alternative.uncertainty())) {
-                uncertainties.add(alternative.uncertainty());
+            String uncertainty = alternative.uncertainty();
+            if (uncertainty != null && !uncertainties.contains(uncertainty)) {
+                uncertainties.add(uncertainty);
             }
         }
     }
@@ -1942,11 +1945,13 @@ final class PlayConnection implements ClientContext {
                 return swingAfter(useItem.getHand(), this.useItem(level, player, useItem), accompaniedSwing);
             }
             case ServerboundAttackPacket attack -> {
-                Entity target = level.getEntity(attack.entityId());
+                Entity target = level.getEntityOrPart(attack.entityId());
                 Packet<?> next = this.nextAction(index);
                 if (target == null) {
-                    this.checkSwingFollows(new CheckedAction("attacked an entity the sandbox does not know (entity " + attack.entityId() + ")", packet,
-                            Flag.NO_PREDICTION), next);
+                    CheckedAction unknownAttack = new CheckedAction("attacked an entity the sandbox does not know (entity " + attack.entityId() + ")", packet,
+                            Flag.NO_PREDICTION);
+                    this.rejectUnknownTarget(unknownAttack);
+                    this.checkSwingFollows(unknownAttack, next);
                     this.attackUnknownEntity(player, this.onlySwingsFollow(index));
                 } else {
                     CheckedAction checkedAttack = new CheckedAction("attacked " + describeEntity(target), packet, Flag.NO_PREDICTION);
@@ -1957,13 +1962,13 @@ final class PlayConnection implements ClientContext {
                 return InteractionHand.MAIN_HAND;
             }
             case ServerboundInteractPacket interact -> {
-                Entity target = level.getEntity(interact.entityId());
+                Entity target = level.getEntityOrPart(interact.entityId());
                 if (target == null) {
-                    // - What interacting does on the client never moves the player, but it may use up or fill the -
-                    // - held item. Whether the client's player swung its hand after it is unknown as well, so a swing -
-                    // - of that hand right after it counts as its own -
-                    this.tickPackets.notes.add("interacted with entity " + interact.entityId() + ", which the sandbox does not know");
-                    this.markInventoryUnknown(InventoryMenu.CONTAINER_ID);
+                    // - Nothing is left to simulate: the interaction depends on the entity. Whether the client's -
+                    // - player swung its hand after it is unknown as well, so a swing of that hand right after it -
+                    // - counts as its own -
+                    this.rejectUnknownTarget(new CheckedAction("interacted with an entity the sandbox does not know (entity " + interact.entityId() + ")", packet,
+                            Flag.NO_PREDICTION));
                     return interact.hand();
                 }
                 this.checkInteraction(level, player, target, interact.hand(),
@@ -2002,13 +2007,10 @@ final class PlayConnection implements ClientContext {
     }
 
     // - What the client's key handling could do depends on the items it held: the item in the hand, the attack range -
-    // - it picks along, whether it is in use. While the sandbox's items differ from the client's (see -
-    // - markInventoryUnknown), what a check finds is noted instead -
+    // - it picks along, whether it is in use. The checks judge the sandbox's items also while these may differ from -
+    // - the client's (see markInventoryUnknown): a client can make any of its clicks differ, and passing over what the -
+    // - checks find then would let it act as it likes -
     private void reject(CheckedAction action, Check check, String detail) {
-        if (this.unknownInventoryMenu.isPresent()) {
-            this.tickPackets.notes.add("not checked: " + detail + ", while the sandbox's items differ from the client's");
-            return;
-        }
         this.tickPackets.rejectAction(check, detail, action.packet(), action.predictionSequence());
     }
 
@@ -2164,13 +2166,11 @@ final class PlayConnection implements ClientContext {
     // - abort has none. The server shows the other players the swing of an attack or a break only for that packet -
     // - (ServerGamePacketListenerImpl.handleAnimate), so a client that leaves it out hides them from them; it swings -
     // - the arm for a stab itself (PiercingWeapon.attack), but no vanilla client leaves out the swing after one. The -
-    // - swing does not depend on the items, so it is checked also while the sandbox's items differ from the client's -
-    // - (see reject). The swings after item uses and drops depend on what they did, so their absence is not checked. -
-    // - next is the tick's action after this one, null when this one ends the tick's actions -
+    // - swings after item uses and drops depend on what they did, so their absence is not checked. next is the tick's -
+    // - action after this one, null when this one ends the tick's actions -
     private void checkSwingFollows(CheckedAction action, @Nullable Packet<?> next) {
         if (!(next instanceof ServerboundSwingPacket swing && swing.getHand() == InteractionHand.MAIN_HAND)) {
-            this.tickPackets.rejectAction(Check.NO_SWING, action.description() + " without the swing a vanilla client sends right after it",
-                    action.packet(), action.predictionSequence());
+            this.reject(action, Check.NO_SWING, action.description() + " without the swing a vanilla client sends right after it");
         }
     }
 
@@ -2336,6 +2336,15 @@ final class PlayConnection implements ClientContext {
                 return;
             }
         }
+    }
+
+    // - An attack or interaction on an entity the sandbox does not know. The sandbox applies the server's packets in the -
+    // - order the client handles them, before the tick whose key handling came after them (see ClientSession), so it -
+    // - knows every entity the client knows as that key handling runs, and the crosshair picks from those alone -
+    // - (Minecraft.pick; SandboxLevel.getEntityOrPart finds the parts of an ender dragon it meets). No vanilla client -
+    // - acts on another entity, and what such an action did on the client is unknown -
+    private void rejectUnknownTarget(CheckedAction action) {
+        this.reject(action, Check.HITBOX, action.description() + ", which the crosshair cannot have pointed at: no packet of the server showed it to the client");
     }
 
     private void rejectOutOfReach(CheckedAction action, double distance, double reach, String reacher) {
@@ -2664,22 +2673,20 @@ final class PlayConnection implements ClientContext {
                 }));
     }
 
-    // - MultiPlayerGameMode.attack on an entity the client knows but the sandbox does not, which no vanilla client -
-    // - does. Player.attack then did to the player what the entity allowed: an attack that hurt it with a positive -
-    // - knockback slowed the player down, which is the alternative to it doing nothing -
+    // - MultiPlayerGameMode.attack on an entity the sandbox does not know, which fails Hitbox since no vanilla client -
+    // - does it (see rejectUnknownTarget). Player.attack then did to the player what the entity allowed: an attack that -
+    // - hurt it with a positive knockback slowed the player down, which is the alternative to it doing nothing where -
+    // - the attack is the last thing of the tick that changes the player. The alternative stands for no uncertainty, -
+    // - and there is none where it cannot be tried: the sandbox takes the attack for one that did nothing, and a tick -
+    // - that moved otherwise fails Simulation as well. An uncertainty would leave the movement of every tick with such -
+    // - an attack unchecked -
     private void attackUnknownEntity(SandboxPlayer player, boolean lastChange) {
         boolean couldSlowDown = player.attackCouldSlowDown();
         this.gameMode.finishAttack(player);
         this.tickPackets.notes.add("attacked an entity the sandbox does not know");
-        if (!couldSlowDown) {
-            return;
-        }
-        String uncertainty = "attacked an entity the client knows but the sandbox does not";
-        if (lastChange) {
-            this.tickPackets.alternatives.add(new TickAlternative(uncertainty, "the attack on the unknown entity slowing the player down", ItemStack.EMPTY,
+        if (couldSlowDown && lastChange) {
+            this.tickPackets.alternatives.add(new TickAlternative(null, "the attack on the unknown entity slowing the player down", ItemStack.EMPTY,
                     SandboxPlayer::slowDownAfterAttack));
-        } else {
-            this.tickPackets.uncertainties.add(uncertainty);
         }
     }
 
@@ -2755,15 +2762,16 @@ final class PlayConnection implements ClientContext {
         return dropped || otherSlotDrops ? InteractionHand.MAIN_HAND : null;
     }
 
-    // - What the sandbox cannot know about the tick's movement beyond the tick's own packets: the items, when they -
-    // - differ from the client's, and a block the client may have broken otherwise than the sandbox where the -
-    // - movement went past it, or where ending the prediction of its break may have put the client's player back -
-    // - (see SandboxGameMode.recentUncertainBreaks) -
+    // - What the sandbox cannot know about the tick's movement beyond the tick's own packets: a block the client may -
+    // - have broken otherwise than the sandbox where the movement went past it, or where ending the prediction of its -
+    // - break may have put the client's player back (see SandboxGameMode.recentUncertainBreaks). Items that may differ -
+    // - from the client's (see markInventoryUnknown) are only noted: a client can make any of its clicks differ, and -
+    // - an uncertainty for them would leave the movement of every tick after such a click unchecked -
     private void collectOngoingUncertainties(
             List<String> uncertainties, SandboxPlayer player, Vec3 positionBeforeTick, Entity vehicleBeforeTick, Vec3 vehiclePositionBeforeTick
     ) {
         if (this.unknownInventoryMenu.isPresent()) {
-            uncertainties.add("items differ from the client's");
+            this.tickPackets.notes.add("the sandbox's items may differ from the client's until the server's resend of them arrives");
         }
         List<SandboxGameMode.UncertainBreak> uncertainBreaks = this.gameMode.recentUncertainBreaks();
         this.gameMode.forgetAcknowledgedUncertainBreaks();

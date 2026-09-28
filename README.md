@@ -105,7 +105,8 @@ with an offset of exactly 0, 19 800 ticks in all, and no check failed:
 
 The report notes of those ticks name only riding a vehicle the server moves, the answers to the server's corrections
 of a vehicle, the hotbar keys the sandbox inferred from steering, the alternatives that matched, and the attack on an
-entity nobody has that course 6 sends through its proxy.
+entity nobody has that course 6 sent through its proxy then; such an attack fails `Hitbox` now, and the test of the
+disablers sends it instead (see "Disablers").
 
 The tests of the checks and responses failed only what they cheated:
 
@@ -133,6 +134,18 @@ The tests of the checks and responses failed only what they cheated:
   `setbacks.maximum-hold-millis` set to 1 the packets went on unjudged 264 times; the server teleported the player back
   55 times, to where it then stayed, and five failed ticks needed no setback of their own: four had ended before one of
   those teleports went out, and one began while one was still on its way to the client (see "Setbacks").
+- The test of the disablers (see "Disablers") found them in this build too before their fix. While positions were
+  reported 2 blocks higher, an interaction with an entity id no entity had, sent behind every tick end, left 83 of 85
+  ticks `UNVERIFIED`, and the server's position of the player rose to 102.0 and went on from 98.5 to 112.9 blocks east;
+  a click that claimed an item on the empty cursor left 61 of 93 ticks `UNVERIFIED`, and a charged sprint attack on
+  that id with its swing and an item use, behind every sixth tick end, 13 of 87, which moved the server's position of
+  the player up to 102.44. With the fix none of the 1119 ticks of the test's connection was `UNVERIFIED`, and the
+  server's position of the player stayed where it was; a single charged attack on the unknown id with its swing failed
+  `Hitbox` alone, and the movement of its tick matched. The NoSwing test's attack on the unknown entity failed `Hitbox`
+  as well, course 6 without it matched in all of its 1644 ticks, and a stack the creative inventory had left on the
+  cursor, put down by a click in the survival inventory, left the sandbox's items differing from the client's for
+  three ticks, which matched (see "Verified so far"). The thirteen courses matched in all of their 19 648 simulated
+  ticks, and the combat and block tests failed exactly the checks they failed before.
 
 Over worse connections the courses matched as well. Through the proxy of "Verified so far", with each of its five kinds
 of delay, courses 1, 2, 3, 5, 7, 8, 9, 10, 11 and 12 and the block and combat tests matched in all of their 36 425
@@ -282,7 +295,8 @@ does not steer moves as the server says, which the sandbox follows like the clie
 Menu clicks happen on screens between the client's ticks and are applied right away. The client sends the slots a
 click changed as hashes, so every click is checked: when the sandbox's items turn out to differ from the client's, it
 marks them unknown and ClauAC has the server resend the player's inventory (Paper's `Player#updateInventory`), which
-the sandbox takes over when it arrives.
+the sandbox takes over when it arrives. Until then the ticks note that the items may differ, but their movement and
+actions are checked as ever, since a client can make any of its clicks differ (see "Disablers").
 
 ### Results
 
@@ -400,8 +414,9 @@ of them runs from the saved state, and the first that matches what the client re
   and gets no switch reported is `MISMATCHED`. With the attack strength that earlier switch left, an attack may have
   slowed the player down (a knockback attack) where the sandbox's did not, or the other way round: that attack runs
   again with the other strength.
-- An attack on an entity the sandbox does not know, which no vanilla client makes, may have slowed the player down or
-  not, depending on the entity.
+- An attack on an entity the sandbox does not know fails `Hitbox`, since no vanilla client makes it (see "Attacks and
+  interactions"). Where it is the last thing of the tick that changes the player, the attack slowing the player down
+  is tried as well; otherwise the sandbox takes it for an attack that did nothing to the player.
 - A riptide trident begins its use and throws its user only in water or rain (`TridentItem.use`, `releaseUsing`), and
   whether rain falls on the player depends on the sky light at its feet and at the top of its box
   (`Level.precipitationAt`, `Entity.isInRain`). The sandbox keeps no light, but the client's sky light is full
@@ -425,11 +440,9 @@ What cannot be tried that way leaves the tick `UNVERIFIED` instead of `MISMATCHE
   tick, a difference that keeps shrinking in the ticks right after it stays `UNVERIFIED`.
 - A switch that stopped an item use when the new item changes an attribute that moves the player (speed, gravity,
   scale, step height and the like), which the alternative leaves out.
-- Items the sandbox had to mark unknown, until the server's resend arrives, and teleports whose resulting position
-  differs from the sandbox's in a coordinate the teleport gives relative to the player's own; one it sets outright has
-  to be the teleport's (see "The 26.2 build"). A rotation that differs is the client's input and is taken over.
-  Interacting with an entity the sandbox does not know never moves the player, but may use up or fill the held item, so
-  the sandbox then marks its items unknown and has them resent.
+- Teleports whose resulting position differs from the sandbox's in a coordinate the teleport gives relative to the
+  player's own; one it sets outright has to be the teleport's (see "The 26.2 build"). A rotation that differs is the
+  client's input and is taken over.
 - With the experimental minecart movement, a minecart turns its rider only while the client's "rotate with minecart"
   option is on, which the server never learns. Placing a block or swinging at what the crosshair points at in such a
   minecart depends on the rotation the client had.
@@ -451,6 +464,32 @@ Known limits:
 - The tick budget (see "Cost and limits") only bounds what the simulation costs; the `Timer` check (see "Responses")
   finds a client that ends its ticks faster than its timer allows. A client whose timer runs up to 1% fast passes
   both, since clocks drift that far apart in neither's view.
+
+### Disablers
+
+An uncertainty explains any difference in the movement, so what leaves a tick `UNVERIFIED` has to be the client's
+situation, never something a client can send at will: a client that could would keep its movement unchecked for as
+long as it went on sending it, as the cheats called disablers do. Items the sandbox had to mark unknown after a click
+that differed (see "Following the client's timeline") are therefore only noted in the ticks until the server's resend
+arrives, and an attack or interaction on an entity the sandbox does not know fails `Hitbox` (see "Attacks and
+interactions") and leaves the tick's movement checked; the alternative of such an attack stands for no uncertainty
+where it cannot be tried. Before, both left the tick `UNVERIFIED`, and while the items were unknown the checks of the
+actions only noted what they found. What still leaves a tick `UNVERIFIED` (see above) takes more than a packet: the
+player riding or blocks moving next to it while an alternative is open, an attack on an entity the crosshair points at
+whose strength depends on when a hotbar switch happened and after which the tick's actions go on, a relative teleport
+of the server, a block the client may have broken otherwise than the sandbox, or a minecart with the experimental
+movement.
+
+In game, a proxy reported the positions of a walking player 2 blocks higher, as in the tests of the setbacks, and sent
+something no vanilla client sends behind every tick end of the client, from a second before the shift on; it left the
+client's answers to the corrections alone. With the old build, an interaction with an entity id no entity had left 88
+of 89 ticks `UNVERIFIED`, and the server's position of the player rose to 102.0 and went on from 98.7 to 113.6 blocks
+east. A click in the player's inventory that claimed an item on its empty cursor left 53 of 92 ticks `UNVERIFIED`, and
+a charged attack on the unknown entity id with its swing and an item use after it, behind every sixth tick end while
+the player sprinted, 13 of 96, which moved the server's position of the player up to 102.44. With the new build none
+of these ticks was `UNVERIFIED`: the shifted ones failed `Simulation`, the interactions and attacks `Hitbox`, and the
+server's position of the player stayed where it was. A single charged attack on the unknown entity id with its swing
+failed `Hitbox` alone, and the movement of its tick matched as simulated.
 
 ### Verified so far
 
@@ -516,13 +555,17 @@ courses matched again in all of their 19 802 simulated ticks, and in all 19 841 
 the player on foot ran a second time from its snapshot (`clauac.verifyRepeatedTicks=true`) and ended the same.
 
 Menu clicks matched the client's hashes in chests, the player's inventory (crafting included), furnaces, stonecutters,
-anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.
-A switch from the creative inventory screen straight to survival made the client click in a menu the sandbox did not
-have; the next click showed the difference and the inventory resend brought both back in line. Switching the hotbar
-slot while eating matched through the alternative that the switch stopped the item use a tick before the client
-reported it, which the next tick confirmed; a sprint attack right after a hotbar switch matched through the attack
-strength that switch left, and an attack on an entity id the sandbox did not know, injected into the connection,
-matched without slowing the player down. While the player was dead the sandbox, like the client, did not move it
+anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging. A
+switch from the creative inventory screen straight to survival made the client click in a menu the sandbox did not have;
+the next click showed the difference and the inventory resend brought both back in line. The creative inventory keeps
+what it picks up on the client's cursor alone, and that screen turns into the survival inventory with the cursor still
+full: in two runs, such a stack put down by a click in the survival inventory left the sandbox's items differing from
+the client's for three and two ticks, which ClauAC checks as ever since the fix of the disablers (see "Disablers");
+these ticks and the walking and jumping after them matched. Switching the hotbar slot while eating matched through the
+alternative that the switch stopped the item use a tick before the client reported it, which the next tick confirmed; a
+sprint attack right after a hotbar switch matched through the attack strength that switch left, and an attack on an
+entity id the sandbox did not know, injected into the connection, matched without slowing the player down; such an
+attack fails `Hitbox` now (see "Disablers"). While the player was dead the sandbox, like the client, did not move it
 (`NOT_SIMULATED`), and matching resumed after the respawn.
 
 Over worse connections the courses matched as well. A proxy between the client and the server held back what each side
@@ -564,8 +607,9 @@ Every `MISMATCHED` tick names the checks it failed, each with what exactly faile
 | `Reach`             | The client acted on an entity or a block farther away than the player or its weapon reaches  |
 |                     | (see "Attacks and interactions" and "Blocks and items")                                      |
 | `Hitbox`            | The client acted on an entity or a block its crosshair did not point at: one behind a block  |
-|                     | or another entity, one beside where the player looked, one no crosshair meets, another face  |
-|                     | or point of a block; or it used an item facing another way than the player                  |
+|                     | or another entity, one beside where the player looked, one no crosshair meets, one the       |
+|                     | server never showed the client, another face or point of a block; or it used an item facing  |
+|                     | another way than the player                                                                  |
 | `Interaction`       | The client acted when a vanilla client does not: while it used an item, paddled a boat or    |
 |                     | broke a block, as a spectator, outside the world border, with an item that cannot do what it |
 |                     | did, or with another hotbar slot in the middle of its key handling                           |
@@ -613,6 +657,10 @@ attack and interaction against what these methods allow:
   blocks and entities in front of the target count, and so do its pick radius and its position as the client
   interpolated it. When the crosshair did not point at the target, the tick fails `Reach` if the target lay out of
   reach even for a crosshair on it, and `Hitbox` otherwise.
+- The crosshair picks from the entities the client knows, which are the ones the sandbox knows: the sandbox applies the
+  server's packets before the tick whose key handling came after them. An attack or interaction on an entity the
+  sandbox does not know therefore fails `Hitbox`. The crosshair meets the parts of an ender dragon instead of the
+  dragon, and the sandbox looks their ids up as the server does (`ServerLevel.getEntityOrPart`).
 - The crosshair meets an entity's box, grown by its pick radius, closer than the player's entity interaction range,
   and a weapon with an attack range (`minecraft:attack_range`) attacks only where that point lies within its range.
   An interaction also needs the entity's box itself closer than that range (`Player.isWithinEntityInteractionRange`)
@@ -633,8 +681,6 @@ Where the packets leave the client's situation open, the check takes whatever a 
   hotbar switch does not change them.
 - In a minecart with the experimental movement, the rotation the player acted with is unknown (see "What the
   simulation cannot know"), and what the crosshair pointed at is not checked; the tick's notes say so.
-- An attack or interaction on an entity the sandbox does not know is not checked (see "What the simulation cannot
-  know").
 
 Attacks and interactions are held like the movement (see "Setbacks"). An attack or interaction that fails `Reach`,
 `Hitbox`, `Interaction` or `NoSwing` (see "Swings") with `setback` on never reaches the server; the tick's other actions
@@ -798,14 +844,16 @@ the attack on the unknown entity. With the 26.3 client the same test failed a ni
 that client sends once it goes on breaking a block after a finish; the 26.2 client sends no such turn (see "What the
 26.2 client does differently"). None of them reached the server: the cow kept its health, the stone and the slime block
 stayed, and `/clauac status` counted 8 actions kept from the server and 6 block predictions taken back. With the swings,
-before and after, every tick matched and the server applied what the client did. An alert reads:
+before and after, every tick matched and the server applied what the client did. Since the fix of the disablers, the
+attack on the unknown entity fails `Hitbox` as well (see "Disablers"); in the run that showed it, the client did not go
+on from the slime block to the floor behind it, so seven actions failed. An alert reads:
 
     [ClauAC] Tester failed NoSwing x1 attacked minecraft:cow (entity 7525) without the swing a vanilla client sends right after it
 
 The combat and block tests send the swing a vanilla client sends after each attack, block action and stab they
-inject, and each of their steps failed exactly the checks it failed with the 26.3 client; course 6 sends its attack on
-an unknown entity with that swing as well. The courses and the other tests are listed in "Verified with the 26.2
-client".
+inject, and each of their steps failed exactly the checks it failed with the 26.3 client; course 6 sent its attack on
+an unknown entity with that swing as well, which the test of disablers sends now (see "Disablers"). The courses and the
+other tests are listed in "Verified with the 26.2 client".
 
 ### Setbacks
 
