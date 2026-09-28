@@ -55,8 +55,14 @@ The 26.2 client sends what 26.3 sends, but in other places and partly in other p
 - **Teleports.** The client accepts a teleport with its id alone (`ServerboundAcceptTeleportationPacket`) and sends its
   new position and rotation right after it in a movement packet (`ClientPacketListener.handleMovePlayer`), where 26.3
   puts them into the acceptance. It also sends such a movement packet when the server moves the vehicle it rode after
-  removing it, which moves the player instead (`handleTeleportEntity`); 26.3 sends nothing then. The sandbox checks
-  these movement packets against its player after the teleport, apart from the tick's movement.
+  removing it, which moves the player instead (`handleTeleportEntity`); 26.3 sends nothing then. The server takes the
+  position in that movement packet as the player's movement, as the 26.3 server takes the one in the acceptance. The
+  sandbox checks these movement packets against its player after the teleport, apart from the tick's movement: a
+  coordinate the teleport sets outright is the teleport's on every client (`PositionMoveRotation.calculateAbsolute`),
+  so another one fails `Simulation` and stays the teleport's in the sandbox, which the next tick starts from. A
+  movement cheat that changes the positions in every movement packet changes this answer too, and as the answer to a
+  setback's correction it would otherwise carry the cheat's position past the setback. A teleport does not end the
+  client's breaking either, where 26.3's `handleMovePlayer` calls `MultiPlayerGameMode.stopDestroyBlock`.
 - **Breaking.** 26.2 has no turn to another face: `continueDestroyBlock` goes on breaking the same block from any face
   and names the face only with the finish, so breaking a block sends only a start, an abort and a finish.
 
@@ -71,35 +77,78 @@ entity only when the level's features enable its type (`EntityType.create` with 
 ### Verified with the 26.2 client
 
 With the real 26.2 client on Paper 26.2 (build 129), every simulated tick of the thirteen test courses was `MATCHED`
-with an offset of exactly 0, 19 674 ticks in all, and no check failed:
+with an offset of exactly 0, 19 800 ticks in all, and no check failed:
 
 | Course | What the player does                                                                   | Ticks |
 |--------|----------------------------------------------------------------------------------------|-------|
-| 1      | walking, jumping, the stairs, sneaking, a sprint jump into the pool, floating, diving  | 430   |
+| 1      | walking, jumping, the stairs, sneaking, a sprint jump into the pool, floating, diving  | 427   |
 |        | and swimming                                                                           |       |
-| 2      | speed and jump boost, knockback from a cow, walking into it, creative flight           | 605   |
+| 2      | speed and jump boost, knockback from a cow, walking into it, creative flight           | 595   |
 | 3      | cows pushing, a boat, eating, placing and breaking dirt, a chest, a sprint hit on a    | 1650  |
 |        | second player, a zombie's knockback, a wind charge and an elytra flight with fireworks |       |
-| 4      | levitation, slow falling, the gravity, jump strength and scale attributes and towers   | 1357  |
+| 4      | levitation, slow falling, the gravity, jump strength and scale attributes and towers   | 1360  |
 |        | with the offhand, over 150 ms of latency each way                                      |       |
-| 5      | riding a boat, a pig the server moves, a horse, a camel, a pig and a strider steered   | 2285  |
+| 5      | riding a boat, a pig the server moves, a horse, a camel, a pig and a strider steered   | 2329  |
 |        | with their items, a minecart, a happy ghast and a nautilus                             |       |
-| 6      | the alternatives of uncertain ticks, through a proxy that injects packets              | 1762  |
-| 7      | pistons, slime and honey blocks moving the player and the boat it rides                | 2567  |
-| 8      | powder snow with and without leather boots, depth strider, soul speed, swift sneak,    | 2111  |
+| 6      | the alternatives of uncertain ticks, through a proxy that injects packets              | 1786  |
+| 7      | pistons, slime and honey blocks moving the player and the boat it rides                | 2572  |
+| 8      | powder snow with and without leather boots, depth strider, soul speed, swift sneak,    | 2143  |
 |        | frost walker and a spear with lunge                                                    |       |
-| 9      | 25 attacks and 5 interactions with entities                                            | 1487  |
-| 10     | a ladder, vines, scaffolding, crawling through a tunnel, sweet berry bushes, cobwebs,  | 1932  |
+| 9      | 25 attacks and 5 interactions with entities                                            | 1491  |
+| 10     | a ladder, vines, scaffolding, crawling through a tunnel, sweet berry bushes, cobwebs,  | 1920  |
 |        | packed and blue ice                                                                    |       |
-| 11     | bubble columns, water and lava, riptide in water and in the rain, ender pearls, the    | 2214  |
+| 11     | bubble columns, water and lava, riptide in water and in the rain, ender pearls, the    | 2238  |
 |        | world border                                                                           |       |
-| 12     | a round trip through a nether portal; 58 more ticks on the loading screens were not    | 843   |
+| 12     | a round trip through a nether portal; 87 more ticks on the loading screens were not    | 848   |
 |        | simulated                                                                              |       |
-| 13     | auto-jump                                                                              | 431   |
+| 13     | auto-jump                                                                              | 441   |
 
 The report notes of those ticks name only riding a vehicle the server moves, the answers to the server's corrections
 of a vehicle, the hotbar keys the sandbox inferred from steering, the alternatives that matched, and the attack on an
 entity nobody has that course 6 sends through its proxy.
+
+The tests of the checks and responses failed only what they cheated:
+
+- The seven attacks and interactions of the combat test, the thirteen block actions and item uses of the block test
+  and the eight actions of the NoSwing test (see "Swings") that no vanilla client sends each failed the checks they
+  failed with the 26.3 client, in exactly one tick, and never reached the server, while every tick of the vanilla steps
+  around them matched. `/clauac status` counted 7, 15 and 8 actions kept from the server, and 11 and 6 block
+  predictions taken back: as with the 26.3 client, but for the turn to another face that only the 26.3 client sends.
+- `Timer` failed only once the proxy sent more tick ends than real time allows: 129 ticks after it began to send one
+  extra every 0.25 s, with the client's ticks 1104 ms ahead of real time, and 8 ticks into a flood of 1500 at once.
+  The 25 seconds of the client's packets the proxy had held and then let go at once failed nothing. Once the tick
+  budget had run out, it kept 843 ticks of that flood from the simulation (`TickRate`); a flood of 1000 that came after
+  a hold of 10 seconds stayed within the budget and was simulated tick by tick, with the simulation at most 0.75 s
+  behind the connection.
+- A test plugin that cancelled the flag events of `BadPackets` kept the three pongs for pings nobody sent from
+  alerting. A flood of 1500 tick ends brought one alert each for `Simulation`, `Timer` and `TickRate`; after
+  `checks.Simulation.alert` was set to `false` and `/clauac reload`, a flood of 300 more brought only the alerts of
+  `Timer` and `TickRate`, which counted the 1486 and 311 flags since the ones before. All 3594 flag events came on the
+  simulation threads with ClauAC's class loader as their context class loader.
+- With the proxy shifting the positions in the client's movement packets, on foot 2 blocks up and 4 blocks ahead and in
+  a boat 3 blocks ahead, the server's position of the player and of the boat never moved, and Paper's own movement
+  checks saw nothing: 57 teleports and 29 corrections of the boat kept 451 movement packets from the server. The proxy
+  shifted the client's answers to those teleports as well, which the 26.2 client sends as movement packets of their
+  own, and all 55 of them failed `Simulation` (see "What the 26.2 client does differently"). With
+  `setbacks.maximum-hold-millis` set to 1 the packets went on unjudged 264 times; the server teleported the player back
+  55 times, to where it then stayed, and five failed ticks needed no setback of their own: four had ended before one of
+  those teleports went out, and one began while one was still on its way to the client (see "Setbacks").
+
+Over worse connections the courses matched as well. Through the proxy of "Verified so far", with each of its five kinds
+of delay, courses 1, 2, 3, 5, 7, 8, 9, 10, 11 and 12 and the block and combat tests matched in all of their 36 425
+simulated ticks but the 47 with the cheats of those tests, which ClauAC refused as over a direct connection; 54 more
+were the loading of the terrain after the portal's changes of dimension. ClauAC held the client's packets for 3.3 to
+11.4 ms on average, only the packets the block test lets go unjudged on purpose went on unjudged, and the client
+answered every keep-alive in order. Paper's own movement checks acted on the pistons' pushes of the player and its
+boat (`moved wrongly`), on a pig the player took over, and on a horse after a long stall (`moved too quickly`); the
+sandbox followed each of their corrections as the client did.
+
+In another run of the thirteen courses every tick of the player on foot ran a second time from its snapshot
+(`clauac.verifyRepeatedTicks=true`): all 19 879 simulated ticks matched, and every repeated tick ended the same.
+
+These runs showed two faults of the port, both fixed since: the answer to a setback's teleport carried a movement
+cheat's position past the setback (see "What the 26.2 client does differently"), and a late setback of a tick that
+ended before an earlier one teleported the player undid that teleport (see "Setbacks").
 
 ## Building
 
@@ -377,9 +426,10 @@ What cannot be tried that way leaves the tick `UNVERIFIED` instead of `MISMATCHE
 - A switch that stopped an item use when the new item changes an attribute that moves the player (speed, gravity,
   scale, step height and the like), which the alternative leaves out.
 - Items the sandbox had to mark unknown, until the server's resend arrives, and teleports whose resulting position
-  differs from the sandbox's. A rotation that differs is the client's input and is taken over. Interacting with an
-  entity the sandbox does not know never moves the player, but may use up or fill the held item, so the sandbox then
-  marks its items unknown and has them resent.
+  differs from the sandbox's in a coordinate the teleport gives relative to the player's own; one it sets outright has
+  to be the teleport's (see "The 26.2 build"). A rotation that differs is the client's input and is taken over.
+  Interacting with an entity the sandbox does not know never moves the player, but may use up or fill the held item, so
+  the sandbox then marks its items unknown and has them resent.
 - With the experimental minecart movement, a minecart turns its rider only while the client's "rotate with minecart"
   option is on, which the server never learns. Placing a block or swinging at what the crosshair points at in such a
   minecart depends on the rotation the client had.
@@ -406,17 +456,17 @@ Known limits:
 
 The runs of this build with the real 26.2 client are listed in "The 26.2 build". The rest of this section, like the
 in-game results in the sections after it, comes from the 26.3 build with the 26.3 client, over the same courses and
-tests. With a real 26.3 client on Paper 26.3, every tick of the following produced `MATCHED` with an offset of exactly 0:
-walking, jumping, sneaking, sprinting and sprint jumping, stairs up and down, sinking, swimming and leaving water, a
-50 block fall into water, speed and jump boost effects, knockback from damage, a TNT explosion and a wind charge, teleports,
-creative flight, gliding with an elytra and boosting with fireworks, cows and another player pushing the player,
-walking into a boat and stepping onto it, a team whose collision rule stops those pushes, eating, blocking with a
-shield and drawing a bow while walking, placing a block and walking into it, breaking blocks, and a sprint hit on a
+tests. With a real 26.3 client on Paper 26.3, every tick of the following produced `MATCHED` with an offset of exactly
+0: walking, jumping, sneaking, sprinting and sprint jumping, stairs up and down, sinking, swimming and leaving water, a
+50 block fall into water, speed and jump boost effects, knockback from damage, a TNT explosion and a wind charge,
+teleports, creative flight, gliding with an elytra and boosting with fireworks, cows and another player pushing the
+player, walking into a boat and stepping onto it, a team whose collision rule stops those pushes, eating, blocking with
+a shield and drawing a bow while walking, placing a block and walking into it, breaking blocks, and a sprint hit on a
 boat and on another player. Riding matched as well, the vehicle included: steering a boat on water through turns and
 leaving it, a horse walking, sprinting and making a charged jump, a camel walking and dashing, a pig steered with a
 carrot on a stick and boosted, a strider on lava, a happy ghast flying up, forward and down, a nautilus swimming and
-dashing, a minecart on powered rails, and a panicking pig the server moved, which the player took over with a hotbar
-key and handed back the same way.
+dashing, a minecart on powered rails, and a panicking pig the server moved, which the player took over with a hotbar key
+and handed back the same way.
 
 Pistons matched too: a piston pushing the player sideways, into a wall, and back while the player walked towards it,
 lifting the block the player stood on, pushing the jumping player down, and lifting the player against a ceiling,
@@ -731,31 +781,31 @@ of the tick's packets, so it applies also while the sandbox's items differ from 
 
 Leaving the swing out makes no attack stronger: `Player.attack` starts the attack strength over itself
 (`Player.onAttack`), and the server's `handleAnimate` does nothing with it. What it hides is the swing: the other
-players do not see the player attack or break, and plugins that listen for `PlayerArmSwingEvent` do not hear of it.
-The server swings the arm for a stab itself (`PiercingWeapon.attack`), so a stab without the swing hides nothing, but
-no vanilla client sends one. The ticks between the start and the finish of a break send the swing alone, and those swings are what tells the
-simulation the breaking progress (see "Blocks and items"): a client that leaves them out finishes before the progress
-it showed, which fails `FastBreak` as well. A click that meets nothing sends the swing alone, too. A client that leaves
-that one out sends nothing at all, which no check on the server can see.
+players do not see the player attack or break, and plugins that listen for `PlayerArmSwingEvent` do not hear of it. The
+server swings the arm for a stab itself (`PiercingWeapon.attack`), so a stab without the swing hides nothing, but no
+vanilla client sends one. The ticks between the start and the finish of a break send the swing alone, and those swings
+are what tells the simulation the breaking progress (see "Blocks and items"): a client that leaves them out finishes
+before the progress it showed, which fails `FastBreak` as well. A click that meets nothing sends the swing alone, too. A
+client that leaves that one out sends nothing at all, which no check on the server can see.
 
-In game, a proxy between the 26.3 client and the server dropped the client's swings for a while, as a NoSwing cheat
-does, while the player attacked a cow without AI, mined stone with a diamond pickaxe, held the attack button on bedrock
-and broke a slime block, which breaks at once; the proxy also sent an attack on an entity id nobody had, without a
-swing. Nine actions failed `NoSwing`, each in its own tick: the attack; the starts of breaking the stone, the bedrock,
-the slime block and the floor behind it, which the crosshair met through the slime block the client had just broken
-while the button was still down; the two finishes of the stone, which failed `FastBreak` as well; the turn to another
-face of the stone, which `continueDestroyBlock` sends in the first tick it goes on breaking a block after a finish, as
-the client did once the stone came back; and the attack on the unknown entity. None of them reached the server: the cow
-kept its health, the stone and the slime block stayed, and `/clauac status` counted 9 actions kept from the server and 6
-block predictions taken back. With the swings, before and after, every tick matched and the server applied what the
-client did. An alert reads:
+In game, a proxy between the 26.2 client and the server dropped the client's swing packets for a while (42 of them), as
+a NoSwing cheat does, while the player attacked a cow without AI, mined stone with a diamond pickaxe, held the attack
+button on bedrock and broke a slime block, which breaks at once; the proxy also sent an attack on an entity id nobody
+had, without a swing. Eight actions failed `NoSwing`, each in its own tick: the attack; the starts of breaking the
+stone, the bedrock, the slime block and the floor behind it, which the crosshair met through the slime block the client
+had just broken while the button was still down; the two finishes of the stone, which failed `FastBreak` as well; and
+the attack on the unknown entity. With the 26.3 client the same test failed a ninth action, the turn to another face
+that client sends once it goes on breaking a block after a finish; the 26.2 client sends no such turn (see "What the
+26.2 client does differently"). None of them reached the server: the cow kept its health, the stone and the slime block
+stayed, and `/clauac status` counted 8 actions kept from the server and 6 block predictions taken back. With the swings,
+before and after, every tick matched and the server applied what the client did. An alert reads:
 
-    [ClauAC] Tester failed NoSwing x1 attacked minecraft:cow (entity 375) without the swing a vanilla client sends right after it
+    [ClauAC] Tester failed NoSwing x1 attacked minecraft:cow (entity 7525) without the swing a vanilla client sends right after it
 
-The combat and block tests now send the swing a vanilla client sends after each attack and block action they inject,
-and each of their steps failed exactly the checks it failed before; course 6 sends its attack on an unknown entity with
-that swing as well. With the check, the thirteen courses matched in all of their 19 719 simulated ticks, and the tests
-of `Timer`, the tick budget, alerts and setbacks, held and late, passed as before.
+The combat and block tests send the swing a vanilla client sends after each attack, block action and stab they
+inject, and each of their steps failed exactly the checks it failed with the 26.3 client; course 6 sends its attack on
+an unknown entity with that swing as well. The courses and the other tests are listed in "Verified with the 26.2
+client".
 
 ### Setbacks
 
@@ -782,15 +832,17 @@ failed from the server instead (see "Attacks and interactions", "Blocks and item
   involved at all: it never saw the movement that was thrown away.
 - A tick that fails after the client has taken the correction gets a setback of its own, since the simulation went
   on from where the correction put the player. A tick the client played before it took the correction needs none; the
-  correction puts the client back anyway.
+  correction puts the client back anyway. Neither does a tick that ended before a teleport of the server went out,
+  the server's own or one of the setbacks below: the client played it before it could take that teleport, which puts
+  it somewhere anyway, while the simulation began the tick where the tick before had left the player.
 - When the simulation falls behind, the packets go on unjudged once the oldest has waited `setbacks.maximum-hold-millis`
   (a second by default), or once more than 2048 packets or 4 MiB are held. The packets of a connection that started
   while the vanilla runtime was starting are never held, since the simulation does not see all of them. The server
   then applies movement that may turn out to fail. Such a setback teleports the player back to where the failed tick
   began, on the server (`Player#teleport`, cause `UNKNOWN`), unless the server put the player somewhere itself after
-  that tick began (a teleport or a respawn), which the setback would undo. A plugin can cancel that teleport; the log
-  says so then. Vehicle movement that reached the server this way stays: the vehicle is only put back where the server
-  has it.
+  that tick began (a teleport or a respawn), which the setback would undo, or such a setback of an earlier tick
+  teleported the player back after this tick ended (see above). A plugin can cancel that teleport; the log says so
+  then. Vehicle movement that reached the server this way stays: the vehicle is only put back where the server has it.
 - A dead or sleeping player is not set back, and neither is a rider that did not steer its vehicle, whose position the
   server decides.
 
@@ -869,14 +921,15 @@ the `config.yml` of an earlier version keeps working. The alerts go out through 
 
 ### For other plugins: `ClauACFlagEvent`
 
-ClauAC calls `io.github.hellotta.clauac.api.ClauACFlagEvent` once for every check a tick failed, before it responds to
-it. The event holds the player, the check (`io.github.hellotta.clauac.simulation.api.Check`), the detail and the
-client tick; cancelling it keeps ClauAC from responding to that flag: it does not alert, and it sets the player back
-or keeps the failed action from the server only when another flag of the same tick that nobody cancelled asks for
-it. The event is asynchronous: the simulation
-thread that finished the tick calls it as soon as the result is known, with ClauAC's plugin class loader as the
-thread's context class loader. A listener therefore has to be quick and must hand anything that touches the world or
-the player's state to the server thread. A plugin that listens for it depends on ClauAC in its `plugin.yml`
+ClauAC calls `io.github.hellotta.clauac.api.ClauACFlagEvent` once for every flag of a tick, before it responds to it:
+for every check the tick failed, and once more for every other way it failed the same check (two packets no vanilla
+client sends, or a teleport answered with another position and a tick's own movement that differs). The event holds the
+player, the check (`io.github.hellotta.clauac.simulation.api.Check`), the detail and the client tick; cancelling it
+keeps ClauAC from responding to that flag: it does not alert, and it sets the player back or keeps the failed action
+from the server only when another flag of the same tick that nobody cancelled asks for it. The event is asynchronous:
+the simulation thread that finished the tick calls it as soon as the result is known, with ClauAC's plugin class loader
+as the thread's context class loader. A listener therefore has to be quick and must hand anything that touches the world
+or the player's state to the server thread. A plugin that listens for it depends on ClauAC in its `plugin.yml`
 (`depend: [ClauAC]`), so that it loads after ClauAC and sees its classes:
 
 ```java

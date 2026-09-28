@@ -521,14 +521,15 @@ final class PlayConnection implements ClientContext {
     }
 
     // - ClientPacketListener.handleTeleportEntity applies a teleport of the player's removed vehicle to the player and -
-    // - answers it right away with the player's resulting position (see ClientTickPackets.takePositionAnswer) -
-    void takeRemovedVehicleTeleportAnswer() {
+    // - answers it right away with the player's resulting position (see ClientTickPackets.takePositionAnswer); the -
+    // - teleport's relatives are the coordinates it gives relative to the player's own -
+    void takeRemovedVehicleTeleportAnswer(Set<Relative> relatives) {
         ServerboundMovePlayerPacket answer = this.tickPackets.takePositionAnswer();
         if (answer == null) {
             this.tickPackets.notes.add("the client did not answer a teleport of its removed vehicle with its resulting position");
             return;
         }
-        this.verifyPositionAnswer("the teleport of its removed vehicle", answer);
+        this.verifyPositionAnswer("the teleport of its removed vehicle", relatives, answer);
     }
 
     // - ClientPacketListener.handleUpdateTags: the tags first, then the fuel values the client works out from them -
@@ -733,15 +734,20 @@ final class PlayConnection implements ClientContext {
 
     // - The client answers a position packet with its acceptance and right after it with its resulting position -
     // - (ClientPacketListener.handleMovePlayer, see verifyPositionAnswer) -
-    void verifyTeleportAnswer(int teleportId, ServerboundMovePlayerPacket answer) {
-        this.verifyPositionAnswer("teleport " + teleportId, answer);
+    void verifyTeleportAnswer(ClientboundPlayerPositionPacket teleport, ServerboundMovePlayerPacket answer) {
+        this.verifyPositionAnswer("teleport " + teleport.id(), teleport.relatives(), answer);
     }
 
     // - The client answers a packet of the server that put its player somewhere with a movement packet that carries -
     // - the player's resulting position and rotation and reports neither ground nor collision; the answer is no -
-    // - movement of the client's tick. A difference means the sandbox's player was elsewhere before the packet, which -
-    // - matters for relative teleports; the sandbox takes over the client's values -
-    private void verifyPositionAnswer(String answered, ServerboundMovePlayerPacket answer) {
+    // - movement of the client's tick. A coordinate the packet gives relative to the player's own (relatives) differs -
+    // - when the sandbox's player was elsewhere before the packet, and the sandbox takes the client's over. One it -
+    // - sets outright is the packet's on every client (PositionMoveRotation.calculateAbsolute), so an answer that -
+    // - differs in it puts the player where the vanilla client is not, which fails Simulation like any other such -
+    // - position, and the coordinate stays the packet's: the client's next tick starts there, and a setback of that -
+    // - tick on the server goes back there. Otherwise the client could carry a position of its choosing past a -
+    // - setback's correction -
+    private void verifyPositionAnswer(String answered, Set<Relative> relatives, ServerboundMovePlayerPacket answer) {
         if (!(answer instanceof ServerboundMovePlayerPacket.PosRot) || answer.isOnGround() || answer.horizontalCollision()) {
             this.tickPackets.reject(Check.BAD_PACKETS, "the client answered " + answered + " with a movement packet unlike a vanilla client's");
             return;
@@ -755,19 +761,29 @@ final class PlayConnection implements ClientContext {
         double z = answer.getZ(current.getZ());
         float yRot = answer.getYRot(current.getYRot());
         float xRot = answer.getXRot(current.getXRot());
-        boolean positionDiffers = current.getX() != x || current.getY() != y || current.getZ() != z;
-        if (positionDiffers || current.getYRot() != yRot || current.getXRot() != xRot) {
+        boolean xRelative = relatives.contains(Relative.X);
+        boolean yRelative = relatives.contains(Relative.Y);
+        boolean zRelative = relatives.contains(Relative.Z);
+        boolean xDiffers = current.getX() != x;
+        boolean yDiffers = current.getY() != y;
+        boolean zDiffers = current.getZ() != z;
+        if (xDiffers || yDiffers || zDiffers || current.getYRot() != yRot || current.getXRot() != xRot) {
             // - The rotation is the client's input and may have turned since its last tick; the sandbox takes it over -
-            // - like the tick's own rotation. A position that differs shows the player was elsewhere than the sandbox -
-            // - thought, with a velocity the sandbox cannot know either -
-            if (positionDiffers) {
+            // - like the tick's own rotation. A relative coordinate that differs shows the player was elsewhere than -
+            // - the sandbox thought, with a velocity the sandbox cannot know either -
+            if (!xRelative && xDiffers || !yRelative && yDiffers || !zRelative && zDiffers) {
+                this.tickPackets.reject(Check.SIMULATION, String.format(Locale.ROOT,
+                        "differs in: the position the client answered %s with, %.6f %.6f %.6f, where it puts the player at %.6f %.6f %.6f",
+                        answered, x, y, z, current.getX(), current.getY(), current.getZ()));
+            }
+            if (xRelative && xDiffers || yRelative && yDiffers || zRelative && zDiffers) {
                 this.tickPackets.uncertainties.add("teleport result differed");
             }
             this.tickPackets.notes.add(String.format(
                     "%s: sandbox %.6f %.6f %.6f %.3f %.3f, client %.6f %.6f %.6f %.3f %.3f",
                     answered, current.getX(), current.getY(), current.getZ(), current.getYRot(), current.getXRot(), x, y, z, yRot, xRot
             ));
-            current.setPos(x, y, z);
+            current.setPos(xRelative ? x : current.getX(), yRelative ? y : current.getY(), zRelative ? z : current.getZ());
             current.setYRot(yRot);
             current.setXRot(xRot);
         }

@@ -22,14 +22,20 @@ import org.slf4j.Logger;
 // - A tick whose movement reached the server before the simulation judged it (the simulation fell behind, or the -
 // - connection started before the vanilla runtime) moved the player on the server too; the server itself then -
 // - teleports the player back to where that tick began. Such a teleport would undo one of the server's own that -
-// - came after the tick began, so it is left out then. Vehicle movement that reached the server that way stays: the -
-// - vehicle is only put back where the server has it -
+// - came after the tick began, so it is left out then. It is left out as well for a tick that ended before an -
+// - earlier one of these teleports: the client played that tick before it could take the teleport, which puts it -
+// - back anyway, and the simulation began the tick where the tick before it had left the player, which the -
+// - teleport undid. Vehicle movement that reached the server that way stays: the vehicle is only put back where the -
+// - server has it -
 public final class Setbacks {
 
     private final JavaPlugin plugin;
     private final Logger logger;
     // - When the server last put each player somewhere itself (teleports and respawns), System.nanoTime; server thread -
     private final Map<UUID, Long> repositions = new HashMap<>();
+    // - When ClauAC last teleported each player back on the server (see teleportBack), System.nanoTime taken once the -
+    // - teleport had gone out; server thread -
+    private final Map<UUID, Long> teleportsBack = new HashMap<>();
     // - Set while ClauAC teleports a player, so that its own teleport does not count as one of the server's -
     private boolean teleporting;
 
@@ -93,6 +99,11 @@ public final class Setbacks {
             this.skip(connection, request, name, "the server put it somewhere itself after that tick began");
             return;
         }
+        Long teleportedBack = this.teleportsBack.get(player.getUniqueId());
+        if (teleportedBack != null && teleportedBack - request.endArrivalNanos() > 0L) {
+            this.skip(connection, request, name, "an earlier setback teleported it back after that tick ended");
+            return;
+        }
         Location target = new Location(player.getWorld(), start.x(), start.y(), start.z(), player.getYaw(), player.getPitch());
         boolean teleported;
         this.teleporting = true;
@@ -107,6 +118,7 @@ public final class Setbacks {
             connection.setbackSkipped(request.generation());
             return;
         }
+        this.teleportsBack.put(player.getUniqueId(), System.nanoTime());
         this.logger.info("Setting {} back after client tick {} ({}): the server teleported it back to {}, since the tick's movement had reached the server",
                 name, request.clientTick(), request.checks(), describe(target));
         connection.setbackTeleported(request.generation());
@@ -142,5 +154,6 @@ public final class Setbacks {
 
     public void onQuit(UUID player) {
         this.repositions.remove(player);
+        this.teleportsBack.remove(player);
     }
 }

@@ -51,7 +51,7 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
 - **Display:** Xvfb with Mesa's software renderer (llvmpipe). The 26.2 client runs its OpenGL backend there. The 26.3
   client fails to create its OpenGL backend on Xvfb ("Couldn't find matching GLX visual") and falls back to Vulkan,
   so `mesa-vulkan-drivers` must be installed for it. On a 4-core container the 26.3 client rendered about 10 distinct
-  frames per second.
+  frames per second, the 26.2 client about 5.6 (0.18 s apart on average, up to 0.27 s).
 - **Joining the dev server:** launch the client with an offline identity and set `online-mode=false` in
   `run/server.properties`. The `server.properties` Paper 26.3 generated here had `white-list=true`, the one Paper 26.2
   generated `white-list=false`; add the test player with `whitelist add <name>` so that it joins either way.
@@ -68,6 +68,13 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
   `drowning_damage` off on the test world. Phantoms come for a player that has gone more than 72000 ticks without
   sleeping whenever the sky is dark enough (`PhantomSpawner`), which a thunderstorm makes it even at a stopped noon, and
   they killed an idle test player: turn `spawn_phantoms` off, clear the weather and turn `advance_weather` off.
+- **The nether:** resistance 255 takes the damage of an attack away, not its knockback: a piglin that attacked an idle
+  test player twice right beside the portal it had arrived through pushed it out of that portal. In a peaceful level no
+  mob takes a player for its target (`LivingEntity.canAttack`); piglins stay in a peaceful level, most other monsters
+  leave it (`EntityType.isAllowedInPeaceful`). Paper keeps a difficulty for every level, which the `difficulty` command
+  reads and sets for the level it runs in: `execute in minecraft:the_nether run difficulty peaceful` makes the nether
+  peaceful alone. Chunks that load in a peaceful level drop the monsters stored in them that do not stay there, and the
+  server logs a warning `Skipping Entity with id <type>` for each (`EntityType.canSpawn`).
 - **Console commands:** `~ ~ ~` in a console command means the console's position (the world spawn); run relative
   commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`.
 - **Aiming the test player:** `tp ... facing` and `rotate ... facing` turn the player from the command source's anchor,
@@ -76,6 +83,11 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
   player without taking it off its vehicle.
 - **Key presses:** `xdotool key` releases the key within the same client tick, which the client's per-tick key polling
   can miss (a double tap of jump to fly never registers). Hold keys with `keydown`, `sleep 0.1`, `keyup`.
+- **Hotbar keys:** the client takes in keys once a frame and handles the number keys that came since in the order of
+  their slots, not of the presses (`Minecraft.handleKeybinds`): two number keys pressed within one frame select the
+  higher slot. It reports the slot at the start of the next tick (`MultiPlayerGameMode.tick` runs before
+  `handleKeybinds`) or with the first action that needs it, so an action a proxy injects right after a number key goes
+  out with the slot before. Wait a second after a number key before anything that depends on it.
 - **Typing into the chat:** the chat key opens the chat only in the client's next tick, and the keys typed until then
   act as key bindings. Right after a 26.2 client joined, a press of the chat key opened nothing: the command typed
   after it never reached the server, and its `l` opened the advancements. Commands typed right after a 26.3 client
@@ -106,9 +118,16 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
 - **config.yml of the dev server:** `saveDefaultConfig` never overwrites `run/plugins/ClauAC/config.yml`, so after a
   new setting was added the file lacks it and the setting takes its default. Delete the file before starting the
   server to get the current one with its comments.
-- **Testing setbacks:** a proxy that changes the positions in the client's movement packets imitates a movement
-  cheat without a cheat client; the server's own position of the player can be sampled with
-  `data get entity <name> Pos` on the console meanwhile. Two findings from that: the client answers a vehicle
-  correction (`ClientboundMoveVehiclePacket`) with a vehicle move packet right away, before the pong behind it; and
-  since the simulation continues from what a failed tick reported, a tick that fails after the client took a
-  correction needs a setback of its own, or the ticks after it match and their movement reaches the server.
+- **Testing setbacks:** a proxy that changes the positions in the client's movement packets imitates a movement cheat
+  without a cheat client; the server's own position of the player can be sampled with `data get entity <name> Pos` on
+  the console meanwhile. Findings from that: the client answers a vehicle correction (`ClientboundMoveVehiclePacket`)
+  with a vehicle move packet right away, before the pong behind it; since the simulation continues from what a failed
+  tick reported, a tick that fails after the client took a correction needs a setback of its own, or the ticks after it
+  match and their movement reaches the server; and the 26.2 client answers a teleport with its acceptance and its
+  resulting position in a movement packet right after it, which such a proxy shifts as well (26.3 puts the position into
+  the acceptance). With `setbacks.maximum-hold-millis` at 1, shifted answers reach the server unjudged and keep the
+  player floating over the floor, and the server kicks it after 80 ticks (`ServerGamePacketListenerImpl.tick`).
+- **Pipelines under `pipefail`:** `producer | grep -q` fails whenever grep stops reading before the producer has written
+  everything, since the producer then dies of SIGPIPE. A check of the client's command line
+  (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input
+  whole first, e.g. `grep -q -- "$pattern" <<< "$(tr '\0' '\n' < /proc/<pid>/cmdline)"`.

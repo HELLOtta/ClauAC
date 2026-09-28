@@ -309,19 +309,20 @@ public final class ClientSession implements PlayerSimulation {
     }
 
     // - Applies everything the client provably processed, up to and including the answered packet, which also tells -
-    // - the client's clock how far the client has come. Returns false when no pending packet is the answered one -
-    private boolean applyThrough(Predicate<Packet<?>> answeredPacket, String answer) {
+    // - the client's clock how far the client has come. Returns the answered packet, null when no pending packet is -
+    // - the answered one -
+    private @Nullable Packet<?> applyThrough(Predicate<Packet<?>> answeredPacket, String answer) {
         List<PendingClientbound.PendingPacket> released = this.pending.takeThrough(answeredPacket);
         if (released.isEmpty()) {
             // - Every packet a client can answer reaches the sandbox, so a vanilla client never does this -
             this.reject(Check.BAD_PACKETS, "the client sent " + answer + " for a packet the server never sent");
-            return false;
+            return null;
         }
         this.clientClock.reached(released.getLast().sentAt());
         for (PendingClientbound.PendingPacket packet : released) {
             this.apply(packet);
         }
-        return true;
+        return released.getLast().packet();
     }
 
     private void apply(PendingClientbound.PendingPacket released) {
@@ -401,8 +402,9 @@ public final class ClientSession implements PlayerSimulation {
         if (acceptance != null) {
             this.teleportAcceptance = null;
             if (packet instanceof ServerboundMovePlayerPacket answer) {
-                if (acceptance.answeredServer()) {
-                    this.requirePlay().verifyTeleportAnswer(acceptance.teleportId(), answer);
+                ClientboundPlayerPositionPacket teleport = acceptance.teleport();
+                if (teleport != null) {
+                    this.requirePlay().verifyTeleportAnswer(teleport, answer);
                 }
                 return;
             }
@@ -414,9 +416,10 @@ public final class ClientSession implements PlayerSimulation {
             case ServerboundPongPacket pong ->
                     this.applyThrough(pending -> pending instanceof ClientboundPingPacket ping && ping.getId() == pong.getId(), "pong " + pong.getId());
             case ServerboundAcceptTeleportationPacket accept -> {
-                boolean answeredServer = this.applyThrough(pending -> pending instanceof ClientboundPlayerPositionPacket position
+                Packet<?> answered = this.applyThrough(pending -> pending instanceof ClientboundPlayerPositionPacket position
                         && position.id() == accept.getId(), "teleport acceptance " + accept.getId());
-                this.teleportAcceptance = new TeleportAcceptance(accept.getId(), answeredServer);
+                this.teleportAcceptance = new TeleportAcceptance(
+                        accept.getId(), answered instanceof ClientboundPlayerPositionPacket teleport ? teleport : null);
             }
             case ServerboundConfigurationAcknowledgedPacket ignored -> {
                 this.applyThrough(pending -> pending instanceof ClientboundStartConfigurationPacket, "configuration acknowledgement");
@@ -541,9 +544,9 @@ public final class ClientSession implements PlayerSimulation {
         );
     }
 
-    // - An acceptance of a teleport waiting for the resulting position that follows it: the teleport's id, and -
-    // - whether it answered a teleport of the server -
-    private record TeleportAcceptance(int teleportId, boolean answeredServer) {
+    // - An acceptance of a teleport waiting for the resulting position that follows it: the teleport's id, and the -
+    // - server's teleport it answered, null when the server never sent one with that id -
+    private record TeleportAcceptance(int teleportId, @Nullable ClientboundPlayerPositionPacket teleport) {
     }
 
     // - Why the simulation stopped when it fell behind. The message tells everything, a stack trace would not; a -

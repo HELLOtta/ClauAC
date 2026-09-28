@@ -159,6 +159,10 @@ final class ConnectionSimulation {
     // - The latest tick that failed after the client had taken the correction; its setback follows once the current -
     // - one is over, since the simulation continued from what that tick reported -
     private @Nullable FailedTick failedAfterCorrection;
+    // - Where the server's latest teleport of the player went out among the serverbound packets -
+    // - (TickEnd.serverboundPackets): the client played every tick that ended before it without that teleport, which -
+    // - puts it somewhere anyway -
+    private long serverTeleportAt = -1L;
     // - Written on the event loop only; volatile for /clauac status -
     private volatile long setbacksRequested;
     private volatile long positionCorrections;
@@ -280,6 +284,10 @@ final class ConnectionSimulation {
             }
             if (handedOver) {
                 this.handOver(phase, direction, packetId, ByteBufHelper.copyBytes(buffer));
+            }
+            if (clientboundPlay && type == PacketType.Play.Server.PLAYER_POSITION_AND_LOOK) {
+                // - The connection's own corrections are sent silently and never come here -
+                this.serverTeleportAt = this.hold.handedOver();
             }
             if (held) {
                 this.hold.onServerbound(type, buffer, System.nanoTime(), this.responses.settings().maximumHoldNanos());
@@ -521,8 +529,11 @@ final class ConnectionSimulation {
     // - set back and without the actions that failed a check. A tick that fails while a setback is under way needs -
     // - no setback of its own when the client had not taken the correction yet before the tick: the correction on -
     // - its way puts the client back anyway. After the correction, the simulation went on from where the correction -
-    // - put the player, so such a tick needs its own setback, which follows the current one. Actions that went on -
-    // - unjudged already reached the server, which answers them itself -
+    // - put the player, so such a tick needs its own setback, which follows the current one. Neither needs a tick -
+    // - that ended before a teleport of the server went out, such as that of a setback whose tick's movement had -
+    // - reached the server: that teleport puts the client somewhere anyway, while the simulation began the tick where -
+    // - the tick before had left the player. Actions that went on unjudged already reached the server, which answers -
+    // - them itself -
     private void judge(ClientTickReport report, TickEnd end, TickResponse response) {
         boolean late = this.hold.wentOnUnjudged();
         if (!response.refusedActions().isEmpty()) {
@@ -530,7 +541,10 @@ final class ConnectionSimulation {
         }
         if (response.setBack()) {
             this.hold.dropMovementThrough(end.serverboundPackets());
-            if (this.setbackPhase == SetbackPhase.NONE) {
+            if (end.serverboundPackets() <= this.serverTeleportAt) {
+                this.logger.info("Not setting {} back after client tick {} ({}): the tick ended before a teleport of the server went out",
+                        this.user.getName(), report.clientTick(), describeChecks(report));
+            } else if (this.setbackPhase == SetbackPhase.NONE) {
                 this.startSetback(report, end, late);
             } else if (this.correctionAnsweredAt >= 0L && end.serverboundPackets() > this.correctionAnsweredAt) {
                 this.failedAfterCorrection = new FailedTick(report, end, late);
@@ -574,11 +588,16 @@ final class ConnectionSimulation {
         this.failedAfterCorrection = null;
         this.setbacksRequested++;
         this.hold.setDroppingMovement(true);
-        String checks = report.flags().stream().map(Flag::check).distinct().map(check -> check.displayName()).collect(Collectors.joining(", "));
-        SetbackRequest request = new SetbackRequest(generation, report.clientTick(), checks, report.vehicle() != null, report.start(), end.arrivalNanos(), late);
+        SetbackRequest request = new SetbackRequest(
+                generation, report.clientTick(), describeChecks(report), report.vehicle() != null, report.start(), end.arrivalNanos(), late);
         if (!this.setbacks.request(this, request)) {
             this.setbackSkipped(generation);
         }
+    }
+
+    // - The checks a tick failed, for the log -
+    private static String describeChecks(ClientTickReport report) {
+        return report.flags().stream().map(Flag::check).distinct().map(check -> check.displayName()).collect(Collectors.joining(", "));
     }
 
     // - From the server thread: teleports the client to where the server has the player, with this velocity and its -

@@ -153,7 +153,7 @@ final class EntityHandlers {
             if (removedVehicle.isPresent() && removedVehicle.getAsInt() == packet.id()) {
                 LOGGER.debug("Trying to teleport entity with id {}, that was formerly player vehicle, applying teleport to player instead", packet.id());
                 setValuesFromPositionPacket(packet.change(), packet.relatives(), player, false);
-                this.connection.takeRemovedVehicleTeleportAnswer();
+                this.connection.takeRemovedVehicleTeleportAnswer(packet.relatives());
             }
         } else {
             boolean hasRelative = packet.relatives().contains(Relative.X) || packet.relatives().contains(Relative.Y) || packet.relatives().contains(Relative.Z);
