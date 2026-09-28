@@ -412,14 +412,18 @@ courses matched again in all of their 19 802 simulated ticks, and in all 19 841 
 the player on foot ran a second time from its snapshot (`clauac.verifyRepeatedTicks=true`) and ended the same.
 
 Menu clicks matched the client's hashes in chests, the player's inventory (crafting included), furnaces, stonecutters,
-anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging.
-A switch from the creative inventory screen straight to survival made the client click in a menu the sandbox did not
-have; the next click showed the difference and the inventory resend brought both back in line. Switching the hotbar
-slot while eating matched through the alternative that the switch stopped the item use a tick before the client
-reported it, which the next tick confirmed; a sprint attack right after a hotbar switch matched through the attack
-strength that switch left, and an attack on an entity id the sandbox did not know, injected into the connection,
-matched without slowing the player down; such an attack fails `Hitbox` now (see "Disablers"). While the player was
-dead the sandbox, like the client, did not move it (`NOT_SIMULATED`), and matching resumed after the respawn.
+anvils (renaming included), villager trades and horse inventories, including shift clicks, number keys and dragging. A
+switch from the creative inventory screen straight to survival made the client click in a menu the sandbox did not have;
+the next click showed the difference and the inventory resend brought both back in line. The creative inventory keeps
+what it picks up on the client's cursor alone, and that screen turns into the survival inventory with the cursor still
+full: in two runs, such a stack put down by a click in the survival inventory left the sandbox's items differing from
+the client's for three and two ticks, which ClauAC checks as ever since the fix of the disablers (see "Disablers");
+these ticks and the walking and jumping after them matched. Switching the hotbar slot while eating matched through the
+alternative that the switch stopped the item use a tick before the client reported it, which the next tick confirmed; a
+sprint attack right after a hotbar switch matched through the attack strength that switch left, and an attack on an
+entity id the sandbox did not know, injected into the connection, matched without slowing the player down; such an
+attack fails `Hitbox` now (see "Disablers"). While the player was dead the sandbox, like the client, did not move it
+(`NOT_SIMULATED`), and matching resumed after the respawn.
 
 At a server tick rate of 40 (`tick rate 40`), the client still ends 20 ticks a second (`Minecraft.getTickTargetMillis`)
 but moves the living entities it shows twice as fast towards the positions the server sends them
@@ -457,6 +461,18 @@ all of its 727. Over the five connections above, the courses and the block and c
 a direct connection, ClauAC refused every cheat of the combat and block tests, and the tests of `NoSwing`, `Timer`, the
 tick budget, alerts and setbacks, held and late, passed as before; while positions were shifted, the server's position
 of the player did not change in either setback test, and all 67 shifted answers of the held one failed `Simulation`.
+
+The final runs with the fix of the disablers (see "Disablers"), in which course 6 no longer sends an attack on an
+unknown entity, matched as well. The thirteen courses matched in all of their 19 795 simulated ticks and in all 19 636
+of another run in which every tick of the player on foot ran a second time from its snapshot and ended the same, and
+the test of the tick rates matched in all of its 725. Over the five connections above, the courses and the block and
+combat tests matched in all of their 36 427 simulated ticks but the 47 with the cheats of those tests, which ClauAC
+refused as over a direct connection. Over a direct connection, ClauAC refused every cheat of the combat, block and
+`NoSwing` tests, and the tests of `Timer`, the tick budget, alerts and setbacks, held and late, passed as before; the
+server's position of the player did not change in either setback test, and all 66 shifted answers of the held one
+failed `Simulation`. In the test of the disablers none of the 1114 ticks of its connection was `UNVERIFIED`: 261 of its
+movement packets and 131 of its actions were kept from the server, and the server's position of the player stayed
+where it was.
 
 ## Responses
 
@@ -713,7 +729,8 @@ face of the stone, which `continueDestroyBlock` sends in the first tick it goes 
 the client did once the stone came back; and the attack on the unknown entity. None of them reached the server: the cow
 kept its health, the stone and the slime block stayed, and `/clauac status` counted 9 actions kept from the server and 6
 block predictions taken back. With the swings, before and after, every tick matched and the server applied what the
-client did. An alert reads:
+client did. Since the fix of the disablers, the attack on the unknown entity fails `Hitbox` as well (see "Disablers").
+An alert reads:
 
     [ClauAC] Tester failed NoSwing x1 attacked minecraft:cow (entity 375) without the swing a vanilla client sends right after it
 
