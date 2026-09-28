@@ -38,8 +38,8 @@ public final class ReceivedRegistries {
             if (Arrays.equals(this.lastPlayTagUpdate, digest)) {
                 return;
             }
-            List<Registry.PendingTags<?>> pendingTags = new ArrayList<>(packet.tags().size());
-            packet.tags().forEach((registryKey, payload) -> pendingTags.add(this.prepareTags(registryKey, payload)));
+            List<Registry.PendingTags<?>> pendingTags = new ArrayList<>(packet.getTags().size());
+            packet.getTags().forEach((registryKey, payload) -> pendingTags.add(this.prepareTags(registryKey, payload)));
             pendingTags.forEach(Registry.PendingTags::apply);
             this.lastPlayTagUpdate = digest;
         }

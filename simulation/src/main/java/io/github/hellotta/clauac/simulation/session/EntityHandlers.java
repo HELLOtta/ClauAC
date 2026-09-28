@@ -7,7 +7,6 @@ import io.github.hellotta.clauac.simulation.player.SandboxRemotePlayer;
 import io.github.hellotta.clauac.simulation.world.SandboxLevel;
 import java.util.OptionalInt;
 import java.util.Set;
-import net.minecraft.core.PositionAndRotation;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundAnimatePacket;
 import net.minecraft.network.protocol.game.ClientboundDamageEventPacket;
@@ -26,24 +25,22 @@ import net.minecraft.network.protocol.game.ClientboundSetEntityLinkPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEquipmentPacket;
 import net.minecraft.network.protocol.game.ClientboundSetPassengersPacket;
-import net.minecraft.network.protocol.game.ClientboundSwingAnimationPacket;
 import net.minecraft.network.protocol.game.ClientboundTakeItemEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundTeleportEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateAttributesPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateMobEffectPacket;
 import net.minecraft.network.protocol.game.ServerboundMoveVehiclePacket;
 import net.minecraft.network.protocol.game.VecDeltaCodec;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
-import net.minecraft.world.entity.EntitySpawnRequest;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.entity.ExperienceOrb;
 import net.minecraft.world.entity.Leashable;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.PositionMoveRotation;
-import net.minecraft.world.entity.PositionPath;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.AttributeMap;
@@ -66,15 +63,11 @@ import org.slf4j.Logger;
 final class EntityHandlers {
 
     private static final Logger LOGGER = LogUtils.getLogger();
-    // - ClientPacketListener.ENTITY_SPAWN_REQUEST -
-    private static final EntitySpawnRequest ENTITY_SPAWN_REQUEST = new EntitySpawnRequest(EntitySpawnReason.LOAD, true);
     // - Entity events the client consumes itself for sounds, particles or the totem animation, without passing -
     // - them on to the entity -
     private static final byte GUARDIAN_ATTACK_SOUND = 21;
     private static final byte TOTEM_OF_UNDYING = 35;
     private static final byte SNIFFER_DIGGING_SOUND = 63;
-    // - ClientboundAnimatePacket actions -
-    private static final int WAKE_UP = 0;
 
     private final PlayConnection connection;
 
@@ -107,7 +100,9 @@ final class EntityHandlers {
             }
             return new SandboxRemotePlayer(level, playerInfo.getProfile(), this.connection);
         }
-        return type.create(level, ENTITY_SPAWN_REQUEST);
+        // - EntityType.create with a reason leaves out an entity the level cannot spawn (EntityType.canSpawn): one whose -
+        // - features are disabled, or a monster in peaceful difficulty -
+        return type.create(level, EntitySpawnReason.LOAD);
     }
 
     static void handleSetEntityMotion(ClientboundSetEntityMotionPacket packet, SandboxLevel level) {
@@ -127,15 +122,14 @@ final class EntityHandlers {
     static void handleEntityPositionSync(ClientboundEntityPositionSyncPacket packet, SandboxLevel level, SandboxPlayer player) {
         Entity entity = level.getEntity(packet.id());
         if (entity != null) {
-            PositionPath positionPath = packet.position();
-            Vec3 pos = positionPath.endPosition();
+            Vec3 pos = packet.values().position();
             entity.getPositionCodec().setBase(pos);
             if (!entity.isLocalInstanceAuthoritative()) {
-                float yRot = packet.yRot();
-                float xRot = packet.xRot();
+                float yRot = packet.values().yRot();
+                float xRot = packet.values().xRot();
                 boolean tooBigToInterpolate = entity.position().distanceToSqr(pos) > 4096.0;
                 if (level.isTickingEntity(entity) && !tooBigToInterpolate) {
-                    entity.moveOrInterpolateTo(positionPath, yRot, xRot);
+                    entity.moveOrInterpolateTo(pos, yRot, xRot);
                 } else {
                     entity.snapTo(pos, yRot, xRot);
                 }
@@ -151,7 +145,7 @@ final class EntityHandlers {
     }
 
     // - The player's own vehicle can be removed while the server still moves the player with it; the client then -
-    // - applies that vehicle's teleports to the player -
+    // - applies that vehicle's teleports to the player and answers each with the player's resulting position -
     void handleTeleportEntity(ClientboundTeleportEntityPacket packet, SandboxLevel level, SandboxPlayer player) {
         Entity entity = level.getEntity(packet.id());
         if (entity == null) {
@@ -159,6 +153,7 @@ final class EntityHandlers {
             if (removedVehicle.isPresent() && removedVehicle.getAsInt() == packet.id()) {
                 LOGGER.debug("Trying to teleport entity with id {}, that was formerly player vehicle, applying teleport to player instead", packet.id());
                 setValuesFromPositionPacket(packet.change(), packet.relatives(), player, false);
+                this.connection.takeRemovedVehicleTeleportAnswer();
             }
         } else {
             boolean hasRelative = packet.relatives().contains(Relative.X) || packet.relatives().contains(Relative.Y) || packet.relatives().contains(Relative.Z);
@@ -198,16 +193,14 @@ final class EntityHandlers {
         Entity entity = packet.getEntity(level);
         if (entity != null) {
             if (entity.isLocalInstanceAuthoritative()) {
-                if (packet.hasPosition()) {
-                    VecDeltaCodec positionCodec = entity.getPositionCodec();
-                    PositionPath pos = packet.getPositionDelta().decode(positionCodec);
-                    positionCodec.setBase(pos.endPosition());
-                }
+                VecDeltaCodec positionCodec = entity.getPositionCodec();
+                Vec3 pos = positionCodec.decode(packet.getXa(), packet.getYa(), packet.getZa());
+                positionCodec.setBase(pos);
             } else {
                 if (packet.hasPosition()) {
                     VecDeltaCodec positionCodec = entity.getPositionCodec();
-                    PositionPath pos = packet.getPositionDelta().decode(positionCodec);
-                    positionCodec.setBase(pos.endPosition());
+                    Vec3 pos = positionCodec.decode(packet.getXa(), packet.getYa(), packet.getZa());
+                    positionCodec.setBase(pos);
                     if (packet.hasRotation()) {
                         entity.moveOrInterpolateTo(pos, packet.getYRot(), packet.getXRot());
                     } else {
@@ -236,7 +229,7 @@ final class EntityHandlers {
     }
 
     void handleRemoveEntities(ClientboundRemoveEntitiesPacket packet, SandboxLevel level, SandboxPlayer player) {
-        packet.entityIds().forEach(entityId -> {
+        packet.getEntityIds().forEach(entityId -> {
             Entity entity = level.getEntity(entityId);
             if (entity != null) {
                 if (entity.hasIndirectPassenger(player)) {
@@ -304,18 +297,25 @@ final class EntityHandlers {
         }
     }
 
-    // - Only waking up changes an entity; the other actions spawn particles -
-    static void handleAnimate(ClientboundAnimatePacket packet, SandboxLevel level) {
+    // - Swinging a hand and waking up change an entity; the critical hits spawn particles. Returns the hand the -
+    // - entity swung, null when it swung none -
+    static @Nullable InteractionHand handleAnimate(ClientboundAnimatePacket packet, SandboxLevel level) {
         Entity entity = level.getEntity(packet.getId());
-        if (entity != null && packet.getAction() == WAKE_UP) {
-            ((Player) entity).stopSleepInBed(false, false);
+        if (entity != null) {
+            if (packet.getAction() == ClientboundAnimatePacket.SWING_MAIN_HAND) {
+                LivingEntity mob = (LivingEntity) entity;
+                mob.swing(InteractionHand.MAIN_HAND);
+                return InteractionHand.MAIN_HAND;
+            } else if (packet.getAction() == ClientboundAnimatePacket.SWING_OFF_HAND) {
+                LivingEntity mob = (LivingEntity) entity;
+                mob.swing(InteractionHand.OFF_HAND);
+                return InteractionHand.OFF_HAND;
+            } else if (packet.getAction() == ClientboundAnimatePacket.WAKE_UP) {
+                Player player = (Player) entity;
+                player.stopSleepInBed(false, false);
+            }
         }
-    }
-
-    static void handleSwingAnimation(ClientboundSwingAnimationPacket packet, SandboxLevel level) {
-        if (level.getEntity(packet.entityId()) instanceof LivingEntity livingEntity) {
-            livingEntity.swing(packet.hand(), packet.animation(), false);
-        }
+        return null;
     }
 
     static void handleTakeItemEntity(ClientboundTakeItemEntityPacket packet, SandboxLevel level) {
@@ -397,15 +397,20 @@ final class EntityHandlers {
     static @Nullable ServerboundMoveVehiclePacket handleMoveVehicle(ClientboundMoveVehiclePacket packet, SandboxPlayer player) {
         Entity vehicle = player.getRootVehicle();
         if (vehicle != player && vehicle.isLocalInstanceAuthoritative()) {
-            PositionAndRotation target = packet.movingTo();
-            Vec3 currentTarget = vehicle.getClientPosition();
-            Vec3 targetPos = target.position();
-            if (targetPos.distanceTo(currentTarget) > 1.0E-5F) {
+            Vec3 target = packet.position();
+            Vec3 currentTarget;
+            if (vehicle.isInterpolating()) {
+                currentTarget = vehicle.getInterpolation().position();
+            } else {
+                currentTarget = vehicle.position();
+            }
+
+            if (target.distanceTo(currentTarget) > 1.0E-5F) {
                 if (vehicle.isInterpolating()) {
                     vehicle.getInterpolation().cancel();
                 }
 
-                vehicle.absSnapTo(targetPos.x(), targetPos.y(), targetPos.z(), target.yRot(), target.xRot());
+                vehicle.absSnapTo(target.x(), target.y(), target.z(), packet.yRot(), packet.xRot());
             }
 
             return ServerboundMoveVehiclePacket.fromEntity(vehicle);

@@ -6,11 +6,13 @@ plugins {
     alias(libs.plugins.run.paper)
 }
 
-group = "io.github.hellotta"
-version = "0.1.0-SNAPSHOT"
-description = "Predictive (simulation-based) anticheat for Paper, built on PacketEvents."
-
 val targetMinecraftVersion = libs.versions.minecraft.get()
+
+group = "io.github.hellotta"
+// - This branch builds ClauAC for an earlier Minecraft release than the main one; the version, and with it the jar's -
+// - name and plugin.yml, names that release so that the two builds are never taken for each other -
+version = "0.1.0-SNAPSHOT-mc$targetMinecraftVersion"
+description = "Predictive (simulation-based) anticheat for Paper, built on PacketEvents."
 
 // - Bundled third-party packages are moved under this package, keeping their original name as the suffix -
 // - Named so it cannot be confused with ShadowJar's own relocationPrefix property inside relocateBundled -

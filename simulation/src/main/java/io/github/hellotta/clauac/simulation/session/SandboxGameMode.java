@@ -269,7 +269,7 @@ final class SandboxGameMode {
 
     // - Whether the test holds with any hotbar item other than the one held selected. Selecting a slot only sets the -
     // - inventory's selected slot; the held slot is selected again afterwards -
-    private static boolean anyOtherHotbarItem(SandboxPlayer player, BooleanSupplier test) {
+    static boolean anyOtherHotbarItem(SandboxPlayer player, BooleanSupplier test) {
         Inventory inventory = player.getInventory();
         int selected = inventory.getSelectedSlot();
         ItemStack held = inventory.getItem(selected);
@@ -320,9 +320,10 @@ final class SandboxGameMode {
         }
     }
 
-    // - A swing (ServerboundPunchPacket) that no attack or block packet accompanied. Minecraft.startAttack sends one -
-    // - after every click that started nothing: on nothing (or air) it resets the attack strength ticker, on an -
-    // - entity out of a weapon's attack range or on a block it cannot or need not start breaking it does nothing. -
+    // - A swing of the main hand (ServerboundSwingPacket, which LocalPlayer.swing sends) that no attack, block action, -
+    // - stab, drop or item use accompanied. Minecraft.startAttack sends one after every click that started nothing: -
+    // - on nothing (or air) it resets the attack strength ticker, on an entity out of a weapon's attack range or on a -
+    // - block it cannot or need not start breaking it does nothing. -
     // - Minecraft.continueAttack sends one after continueDestroyBlock went on with the block the crosshair points at, -
     // - once per tick and after everything else the key handling sends, so only a swing that ends the tick's actions -
     // - can be that one (continuesBreaking): it counts down the delay after a break, or adds the tick's share of the -
@@ -391,8 +392,11 @@ final class SandboxGameMode {
         return String.format(Locale.ROOT, "at %.1f%% of its breaking progress", progress * PERCENT);
     }
 
-    void useItemOn(SandboxLevel level, SandboxPlayer player, InteractionHand hand, BlockHitResult blockHit, int sequence, ClientTickPackets packets) {
-        predict(level, sequence, packets, () -> this.performUseItemOn(level, player, hand, blockHit));
+    // - Returns what the use resulted in, which decides whether Minecraft.startUseItem swings the hand -
+    InteractionResult useItemOn(SandboxLevel level, SandboxPlayer player, InteractionHand hand, BlockHitResult blockHit, int sequence, ClientTickPackets packets) {
+        InteractionResult[] result = {InteractionResult.PASS};
+        predict(level, sequence, packets, () -> result[0] = this.performUseItemOn(level, player, hand, blockHit));
+        return result[0];
     }
 
     private InteractionResult performUseItemOn(SandboxLevel level, SandboxPlayer player, InteractionHand hand, BlockHitResult blockHit) {
@@ -425,31 +429,28 @@ final class SandboxGameMode {
 
         if (!itemStack.isEmpty() && !player.getCooldowns().isOnCooldown(itemStack)) {
             UseOnContext context = new UseOnContext(player, hand, blockHit);
-            InteractionResult result;
+            InteractionResult success;
             if (player.hasInfiniteMaterials()) {
                 int count = itemStack.getCount();
-                result = itemStack.useOn(context);
+                success = itemStack.useOn(context);
                 itemStack.setCount(count);
             } else {
-                result = itemStack.useOn(context);
-                if (result instanceof InteractionResult.Success success) {
-                    ItemStack resultItemStack = Objects.requireNonNullElseGet(success.heldItemTransformedTo(), () -> player.getItemInHand(hand));
-                    if (resultItemStack != itemStack) {
-                        player.setItemInHand(hand, resultItemStack);
-                    }
-                }
+                success = itemStack.useOn(context);
             }
 
-            return result;
+            return success;
         }
         return InteractionResult.PASS;
     }
 
-    // - The packet carries the rotation the client used, which the tick's movement packet reports as well -
-    void useItem(SandboxLevel level, SandboxPlayer player, InteractionHand hand, int sequence, ClientTickPackets packets) {
+    // - The packet carries the rotation the client used, which the tick's movement packet reports as well. Returns -
+    // - what the use resulted in, which decides whether Minecraft.startUseItem swings the hand -
+    InteractionResult useItem(SandboxLevel level, SandboxPlayer player, InteractionHand hand, int sequence, ClientTickPackets packets) {
+        InteractionResult[] interactionResult = {InteractionResult.PASS};
         predict(level, sequence, packets, () -> {
             ItemStack itemStack = player.getItemInHand(hand);
             if (player.getCooldowns().isOnCooldown(itemStack)) {
+                interactionResult[0] = InteractionResult.PASS;
                 return;
             }
 
@@ -464,7 +465,10 @@ final class SandboxGameMode {
             if (result != itemStack) {
                 player.setItemInHand(hand, result);
             }
+
+            interactionResult[0] = resultHolder;
         });
+        return interactionResult[0];
     }
 
     void attack(SandboxPlayer player, Entity entity) {
@@ -476,18 +480,14 @@ final class SandboxGameMode {
     // - does not know -
     void finishAttack(SandboxPlayer player) {
         player.resetAttackStrengthTicker();
-        if (player.getAbilities().instabuild) {
-            this.destroyDelay = DESTROY_DELAY_TICKS;
-        }
     }
 
-    void interact(SandboxPlayer player, Entity entity, InteractionHand hand, Vec3 location) {
-        if (this.localPlayerMode != GameType.SPECTATOR) {
-            player.interactOn(entity, hand, location);
-        }
+    // - Returns what the interaction resulted in, which decides whether Minecraft.startUseItem swings the hand -
+    InteractionResult interact(SandboxPlayer player, Entity entity, InteractionHand hand, Vec3 location) {
+        return this.localPlayerMode == GameType.SPECTATOR ? InteractionResult.PASS : player.interactOn(entity, hand, location);
     }
 
-    // - MultiPlayerGameMode.piercingAttack; the swing and the sound only show something -
+    // - MultiPlayerGameMode.piercingAttack; the sound only plays something. Minecraft.startAttack swings right after it -
     void piercingAttack(SandboxPlayer player) {
         player.onAttack();
         player.postPiercingAttack();
@@ -497,8 +497,10 @@ final class SandboxGameMode {
         player.releaseUsingItem();
     }
 
-    void dropItem(SandboxPlayer player, boolean all) {
-        player.getInventory().removeFromSelected(all);
+    // - LocalPlayer.drop: the client predicts the removal from the selected slot; returns whether it removed -
+    // - anything, after which Minecraft.handleKeybinds swings the main hand -
+    boolean dropItem(SandboxPlayer player, boolean all) {
+        return !player.getInventory().removeFromSelected(all).isEmpty();
     }
 
     // - MultiPlayerGameMode.handleContainerInput: the client clicks in its menu and sends the slots that changed as -

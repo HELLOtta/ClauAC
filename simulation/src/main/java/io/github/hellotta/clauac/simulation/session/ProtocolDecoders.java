@@ -30,11 +30,6 @@ final class ProtocolDecoders {
             public boolean hasInfiniteMaterials() {
                 return true;
             }
-
-            @Override
-            public boolean canUseCommandBlocks() {
-                return true;
-            }
         });
     }
 

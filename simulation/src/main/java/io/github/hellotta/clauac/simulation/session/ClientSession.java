@@ -52,12 +52,12 @@ import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerInputPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerLoadedPacket;
-import net.minecraft.network.protocol.game.ServerboundPunchPacket;
 import net.minecraft.network.protocol.game.ServerboundRenameItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSelectBundleItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSelectTradePacket;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSetCreativeModeSlotPacket;
+import net.minecraft.network.protocol.game.ServerboundSwingPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
 import net.minecraft.world.flag.FeatureFlagSet;
@@ -101,6 +101,9 @@ public final class ClientSession implements PlayerSimulation {
     private long heldTick = -1L;
     private long heldTickNanos;
     private @Nullable TickEnd heldTickEnd;
+    // - The acceptance of a teleport the client sent last, whose resulting position a vanilla client sends right after -
+    // - it (see onServerbound); null when no position is due -
+    private @Nullable TeleportAcceptance teleportAcceptance;
 
     public ClientSession(
             UUID profileId, String profileName, SimulationListener listener, ServerRegistryCache registryCache, Executor simulationThreads, SimulationLimits limits
@@ -391,15 +394,29 @@ public final class ClientSession implements PlayerSimulation {
             return;
         }
 
+        // - ClientPacketListener.handleMovePlayer sends the resulting position right after the acceptance, so nothing -
+        // - else of a vanilla client comes between them. The position answers the teleport and is no movement of the -
+        // - client's tick; after a teleport the server never sent it tells nothing about where the client is -
+        TeleportAcceptance acceptance = this.teleportAcceptance;
+        if (acceptance != null) {
+            this.teleportAcceptance = null;
+            if (packet instanceof ServerboundMovePlayerPacket answer) {
+                if (acceptance.answeredServer()) {
+                    this.requirePlay().verifyTeleportAnswer(acceptance.teleportId(), answer);
+                }
+                return;
+            }
+            this.reject(Check.BAD_PACKETS, "the client did not follow its acceptance of teleport " + acceptance.teleportId()
+                    + " with its resulting position, as a vanilla client does");
+        }
+
         switch (packet) {
             case ServerboundPongPacket pong ->
                     this.applyThrough(pending -> pending instanceof ClientboundPingPacket ping && ping.getId() == pong.getId(), "pong " + pong.getId());
             case ServerboundAcceptTeleportationPacket accept -> {
-                // - The answer to a teleport the server never sent tells nothing about where the client is -
-                if (this.applyThrough(pending -> pending instanceof ClientboundPlayerPositionPacket position && position.id() == accept.id(),
-                        "teleport acceptance " + accept.id())) {
-                    this.requirePlay().verifyTeleportAnswer(accept);
-                }
+                boolean answeredServer = this.applyThrough(pending -> pending instanceof ClientboundPlayerPositionPacket position
+                        && position.id() == accept.getId(), "teleport acceptance " + accept.getId());
+                this.teleportAcceptance = new TeleportAcceptance(accept.getId(), answeredServer);
             }
             case ServerboundConfigurationAcknowledgedPacket ignored -> {
                 this.applyThrough(pending -> pending instanceof ClientboundStartConfigurationPacket, "configuration acknowledgement");
@@ -407,7 +424,7 @@ public final class ClientSession implements PlayerSimulation {
             }
             case ServerboundMovePlayerPacket.Rot rotation when this.isRotationAnswer(rotation) ->
                     this.applyThrough(pending -> pending instanceof ClientboundPlayerRotationPacket, "rotation answer");
-            case ServerboundMovePlayerPacket move -> this.requirePlay().tickPackets().movePacket = move;
+            case ServerboundMovePlayerPacket move -> this.requirePlay().tickPackets().addPlayerMove(move);
             case ServerboundMoveVehiclePacket vehicleMove -> this.requirePlay().tickPackets().addVehicleMove(vehicleMove);
             case ServerboundPlayerInputPacket input -> this.requirePlay().onInputReported(input.input());
             case ServerboundPlayerCommandPacket command -> {
@@ -417,7 +434,7 @@ public final class ClientSession implements PlayerSimulation {
                     case START_FALL_FLYING -> this.requirePlay().onFallFlyingStartReported();
                     // - The client jumps its vehicle itself and tells the server the power -
                     case START_RIDING_JUMP -> this.requirePlay().onRidingJumpReported(command.getData());
-                    // - Only the enum and the server's handler know it; no code of the 26.3 client sends it -
+                    // - Only the enum and the server's handler know it; no code of the 26.2 client sends it -
                     case STOP_RIDING_JUMP -> this.reject(Check.BAD_PACKETS, "the client sent STOP_RIDING_JUMP, which a vanilla client never sends");
                     case STOP_SLEEPING, OPEN_INVENTORY -> {
                         // - Requests the server answers: leaving the bed and the mount's inventory screen only change -
@@ -430,7 +447,7 @@ public final class ClientSession implements PlayerSimulation {
             case ServerboundClientTickEndPacket ignored -> this.endClientTick(arrivedAt);
             // - What the client did during a tick with its keys and mouse; replayed at the tick's end -
             case ServerboundSetCarriedItemPacket _, ServerboundPlayerActionPacket _, ServerboundUseItemOnPacket _, ServerboundUseItemPacket _,
-                 ServerboundAttackPacket _, ServerboundInteractPacket _, ServerboundPunchPacket _ ->
+                 ServerboundAttackPacket _, ServerboundInteractPacket _, ServerboundSwingPacket _ ->
                     this.requirePlay().tickPackets().addAction(packet, this.serverboundPackets);
             // - What the client did on a screen, between its ticks -
             case ServerboundContainerClickPacket click -> this.requirePlay().onContainerClick(click);
@@ -522,6 +539,11 @@ public final class ClientSession implements PlayerSimulation {
                 false, Double.NaN, Double.NaN, Double.NaN, false, false, false,
                 Double.NaN, null, ClientTickReport.Start.none(repositionPending), rejections, notes
         );
+    }
+
+    // - An acceptance of a teleport waiting for the resulting position that follows it: the teleport's id, and -
+    // - whether it answered a teleport of the server -
+    private record TeleportAcceptance(int teleportId, boolean answeredServer) {
     }
 
     // - Why the simulation stopped when it fell behind. The message tells everything, a stack trace would not; a -

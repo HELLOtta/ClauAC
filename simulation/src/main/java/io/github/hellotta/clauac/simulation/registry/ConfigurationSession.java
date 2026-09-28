@@ -55,7 +55,7 @@ public final class ConfigurationSession {
 
     public void handleUpdateTags(ClientboundUpdateTagsPacket packet, byte[] encodedPacket) {
         this.fingerprint.update(encodedPacket);
-        this.collector.appendTags(packet.tags());
+        this.collector.appendTags(packet.getTags());
     }
 
     public void handleEnabledFeatures(ClientboundUpdateEnabledFeaturesPacket packet) {

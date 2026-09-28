@@ -12,18 +12,23 @@ import java.util.Set;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.network.protocol.game.ServerboundMoveVehiclePacket;
+import net.minecraft.network.protocol.game.ServerboundSwingPacket;
+import net.minecraft.world.InteractionHand;
 import org.jspecify.annotations.Nullable;
 
 // - What the client sent during one of its ticks, between two ServerboundClientTickEndPackets, plus the reasons -
 // - found while processing packets why that tick cannot be verified -
 final class ClientTickPackets {
 
-    // - The movement packet LocalPlayer.sendPosition sent; it is sent at most once per tick -
+    // - The movement packets the client sent since the tick began, oldest first, without those that answered a -
+    // - packet of the server (see takePositionAnswer) -
+    private final Deque<ServerboundMovePlayerPacket> playerMoves = new ArrayDeque<>();
+    // - The movement packet LocalPlayer.sendPosition sent: the last of those; it is sent at most once per tick -
     @Nullable ServerboundMovePlayerPacket movePacket;
     // - The vehicle positions the client sent since the tick began, oldest first, without those that answered a -
     // - correction of the vehicle (see takeCorrectionAnswer) -
     private final Deque<ServerboundMoveVehiclePacket> vehicleMoves = new ArrayDeque<>();
-    // - The vehicle position LocalPlayer.sendChanges sent while the player steers its vehicle: the last of those -
+    // - The vehicle position LocalPlayer.tick sent while the player steers its vehicle: the last of those -
     @Nullable ServerboundMoveVehiclePacket vehicleMove;
     // - What the client did with its keys and mouse during this tick (Minecraft.handleKeybinds and -
     // - MultiPlayerGameMode.tick), in order. These happen inside the tick, after the client processed the server's -
@@ -69,6 +74,38 @@ final class ClientTickPackets {
         this.actionPackets.add(packet);
     }
 
+    // - The client swings its own player when the server shows it a swing of it (ClientPacketListener.handleAnimate), -
+    // - and LocalPlayer.swing sends that swing back right away, while the client handles the server's packets: before -
+    // - it answers the ping behind the animation and before the ticks it runs afterwards, whose actions come after -
+    // - that. The echo is therefore the oldest swing of that hand among the swings the tick's actions begin with. It -
+    // - is taken out of the tick's actions, as no key of the client made it; false when the client sent none -
+    boolean takeSwingEcho(InteractionHand hand) {
+        for (int index = 0; index < this.actions.size() && this.actions.get(index) instanceof ServerboundSwingPacket swing; index++) {
+            if (swing.getHand() == hand) {
+                this.actions.remove(index);
+                this.actionPackets.remove(index);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void addPlayerMove(ServerboundMovePlayerPacket move) {
+        this.playerMoves.addLast(move);
+        this.movePacket = move;
+    }
+
+    // - The client answers a teleport of its removed vehicle, which it applies to its player, right away with the -
+    // - player's position (ClientPacketListener.handleTeleportEntity), while it handles the server's packets: before -
+    // - it answers the ping behind the teleport and before the ticks it runs afterwards, each of which sends its own -
+    // - movement after that. The answer is therefore the oldest movement packet of the tick that did not answer an -
+    // - earlier packet. It is taken out of the tick's movement packets and returned; null when the client sent none -
+    @Nullable ServerboundMovePlayerPacket takePositionAnswer() {
+        ServerboundMovePlayerPacket answer = this.playerMoves.pollFirst();
+        this.movePacket = this.playerMoves.peekLast();
+        return answer;
+    }
+
     void addVehicleMove(ServerboundMoveVehiclePacket move) {
         this.vehicleMoves.addLast(move);
         this.vehicleMove = move;
@@ -95,6 +132,7 @@ final class ClientTickPackets {
     }
 
     void reset() {
+        this.playerMoves.clear();
         this.movePacket = null;
         this.vehicleMoves.clear();
         this.vehicleMove = null;

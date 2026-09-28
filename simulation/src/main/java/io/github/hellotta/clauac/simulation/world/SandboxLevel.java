@@ -27,6 +27,7 @@ import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.item.alchemy.PotionBrewing;
 import net.minecraft.world.item.crafting.RecipeAccess;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.ExplosionDamageCalculator;
@@ -34,9 +35,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.entity.BlockEntity;
-import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
-import net.minecraft.world.level.block.piston.PistonMovingBlockEntity;
+import net.minecraft.world.level.block.entity.FuelValues;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.border.WorldBorder;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -93,6 +92,11 @@ public final class SandboxLevel extends Level {
     private final Scoreboard scoreboard;
     // - ClientLevel.recipeAccess asks the connection, whose recipes outlive the level -
     private final Supplier<RecipeAccess> recipes;
+    // - So does ClientLevel.fuelValues, which AbstractFurnaceMenu.isFuel asks when an item is shift clicked into a -
+    // - furnace menu -
+    private final Supplier<FuelValues> fuelValues;
+    // - And ClientLevel.potionBrewing, which the slots of a brewing stand menu ask what they take -
+    private final Supplier<PotionBrewing> potionBrewing;
     private final FeatureFlagSet enabledFeatures;
     private final EnvironmentAttributeSystem environmentAttributes;
     private final int seaLevel;
@@ -121,6 +125,8 @@ public final class SandboxLevel extends Level {
             SandboxClockManager clockManager,
             Scoreboard scoreboard,
             Supplier<RecipeAccess> recipes,
+            Supplier<FuelValues> fuelValues,
+            Supplier<PotionBrewing> potionBrewing,
             FeatureFlagSet enabledFeatures
     ) {
         super(levelData, dimension, registryAccess, dimensionType, true, isDebug, biomeZoomSeed, 1000000);
@@ -128,6 +134,8 @@ public final class SandboxLevel extends Level {
         this.clockManager = clockManager;
         this.scoreboard = scoreboard;
         this.recipes = recipes;
+        this.fuelValues = fuelValues;
+        this.potionBrewing = potionBrewing;
         this.enabledFeatures = enabledFeatures;
         this.chunkSource = new SandboxChunkSource(this, serverChunkRadius);
         this.seaLevel = seaLevel;
@@ -192,21 +200,6 @@ public final class SandboxLevel extends Level {
         });
     }
 
-    // - Whether a block entity next to this area moves entities when the block entities tick after the entities: a -
-    // - piston's moving block, or a shulker box whose lid is moving -
-    public boolean hasEntityMovingBlockEntityNear(AABB area) {
-        for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(area.minX, area.minY, area.minZ), BlockPos.containing(area.maxX, area.maxY, area.maxZ))) {
-            BlockEntity blockEntity = this.getBlockEntity(pos);
-            if (blockEntity instanceof PistonMovingBlockEntity
-                    || blockEntity instanceof ShulkerBoxBlockEntity shulkerBox
-                    && shulkerBox.getAnimationStatus() != ShulkerBoxBlockEntity.AnimationStatus.CLOSED
-                    && shulkerBox.getAnimationStatus() != ShulkerBoxBlockEntity.AnimationStatus.OPENED) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     public boolean isTickingEntity(Entity entity) {
         return this.tickingEntities.contains(entity);
     }
@@ -218,7 +211,8 @@ public final class SandboxLevel extends Level {
     }
 
     public void tickNonPassenger(Entity entity) {
-        entity.commonTick();
+        entity.setOldPosAndRot();
+        entity.tickCount++;
         entity.tick();
 
         for (Entity passenger : entity.getPassengers()) {
@@ -230,7 +224,8 @@ public final class SandboxLevel extends Level {
         if (entity.isRemoved() || entity.getVehicle() != vehicle) {
             entity.stopRiding();
         } else if (entity instanceof Player || this.tickingEntities.contains(entity)) {
-            entity.commonTick();
+            entity.setOldPosAndRot();
+            entity.tickCount++;
             entity.rideTick();
 
             for (Entity passenger : entity.getPassengers()) {
@@ -448,6 +443,16 @@ public final class SandboxLevel extends Level {
     @Override
     public RecipeAccess recipeAccess() {
         return this.recipes.get();
+    }
+
+    @Override
+    public FuelValues fuelValues() {
+        return this.fuelValues.get();
+    }
+
+    @Override
+    public PotionBrewing potionBrewing() {
+        return this.potionBrewing.get();
     }
 
     @Override

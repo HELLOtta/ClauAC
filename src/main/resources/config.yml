@@ -67,8 +67,8 @@ checks:
   FastBreak:
     alert: true
     setback: true
-  # - The client left out the swing a vanilla client sends right after every attack and every start, finish and -
-  # - turn of breaking a block, which hides the swing of its arm from the other players -
+  # - The client left out the swing a vanilla client sends right after every attack, every start and finish of -
+  # - breaking a block and every stab, which hides the swing of an attack or a break from the other players -
   NoSwing:
     alert: true
     setback: true

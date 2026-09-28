@@ -37,6 +37,10 @@ public final class SandboxRemotePlayer extends Player {
 
     @Override
     public void aiStep() {
+        if (this.isInterpolating()) {
+            this.getInterpolation().interpolate();
+        }
+
         if (this.lerpHeadSteps > 0) {
             this.lerpHeadRotationStep(this.lerpHeadSteps, this.lerpYHeadRot);
             this.lerpHeadSteps--;
@@ -53,17 +57,14 @@ public final class SandboxRemotePlayer extends Player {
             this.lerpDeltaMovementSteps--;
         }
 
+        this.updateSwingTime();
         this.pushEntities();
     }
 
     @Override
     public void lerpMotion(Vec3 movement) {
         this.lerpDeltaMovement = movement;
-        if (this.getType().hasUpdateInterval()) {
-            this.lerpDeltaMovementSteps = this.getType().updateInterval() + 1;
-        } else {
-            this.lerpDeltaMovementSteps = 1;
-        }
+        this.lerpDeltaMovementSteps = this.getType().updateInterval() + 1;
     }
 
     @Override

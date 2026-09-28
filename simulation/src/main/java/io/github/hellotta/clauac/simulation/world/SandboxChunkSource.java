@@ -1,8 +1,10 @@
 package io.github.hellotta.clauac.simulation.world;
 
 import com.mojang.logging.LogUtils;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData;
@@ -13,6 +15,7 @@ import net.minecraft.world.level.chunk.ChunkSource;
 import net.minecraft.world.level.chunk.EmptyLevelChunk;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.lighting.LevelLightEngine;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -90,7 +93,12 @@ public final class SandboxChunkSource extends ChunkSource {
         }
     }
 
-    public @Nullable LevelChunk replaceWithPacketData(int chunkX, int chunkZ, ClientboundLevelChunkPacketData chunkData) {
+    public @Nullable LevelChunk replaceWithPacketData(
+            int chunkX,
+            int chunkZ,
+            FriendlyByteBuf readBuffer,
+            Map<Heightmap.Types, long[]> heightmaps,
+            Consumer<ClientboundLevelChunkPacketData.BlockEntityTagOutput> blockEntities) {
         if (!this.storage.inRange(chunkX, chunkZ)) {
             LOGGER.debug("Ignoring chunk since it's not in the view range: {}, {}", chunkX, chunkZ);
             return null;
@@ -101,10 +109,10 @@ public final class SandboxChunkSource extends ChunkSource {
         ChunkPos pos = new ChunkPos(chunkX, chunkZ);
         if (!isValidChunk(chunk, chunkX, chunkZ)) {
             chunk = new LevelChunk(this.level, pos);
-            chunk.replaceWithPacketData(chunkX, chunkZ, chunkData);
+            chunk.replaceWithPacketData(readBuffer, heightmaps, blockEntities);
             this.storage.replace(index, chunk);
         } else {
-            chunk.replaceWithPacketData(chunkX, chunkZ, chunkData);
+            chunk.replaceWithPacketData(readBuffer, heightmaps, blockEntities);
         }
 
         this.level.onChunkLoaded(pos);

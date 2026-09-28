@@ -102,9 +102,6 @@ final class ConnectionSimulation {
     private static final int MAXIMUM_OWN_TELEPORTS = 64;
     // - The payload of the play pong (serverbound minecraft:pong): the id as an int -
     private static final int PONG_PAYLOAD_BYTES = Integer.BYTES;
-    // - The payload of the teleport answer after its id (serverbound minecraft:accept_teleportation): the position -
-    // - as three doubles and the rotation as two floats -
-    private static final int TELEPORT_ANSWER_VALUE_BYTES = 3 * Double.BYTES + 2 * Float.BYTES;
     // - A VarInt takes at most five bytes, each carrying seven bits and a continuation bit -
     private static final int MAXIMUM_VARINT_BYTES = 5;
     private static final int VARINT_VALUE_BITS = 7;
@@ -442,12 +439,15 @@ final class ConnectionSimulation {
 
     // - Called on the event loop for every teleport answer of the client, like consumeOwnPong: the answer to one of -
     // - the connection's own teleports goes to the simulation and no further, since the server never sent that -
-    // - teleport. Every other answer goes on to the server as it came -
+    // - teleport. Every other answer goes on to the server as it came. The answer (serverbound -
+    // - minecraft:accept_teleportation) carries the teleport's id alone; the movement packet with its resulting -
+    // - position that the client sends right after it (ClientPacketListener.handleMovePlayer) goes its way like the -
+    // - client's other movement, which a setback keeps from the server -
     void consumeOwnTeleportAnswer(PacketReceiveEvent event) {
         Object buffer = event.getByteBuf();
         byte[] payload = ByteBufHelper.copyBytes(buffer);
         OptionalInt id = readVarInt(payload);
-        if (id.isEmpty() || payload.length != varIntSize(id.getAsInt()) + TELEPORT_ANSWER_VALUE_BYTES || !this.ownTeleportIds.remove(id.getAsInt())) {
+        if (id.isEmpty() || payload.length != varIntSize(id.getAsInt()) || !this.ownTeleportIds.remove(id.getAsInt())) {
             return;
         }
         this.consumeOwnAnswer(event, payload);

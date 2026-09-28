@@ -29,7 +29,6 @@ import java.util.UUID;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
-import net.minecraft.core.PositionAndRotation;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.HashedPatchMap;
@@ -57,6 +56,7 @@ import net.minecraft.network.protocol.game.ClientboundForgetLevelChunkPacket;
 import net.minecraft.network.protocol.game.ClientboundGameEventPacket;
 import net.minecraft.network.protocol.game.ClientboundHurtAnimationPacket;
 import net.minecraft.network.protocol.game.ClientboundInitializeBorderPacket;
+import net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLoginPacket;
 import net.minecraft.network.protocol.game.ClientboundMerchantOffersPacket;
@@ -98,7 +98,6 @@ import net.minecraft.network.protocol.game.ClientboundSetPlayerInventoryPacket;
 import net.minecraft.network.protocol.game.ClientboundSetSimulationDistancePacket;
 import net.minecraft.network.protocol.game.ClientboundSetTimePacket;
 import net.minecraft.network.protocol.game.ClientboundStartConfigurationPacket;
-import net.minecraft.network.protocol.game.ClientboundSwingAnimationPacket;
 import net.minecraft.network.protocol.game.ClientboundTakeItemEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundTeleportEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundTickingStatePacket;
@@ -107,33 +106,33 @@ import net.minecraft.network.protocol.game.ClientboundUpdateAttributesPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateMobEffectPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateRecipesPacket;
 import net.minecraft.network.protocol.game.CommonPlayerSpawnInfo;
-import net.minecraft.network.protocol.game.ServerboundAcceptTeleportationPacket;
 import net.minecraft.network.protocol.game.ServerboundAttackPacket;
 import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
 import net.minecraft.network.protocol.game.ServerboundInteractPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.network.protocol.game.ServerboundMoveVehiclePacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
-import net.minecraft.network.protocol.game.ServerboundPunchPacket;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSetCreativeModeSlotPacket;
+import net.minecraft.network.protocol.game.ServerboundSwingPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.resources.RegistryOps;
 import net.minecraft.resources.ResourceKey;
-import net.minecraft.tags.EntityTypeTags;
 import net.minecraft.util.HashOps;
 import net.minecraft.util.Mth;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.TickRateManager;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntitySelector;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.ai.attributes.Attribute;
@@ -141,18 +140,17 @@ import net.minecraft.world.entity.ai.attributes.AttributeMap;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.entity.player.Inventory;
-import net.minecraft.world.entity.vehicle.boat.AbstractBoat;
-import net.minecraft.world.entity.vehicle.minecart.AbstractMinecart;
-import net.minecraft.world.entity.vehicle.minecart.Minecart;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.TridentItem;
+import net.minecraft.world.item.alchemy.PotionBrewing;
 import net.minecraft.world.item.component.AttackRange;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.FuelValues;
 import net.minecraft.world.level.border.WorldBorder;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
 import net.minecraft.world.level.storage.TagValueInput;
@@ -185,8 +183,6 @@ final class PlayConnection implements ClientContext {
     // - Every tick of the player on foot runs a second time from a snapshot, which has to give the same result: a -
     // - development check that the snapshot holds everything a tick changes, on with -Dclauac.verifyRepeatedTicks=true -
     private static final boolean VERIFY_REPEATED_TICKS = Boolean.getBoolean("clauac.verifyRepeatedTicks");
-    // - A block entity this far from the player's box can still move the player when the block entities tick -
-    private static final double MOVING_BLOCK_REACH = 2.0;
     // - The player pushes the entities its box touches during its tick; its movement can carry the box this far -
     private static final double PUSH_REACH = 1.0;
     // - Blocks beside the boxes a movement sweeps through still change it: the block the player stands on, the step -
@@ -218,14 +214,6 @@ final class PlayConnection implements ClientContext {
     // - place of the position are therefore expected for this many ticks after the last estimate -
     private static final int VELOCITY_ESTIMATE_ULPS = 8;
     private static final int VELOCITY_ESTIMATE_TICKS = 100;
-    // - A boat turns its rider by the boat's turn of the tick and keeps it within reach of the boat's heading, in -
-    // - float arithmetic (see checkRiderUses). The client reports the boat's yaw, so the sandbox knows the boat's turn -
-    // - only up to a unit in the last place of that yaw; each of the float operations rounds by at most half a unit -
-    // - in the last place of values no larger than the yaws plus half a turn (Mth.wrapDegrees keeps the rider within -
-    // - half a turn of the boat). The rider's yaw a vanilla client reports therefore lies within a few units in the -
-    // - last place of that size from where the sandbox turns the yaw it used an item with; this many leave a margin -
-    private static final int RIDER_ROTATION_ULPS = 8;
-    private static final float HALF_TURN_DEGREES = 180.0F;
 
     private final GameProfile localGameProfile;
     private final ReceivedRegistries registries;
@@ -237,6 +225,13 @@ final class PlayConnection implements ClientContext {
     // - Counts what the snapshots of the player's state cost (see captureState and restoreState) -
     private final SimulationCost cost;
     private final SandboxClockManager clockManager = new SandboxClockManager();
+    // - ClientPacketListener.potionBrewing, which the client builds from its enabled features as it enters play; its -
+    // - levels ask it (see SandboxLevel.potionBrewing) -
+    private final PotionBrewing potionBrewing;
+    // - ClientPacketListener.fuelValues, which the client works out from its registries and enabled features as it -
+    // - enters play and again after every update of the tags (handleUpdateTags); its levels ask it (see -
+    // - SandboxLevel.fuelValues) -
+    private FuelValues fuelValues;
     private final Scoreboard scoreboard = new Scoreboard();
     private final Map<UUID, SandboxPlayerInfo> playerInfoMap = new HashMap<>();
     private SandboxRecipeContainer recipes = SandboxRecipeContainer.NONE;
@@ -270,11 +265,17 @@ final class PlayConnection implements ClientContext {
     // - Why the tick alternatives are no longer tried on this connection: a snapshot failed, or a tick repeated from -
     // - one came out differently (see tickLocalPlayer) -
     private @Nullable String alternativesDisabled;
-    // - What trying the tick's alternatives at the player's tick found, for the comparison after the tick -
+    // - What trying the tick's alternatives at the player's tick found, for the comparison after the player's tick -
     private @Nullable AlternativeResult alternativeResult;
-    // - The items the player used during the tick while a boat turns it, whose yaw only the tick decides on (see -
-    // - checkUseItem and checkRiderUses) -
-    private final List<RiderUse> riderUses = new ArrayList<>();
+    // - The client tick being simulated, while its level ticks: what the comparison at the player's send needs (see -
+    // - onPlayerTicked) -
+    private @Nullable TickInProgress tickInProgress;
+    // - Whether the player ticked in the client tick being simulated, and what it sent then; null until it did -
+    private boolean playerTicked;
+    private @Nullable SentTick sentTick;
+    // - Whether the client tick being simulated compared what the player sent already, which took over the client's -
+    // - state on a difference and advanced the mirror of what the client sent (see unsimulatedTick) -
+    private boolean movementCompared;
     // - A riptide trident use whose start depended on rain the client's sky light may not have shown yet (see -
     // - rainDependsOnLaggingSkyLight): the client's use may have begun where the sandbox's did not, or the other way -
     // - round. Every tick tries the other state (see otherTridentUse) until a tick matches only with it, the client's -
@@ -301,6 +302,8 @@ final class PlayConnection implements ClientContext {
         this.inventoryResyncRequest = inventoryResyncRequest;
         this.problemLog = problemLog;
         this.cost = cost;
+        this.potionBrewing = PotionBrewing.bootstrap(enabledFeatures);
+        this.fuelValues = FuelValues.vanillaBurnTimes(registries.access(), enabledFeatures);
         RegistryOps<HashCode> hashOps = registries.access().createSerializationContext(HashOps.CRC32C_INSTANCE);
         this.hashGenerator = component -> component.encodeValue(hashOps)
                 .getOrThrow(message -> new IllegalArgumentException("Failed to hash " + component + ": " + message))
@@ -365,7 +368,7 @@ final class PlayConnection implements ClientContext {
         switch (packet) {
             case ClientboundLoginPacket login -> this.handleLogin(login);
             case ClientboundRespawnPacket respawn -> this.handleRespawn(respawn);
-            case ClientboundUpdateTagsPacket tags -> this.registries.applyPlayTagUpdate(tags, encodedPacket);
+            case ClientboundUpdateTagsPacket tags -> this.handleUpdateTags(tags, encodedPacket);
             case ClientboundPingPacket ignored -> {
                 // - Only marks how far the client has processed; see PendingClientbound -
             }
@@ -394,9 +397,13 @@ final class PlayConnection implements ClientContext {
 
     private void handleInLevel(Packet<?> packet, SandboxLevel level, SandboxPlayer player) {
         switch (packet) {
-            case ClientboundLevelChunkWithLightPacket chunk ->
-                    // - Light data is not applied: lighting is disabled in the sandbox and no movement code reads it -
-                    level.getChunkSource().replaceWithPacketData(chunk.x(), chunk.z(), chunk.chunkData());
+            case ClientboundLevelChunkWithLightPacket chunk -> {
+                // - ClientPacketListener.updateLevelChunk. Light data is not applied: lighting is disabled in the -
+                // - sandbox and no movement code reads it -
+                ClientboundLevelChunkPacketData chunkData = chunk.getChunkData();
+                level.getChunkSource().replaceWithPacketData(chunk.getX(), chunk.getZ(), chunkData.getReadBuffer(), chunkData.getHeightmaps(),
+                        chunkData.getBlockEntitiesTagsConsumer(chunk.getX(), chunk.getZ()));
+            }
             case ClientboundForgetLevelChunkPacket forget -> level.getChunkSource().drop(forget.pos());
             case ClientboundChunksBiomesPacket biomes -> handleChunksBiomes(biomes, level);
             case ClientboundBlockUpdatePacket blockUpdate ->
@@ -427,7 +434,7 @@ final class PlayConnection implements ClientContext {
                 data.setDifficulty(difficulty.difficulty());
                 data.setDifficultyLocked(difficulty.locked());
             }
-            case ClientboundExplodePacket explosion -> explosion.playerKnockback().ifPresent(player::pushFromExplosion);
+            case ClientboundExplodePacket explosion -> explosion.playerKnockback().ifPresent(player::addDeltaMovement);
             case ClientboundSetHealthPacket health -> {
                 player.hurtTo(health.getHealth());
                 player.getFoodData().setFoodLevel(health.getFood());
@@ -475,8 +482,12 @@ final class PlayConnection implements ClientContext {
             case ClientboundEntityEventPacket entityEvent -> EntityHandlers.handleEntityEvent(entityEvent, level);
             case ClientboundDamageEventPacket damageEvent -> EntityHandlers.handleDamageEvent(damageEvent, level);
             case ClientboundHurtAnimationPacket hurtAnimation -> EntityHandlers.handleHurtAnimation(hurtAnimation, level);
-            case ClientboundAnimatePacket animate -> EntityHandlers.handleAnimate(animate, level);
-            case ClientboundSwingAnimationPacket swing -> EntityHandlers.handleSwingAnimation(swing, level);
+            case ClientboundAnimatePacket animate -> {
+                InteractionHand swung = EntityHandlers.handleAnimate(animate, level);
+                if (swung != null && level.getEntity(animate.getId()) == player) {
+                    this.takeSwingEcho(swung);
+                }
+            }
             case ClientboundTakeItemEntityPacket takeItem -> EntityHandlers.handleTakeItemEntity(takeItem, level);
             case ClientboundSetEquipmentPacket equipment -> EntityHandlers.handleSetEquipment(equipment, level);
             case ClientboundUpdateAttributesPacket attributes -> EntityHandlers.handleUpdateAttributes(attributes, level);
@@ -500,6 +511,32 @@ final class PlayConnection implements ClientContext {
         }
     }
 
+    // - The server showed the client a swing of its own player, which LocalPlayer.swing sent back right away (see -
+    // - ClientTickPackets.takeSwingEcho): no key of the client made that swing -
+    private void takeSwingEcho(InteractionHand hand) {
+        if (!this.tickPackets.takeSwingEcho(hand)) {
+            this.tickPackets.notes.add("the client did not send back the swing of its " + hand.name().toLowerCase(Locale.ROOT)
+                    + " that the server showed it, as a vanilla client does");
+        }
+    }
+
+    // - ClientPacketListener.handleTeleportEntity applies a teleport of the player's removed vehicle to the player and -
+    // - answers it right away with the player's resulting position (see ClientTickPackets.takePositionAnswer) -
+    void takeRemovedVehicleTeleportAnswer() {
+        ServerboundMovePlayerPacket answer = this.tickPackets.takePositionAnswer();
+        if (answer == null) {
+            this.tickPackets.notes.add("the client did not answer a teleport of its removed vehicle with its resulting position");
+            return;
+        }
+        this.verifyPositionAnswer("the teleport of its removed vehicle", answer);
+    }
+
+    // - ClientPacketListener.handleUpdateTags: the tags first, then the fuel values the client works out from them -
+    private void handleUpdateTags(ClientboundUpdateTagsPacket packet, byte[] encodedPacket) {
+        this.registries.applyPlayTagUpdate(packet, encodedPacket);
+        this.fuelValues = FuelValues.vanillaBurnTimes(this.registries.access(), this.enabledFeatures);
+    }
+
     private SandboxLevel createLevel(SandboxLevelData levelData, CommonPlayerSpawnInfo spawnInfo) {
         return new SandboxLevel(
                 levelData,
@@ -514,6 +551,8 @@ final class PlayConnection implements ClientContext {
                 this.clockManager,
                 this.scoreboard,
                 () -> this.recipes,
+                () -> this.fuelValues,
+                () -> this.potionBrewing,
                 this.enabledFeatures
         );
     }
@@ -639,14 +678,13 @@ final class PlayConnection implements ClientContext {
         });
     }
 
-    // - The teleport also ends the client's mining; the resulting ABORT_DESTROY_BLOCK reaches the sandbox with the -
-    // - client's next tick and then changes nothing more -
+    // - The client answers with its acceptance and, right after it, its resulting position (see verifyTeleportAnswer); -
+    // - its mining goes on -
     private void handleMovePlayer(ClientboundPlayerPositionPacket packet, SandboxLevel level, SandboxPlayer player) {
         if (!player.isPassenger()) {
             EntityHandlers.setValuesFromPositionPacket(packet.change(), packet.relatives(), player, false);
         }
         level.getBlockPredictions().onTeleport();
-        this.gameMode.abortDestroyBlock(player, false);
     }
 
     // - Without the answer the client sends right away -
@@ -693,16 +731,32 @@ final class PlayConnection implements ClientContext {
         return matches;
     }
 
-    // - The client answers a position packet with its resulting position and rotation. A difference means the -
-    // - sandbox's player was elsewhere before the packet, which matters for relative teleports; the sandbox takes -
-    // - over the client's values -
-    void verifyTeleportAnswer(ServerboundAcceptTeleportationPacket answer) {
+    // - The client answers a position packet with its acceptance and right after it with its resulting position -
+    // - (ClientPacketListener.handleMovePlayer, see verifyPositionAnswer) -
+    void verifyTeleportAnswer(int teleportId, ServerboundMovePlayerPacket answer) {
+        this.verifyPositionAnswer("teleport " + teleportId, answer);
+    }
+
+    // - The client answers a packet of the server that put its player somewhere with a movement packet that carries -
+    // - the player's resulting position and rotation and reports neither ground nor collision; the answer is no -
+    // - movement of the client's tick. A difference means the sandbox's player was elsewhere before the packet, which -
+    // - matters for relative teleports; the sandbox takes over the client's values -
+    private void verifyPositionAnswer(String answered, ServerboundMovePlayerPacket answer) {
+        if (!(answer instanceof ServerboundMovePlayerPacket.PosRot) || answer.isOnGround() || answer.horizontalCollision()) {
+            this.tickPackets.reject(Check.BAD_PACKETS, "the client answered " + answered + " with a movement packet unlike a vanilla client's");
+            return;
+        }
         SandboxPlayer current = this.player;
         if (current == null || current.isPassenger()) {
             return;
         }
-        boolean positionDiffers = current.getX() != answer.x() || current.getY() != answer.y() || current.getZ() != answer.z();
-        if (positionDiffers || current.getYRot() != answer.yRot() || current.getXRot() != answer.xRot()) {
+        double x = answer.getX(current.getX());
+        double y = answer.getY(current.getY());
+        double z = answer.getZ(current.getZ());
+        float yRot = answer.getYRot(current.getYRot());
+        float xRot = answer.getXRot(current.getXRot());
+        boolean positionDiffers = current.getX() != x || current.getY() != y || current.getZ() != z;
+        if (positionDiffers || current.getYRot() != yRot || current.getXRot() != xRot) {
             // - The rotation is the client's input and may have turned since its last tick; the sandbox takes it over -
             // - like the tick's own rotation. A position that differs shows the player was elsewhere than the sandbox -
             // - thought, with a velocity the sandbox cannot know either -
@@ -710,13 +764,12 @@ final class PlayConnection implements ClientContext {
                 this.tickPackets.uncertainties.add("teleport result differed");
             }
             this.tickPackets.notes.add(String.format(
-                    "teleport %d: sandbox %.6f %.6f %.6f %.3f %.3f, client %.6f %.6f %.6f %.3f %.3f",
-                    answer.id(), current.getX(), current.getY(), current.getZ(), current.getYRot(), current.getXRot(),
-                    answer.x(), answer.y(), answer.z(), answer.yRot(), answer.xRot()
+                    "%s: sandbox %.6f %.6f %.6f %.3f %.3f, client %.6f %.6f %.6f %.3f %.3f",
+                    answered, current.getX(), current.getY(), current.getZ(), current.getYRot(), current.getXRot(), x, y, z, yRot, xRot
             ));
-            current.setPos(answer.x(), answer.y(), answer.z());
-            current.setYRot(answer.yRot());
-            current.setXRot(answer.xRot());
+            current.setPos(x, y, z);
+            current.setYRot(yRot);
+            current.setXRot(xRot);
         }
     }
 
@@ -736,15 +789,13 @@ final class PlayConnection implements ClientContext {
             this.tickPackets.notes.add("the client did not answer a correction of the vehicle the sandbox steers");
             return;
         }
-        PositionAndRotation answered = answer.movingTo();
-        PositionAndRotation corrected = expected.movingTo();
-        Vec3 answeredPosition = answered.position();
-        Vec3 correctedPosition = corrected.position();
+        Vec3 answeredPosition = answer.position();
+        Vec3 correctedPosition = expected.position();
         List<String> differences = new ArrayList<>();
         if (answeredPosition.x != correctedPosition.x || answeredPosition.y != correctedPosition.y || answeredPosition.z != correctedPosition.z) {
             differences.add(String.format(Locale.ROOT, "vehicle position %.4g blocks off", correctedPosition.distanceTo(answeredPosition)));
         }
-        if (answered.yRot() != corrected.yRot() || answered.xRot() != corrected.xRot()) {
+        if (answer.yRot() != expected.yRot() || answer.xRot() != expected.xRot()) {
             differences.add("vehicle rotation");
         }
         if (answer.onGround() != expected.onGround()) {
@@ -950,12 +1001,13 @@ final class PlayConnection implements ClientContext {
         return this.player;
     }
 
-    // - Minecraft.tick for one client tick, then the comparison of LocalPlayer.sendChanges with what the client sent. -
-    // - Returns the reports that are final, in the order of the client's ticks: a report may be held back for one tick. -
-    // - A failure of the simulation makes the tick MISMATCHED instead of ending the simulation, so that no packet a -
-    // - client sends can switch it off -
+    // - Minecraft.tick for one client tick, with the comparison of what LocalPlayer.tick sent in its middle against -
+    // - what the client sent. Returns the reports that are final, in the order of the client's ticks: a report may be -
+    // - held back for one tick. A failure of the simulation makes the tick MISMATCHED instead of ending the -
+    // - simulation, so that no packet a client sends can switch it off -
     List<ClientTickReport> tick(long clientTick, boolean repositionPending) {
         this.tickStart = this.currentStart(repositionPending);
+        this.movementCompared = false;
         List<ClientTickReport> reports = new ArrayList<>(2);
         try {
             ClientTickReport report = this.simulateTick(clientTick, reports);
@@ -970,7 +1022,8 @@ final class PlayConnection implements ClientContext {
             if (held != null) {
                 reports.add(held);
             }
-            reports.add(this.unsimulatedTick(clientTick, new Flag(Check.SIMULATION_FAILURE, "the simulation of this tick failed (" + problem + ")")));
+            reports.add(this.unsimulatedTick(clientTick, new Flag(Check.SIMULATION_FAILURE, "the simulation of this tick failed (" + problem + ")"),
+                    this.movementCompared));
         }
         // - ClientLevel.tick, after the player sent its movement; a failure here shows in the next tick -
         String levelTickFailure = null;
@@ -1000,7 +1053,7 @@ final class PlayConnection implements ClientContext {
         if (held != null) {
             reports.add(held);
         }
-        reports.add(this.unsimulatedTick(clientTick, rejection));
+        reports.add(this.unsimulatedTick(clientTick, rejection, false));
         this.tickPackets.reset();
         return reports;
     }
@@ -1051,11 +1104,12 @@ final class PlayConnection implements ClientContext {
         this.tridentUseAlternative = null;
         this.releaseHeldReport(tickPlayer, reports);
         tickLevel.tickRateManager().tick();
-        // - The rotation of the whole tick, which the client's key and mouse actions already used. A riding player -
-        // - reports it after its vehicle turned it during the tick -
+        // - The rotation of the whole tick, which the client's key and mouse actions already used. LocalPlayer.tick -
+        // - reports it right after the player's own tick, before a vehicle turns a riding player (Entity.rideTick -
+        // - positions the rider after its tick), so nothing turned it before the report -
         ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
         if (movePacket != null && movePacket.hasRotation()) {
-            tickPlayer.setYRot(movePacket.getYRot(tickPlayer.getYRot()) - this.passengerTurnOfTick(tickPlayer));
+            tickPlayer.setYRot(movePacket.getYRot(tickPlayer.getYRot()));
             tickPlayer.setXRot(movePacket.getXRot(tickPlayer.getXRot()));
         }
         tickPlayer.setReportedKeys(reportedKeys);
@@ -1068,7 +1122,7 @@ final class PlayConnection implements ClientContext {
             notes.add(this.clientLoaded ? "player removed" : "client has not loaded the level");
             return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
         }
-        InferredHotbarSwitch inferredSwitch = this.inferHotbarSwitch(tickPlayer);
+        InferredHotbarSwitch inferredSwitch = this.inferHotbarSwitch(tickLevel, tickPlayer);
         // - LivingEntity.updatingUsingItem, at the start of the player's tick, stops the use once the used hand holds -
         // - another item -
         ItemStack usedMainHandItem = tickPlayer.isUsingItem() && tickPlayer.getUsedItemHand() == InteractionHand.MAIN_HAND
@@ -1078,27 +1132,86 @@ final class PlayConnection implements ClientContext {
         Entity vehicleBeforeTick = tickPlayer.getRootVehicle();
         Vec3 vehiclePositionBeforeTick = vehicleBeforeTick.position();
         this.alternativeResult = null;
-        tickLevel.setLocalPlayerTick(entity -> this.tickLocalPlayer(tickLevel, tickPlayer));
+        this.tickInProgress = new TickInProgress(clientTick, tickPlayer, reportedSprinting, usedMainHandItem, positionBeforeTick, vehicleBeforeTick,
+                vehiclePositionBeforeTick);
+        this.sentTick = null;
+        this.playerTicked = false;
+        SentTick sent;
         try {
-            tickLevel.tickEntities();
+            tickLevel.setLocalPlayerTick(entity -> {
+                this.tickLocalPlayer(tickLevel, tickPlayer);
+                // - The player sent its movement at the end of its tick; with the alternatives decided, the sandbox -
+                // - compares it before the entities after the player tick -
+                if (this.playerTicked) {
+                    this.sentTick = this.reportSentTick(tickPlayer);
+                }
+            });
+            try {
+                tickLevel.tickEntities();
+            } finally {
+                tickLevel.setLocalPlayerTick(null);
+            }
+            tickLevel.tickBlockEntities();
+            sent = this.sentTick;
         } finally {
-            tickLevel.setLocalPlayerTick(null);
+            this.tickInProgress = null;
+            this.sentTick = null;
         }
-        tickLevel.tickBlockEntities();
-        this.checkRiderUses(tickPlayer);
+        if (sent == null) {
+            return this.untickedPlayer(clientTick, tickPlayer, reportedSprinting);
+        }
+        ClientTickReport report = sent.report();
+        if (inferredSwitch != null || !sent.heldUsedItem().isEmpty() || !sent.heldStoppedItem().isEmpty()) {
+            this.heldReport = report;
+            this.heldReportUsedItem = sent.heldUsedItem();
+            this.heldReportUseStopTried = this.alternativeResult instanceof AlternativeResult.NoneMatched;
+            this.heldReportStoppedItem = sent.heldStoppedItem();
+            this.heldReportInferredSwitch = inferredSwitch;
+            return null;
+        }
+        return report;
+    }
+
+    // - The part of LocalPlayer.tick after the player's own tick: it sends the player's keys and its movement, while -
+    // - it rides its rotation and the position of the vehicle it steers. A riding player's tick runs inside its -
+    // - vehicle's (Entity.rideTick), before the vehicle positions and turns it, so its movement is compared right -
+    // - here; the comparison of a player on foot waits until its tick's alternatives are decided (see simulateTick) -
+    @Override
+    public void onPlayerTicked() {
+        TickInProgress tick = this.tickInProgress;
+        if (tick == null) {
+            throw new IllegalStateException("the player ticked outside the simulation of a client tick");
+        }
+        this.playerTicked = true;
+        if (tick.player().isPassenger()) {
+            if (this.sentTick != null) {
+                throw new IllegalStateException("the player ticked twice as a passenger in one client tick");
+            }
+            this.sentTick = this.reportSentTick(tick.player());
+        }
+    }
+
+    // - What LocalPlayer.tick sent, compared with what the client sent: the tick's report, with the item uses a hotbar -
+    // - switch the client reports with its next tick may explain (see releaseHeldReport). On a difference the sandbox -
+    // - takes over the client's state here, from where the rest of the tick goes on as on the client: the entities -
+    // - after the player push it, a vehicle positions and turns it, and moving blocks (pistons, shulker boxes) move it -
+    // - only after it sent its movement -
+    private SentTick reportSentTick(SandboxPlayer tickPlayer) {
+        TickInProgress tick = Objects.requireNonNull(this.tickInProgress, "a client tick is being simulated");
+        this.movementCompared = true;
         List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
-        this.collectOngoingUncertainties(uncertainties, tickPlayer, positionBeforeTick, vehicleBeforeTick, vehiclePositionBeforeTick);
+        this.collectOngoingUncertainties(uncertainties, tickPlayer, tick.positionBeforeTick(), tick.vehicleBeforeTick(), tick.vehiclePositionBeforeTick());
         List<String> notes = new ArrayList<>(this.tickPackets.notes);
         this.judgeAlternatives(uncertainties, notes);
         ClientTickReport report;
         ItemStack heldUsedItem = ItemStack.EMPTY;
         ItemStack heldStoppedItem = ItemStack.EMPTY;
-        // - LocalPlayer.sendChanges decides after the tick whether the player rides -
+        // - LocalPlayer.tick decides as it sends whether the player rides -
         if (tickPlayer.isPassenger()) {
-            Vec3 steeredVehicleBeforeTick = tickPlayer.getRootVehicle() == vehicleBeforeTick ? vehiclePositionBeforeTick : null;
-            report = this.compareRiding(clientTick, tickPlayer, steeredVehicleBeforeTick, reportedSprinting, uncertainties, notes);
+            Vec3 steeredVehicleBeforeTick = tickPlayer.getRootVehicle() == tick.vehicleBeforeTick() ? tick.vehiclePositionBeforeTick() : null;
+            report = this.compareRiding(tick.clientTick(), tickPlayer, steeredVehicleBeforeTick, tick.reportedSprinting(), uncertainties, notes);
         } else {
-            report = this.compareWithClient(clientTick, tickPlayer, positionBeforeTick, reportedSprinting, uncertainties, notes);
+            report = this.compareWithClient(tick.clientTick(), tickPlayer, tick.positionBeforeTick(), tick.reportedSprinting(), uncertainties, notes);
             if (this.alternativeResult instanceof AlternativeResult.Matched matched) {
                 for (TickAlternative alternative : matched.combination()) {
                     if (!alternative.stoppedItem().isEmpty()) {
@@ -1110,26 +1223,59 @@ final class PlayConnection implements ClientContext {
                     this.uncertainTridentUse = null;
                 }
             } else if (report.outcome() == TickOutcome.MISMATCHED && this.tickPackets.rejections.isEmpty()) {
-                heldUsedItem = usedMainHandItem;
+                heldUsedItem = tick.usedMainHandItem();
             }
         }
-        if (inferredSwitch != null || !heldUsedItem.isEmpty() || !heldStoppedItem.isEmpty()) {
-            this.heldReport = report;
-            this.heldReportUsedItem = heldUsedItem;
-            this.heldReportUseStopTried = this.alternativeResult instanceof AlternativeResult.NoneMatched;
-            this.heldReportStoppedItem = heldStoppedItem;
-            this.heldReportInferredSwitch = inferredSwitch;
-            return null;
+        return new SentTick(report, heldUsedItem, heldStoppedItem);
+    }
+
+    // - A tick in which the client's player did not tick, which ClientLevel.tickEntities skips while the player's -
+    // - chunk (or its vehicle's) does not tick: LocalPlayer.tick sent nothing then. Movement or anything else the -
+    // - player sends from its tick differs from that; the sandbox then takes over what the client reported -
+    private ClientTickReport untickedPlayer(long clientTick, SandboxPlayer tickPlayer, boolean reportedSprinting) {
+        ClientTickPackets packets = this.tickPackets;
+        List<String> notes = new ArrayList<>(packets.notes);
+        notes.add("the player did not tick, as its chunk or its vehicle's does not tick");
+        List<String> differences = new ArrayList<>();
+        if (packets.movePacket != null) {
+            differences.add("a movement was sent, while the player did not tick");
         }
-        return report;
+        if (packets.vehicleMove != null) {
+            differences.add("a vehicle position was sent, while the player did not tick");
+        }
+        this.addPlayerCommandDifferences(differences, tickPlayer);
+        if (differences.isEmpty()) {
+            return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
+        }
+        double predictedX = tickPlayer.getX();
+        double predictedY = tickPlayer.getY();
+        double predictedZ = tickPlayer.getZ();
+        boolean predictedOnGround = tickPlayer.onGround();
+        boolean predictedHorizontalCollision = tickPlayer.horizontalCollision;
+        boolean predictedSprinting = tickPlayer.isSprinting();
+        Verdict verdict = this.verdict(differences, List.of(), new ArrayList<>(packets.uncertainties), notes);
+        ReportedState reported = this.reportedState();
+        // - The client's player ticked and sent, as LocalPlayer.sendPosition counts its reminder -
+        if (packets.movePacket != null && this.isCameraOnPlayer()) {
+            this.lastSent.positionReminder++;
+        }
+        this.advanceLastSent(reported);
+        adoptReportedState(tickPlayer, reported, reportedSprinting, packets);
+        return new ClientTickReport(
+                clientTick, verdict.outcome(),
+                predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
+                reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
+                Double.NaN, null, this.tickStart, verdict.flags(), notes
+        );
     }
 
     // - ClientLevel.tickEntities reaching the local player while it rides nothing (see SandboxLevel.setLocalPlayerTick). -
     // - A tick with alternatives runs from a snapshot: when the simulated tick differs from what the client reported, -
     // - the alternatives and their combinations run from the same start, and the first that matches stays. When none -
     // - matches, the simulated tick runs again and has to come out as the first time, which shows that the snapshot -
-    // - held everything the tick changed. Blocks moving next to the player (pistons, shulker boxes) only move it -
-    // - after this point, so the tick is not judged here then; neither is it once snapshots failed on this connection -
+    // - held everything the tick changed. The player sends its movement at the end of its own tick (LocalPlayer.tick), -
+    // - before moving blocks (pistons, shulker boxes) move it, so the tick is judged right here, unless snapshots -
+    // - failed on this connection -
     private void tickLocalPlayer(SandboxLevel level, SandboxPlayer player) {
         List<TickAlternative> alternatives = this.tickPackets.alternatives;
         UncertainTridentUse uncertainUse = this.uncertainTridentUse;
@@ -1150,9 +1296,6 @@ final class PlayConnection implements ClientContext {
             return;
         }
         String unavailable = this.alternativesDisabled;
-        if (unavailable == null && level.hasEntityMovingBlockEntityNear(player.getBoundingBox().inflate(MOVING_BLOCK_REACH))) {
-            unavailable = "blocks move next to the player";
-        }
         TickStart start = null;
         if (unavailable == null) {
             try {
@@ -1347,13 +1490,15 @@ final class PlayConnection implements ClientContext {
     // - the held item at once, but MultiPlayerGameMode reports the new slot only at the start of the next tick unless -
     // - an action of this tick needed it first. While the player rides a vehicle it steers by what it holds (a pig -
     // - by a carrot on a stick, a strider by a warped fungus on a stick), this tick's packets show such a switch all -
-    // - the same: LocalPlayer.sendChanges sends the vehicle's position exactly while the client steers it. When they -
-    // - contradict the held item and no slot was reported after the tick's first packet, the sandbox selects the -
-    // - first hotbar slot that explains them. The next tick has to report the slot (see confirmInferredHotbarSwitch) -
-    private @Nullable InferredHotbarSwitch inferHotbarSwitch(SandboxPlayer player) {
+    // - the same: LocalPlayer.tick sends the vehicle's position exactly while the client steers it, as long as its -
+    // - player ticks, which it does with its vehicle (ClientLevel.tickEntities skips a vehicle whose chunk does not -
+    // - tick, or one that is removed). When they contradict the held item and no slot was reported after the tick's -
+    // - first packet, the sandbox selects the first hotbar slot that explains them. The next tick has to report the -
+    // - slot (see confirmInferredHotbarSwitch) -
+    private @Nullable InferredHotbarSwitch inferHotbarSwitch(SandboxLevel level, SandboxPlayer player) {
         Entity vehicle = player.getRootVehicle();
         boolean clientSteers = this.tickPackets.vehicleMove != null;
-        if (vehicle == player || vehicle.isLocalInstanceAuthoritative() == clientSteers) {
+        if (vehicle == player || vehicle.isRemoved() || !level.isTickingEntity(vehicle) || vehicle.isLocalInstanceAuthoritative() == clientSteers) {
             return null;
         }
         List<Packet<?>> actions = this.tickPackets.actions;
@@ -1383,46 +1528,13 @@ final class PlayConnection implements ClientContext {
         return null;
     }
 
-    // - How far the player's vehicle turns it during this tick, which the rotation a riding player reports already -
-    // - includes. AbstractBoat.positionRider turns a passenger the local client is authoritative for (the local -
-    // - player always is) by the boat's deltaRotation. A boat the client steers turns itself by the same amount -
-    // - (controlBoat); the client reports the boat's rotation after the tick, and the boat's rotation before it is -
-    // - the one the client reported last or the sandbox took over. A boat the client does not steer has no -
-    // - deltaRotation (AbstractBoat.tick). The turn is exact up to the rounding of these float rotations, which -
-    // - AbstractBoat.clampRotation adds to at every frame anyway (Entity.turn calls onPassengerTurned) -
-    private float passengerTurnOfTick(SandboxPlayer player) {
-        ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
-        AbstractBoat boat = turningBoat(player);
-        if (vehicleMove != null && boat != null && boat.isLocalInstanceAuthoritative()) {
-            return vehicleMove.movingTo().yRot() - boat.getYRot();
-        }
-        return 0.0F;
-    }
-
-    // - The boat whose AbstractBoat.positionRider turns the player at the end of the player's tick and clamps its -
-    // - yaw (clampRotation), unless the player's type can turn in boats -
-    private static @Nullable AbstractBoat turningBoat(SandboxPlayer player) {
-        return player.getVehicle() instanceof AbstractBoat boat && !player.is(EntityTypeTags.CAN_TURN_IN_BOATS) ? boat : null;
-    }
-
-    // - Minecart.positionRider turns a passenger player with the experimental minecart movement, but only while the -
-    // - client's "rotate with minecart" option is on (LocalPlayer.shouldRotateWithMinecart), which the server never -
-    // - learns. The rotation such a player acted with during a tick is then unknown -
-    private static boolean passengerTurnUnknown(SandboxPlayer player) {
-        return player.getVehicle() instanceof Minecart && AbstractMinecart.useExperimentalMovement(player.level());
-    }
-
-    // - An action whose outcome depends on the rotation the player had during the tick -
-    private void checkActionRotation(SandboxPlayer player, String action) {
-        if (passengerTurnUnknown(player)) {
-            this.tickPackets.uncertainties.add(action + " with a rotation the minecart may have turned");
-        }
-    }
 
     // - A tick that is not simulated, since its simulation failed partway or it came too soon (see skipTick). Nothing -
     // - the client sent is checked, so the tick is MISMATCHED with the reason, and the sandbox takes over what the -
-    // - client reported, as after a mismatch, so that the next tick starts from where the client is -
-    private ClientTickReport unsimulatedTick(long clientTick, Flag rejection) {
+    // - client reported, as after a mismatch, so that the next tick starts from where the client is. A tick whose -
+    // - simulation failed after it compared what the player sent (movementCompared) took over the client's state -
+    // - there already, and the rest of its tick went on from it -
+    private ClientTickReport unsimulatedTick(long clientTick, Flag rejection, boolean movementCompared) {
         ClientTickPackets packets = this.tickPackets;
         ReportedState reported = this.reportedState();
         boolean reportedSprinting = this.lastSent.sprinting;
@@ -1444,12 +1556,16 @@ final class PlayConnection implements ClientContext {
             predictedOnGround = failedPlayer.onGround();
             predictedHorizontalCollision = failedPlayer.horizontalCollision;
             predictedSprinting = failedPlayer.isSprinting();
-            adoptReportedState(failedPlayer, reported, reportedSprinting, packets);
+            if (!movementCompared) {
+                adoptReportedState(failedPlayer, reported, reportedSprinting, packets);
+            }
         }
-        if (this.isCameraOnPlayer()) {
-            this.lastSent.positionReminder++;
+        if (!movementCompared) {
+            if (this.isCameraOnPlayer()) {
+                this.lastSent.positionReminder++;
+            }
+            this.advanceLastSent(reported);
         }
-        this.advanceLastSent(reported);
         return new ClientTickReport(
                 clientTick, TickOutcome.MISMATCHED,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
@@ -1699,8 +1815,17 @@ final class PlayConnection implements ClientContext {
     private record CheckedAction(String description, long packet, int predictionSequence) {
     }
 
-    // - An item use while a boat turns the player: the use, the rotation the client sent with it and the boat -
-    private record RiderUse(CheckedAction action, float yRot, float xRot, AbstractBoat boat) {
+    // - The client tick being simulated (see tickInProgress): its number, the player, the sprinting it reported, the -
+    // - main hand item the player used as the tick began, and where the player and the vehicle it rode were then -
+    private record TickInProgress(
+            long clientTick, SandboxPlayer player, boolean reportedSprinting, ItemStack usedMainHandItem, Vec3 positionBeforeTick, Entity vehicleBeforeTick,
+            Vec3 vehiclePositionBeforeTick
+    ) {
+    }
+
+    // - What the comparison at the player's send found (see reportSentTick): the tick's report, and the items whose -
+    // - use the next tick has to account for before the report stands (see releaseHeldReport) -
+    private record SentTick(ClientTickReport report, ItemStack heldUsedItem, ItemStack heldStoppedItem) {
     }
 
     // - A trident use the sandbox is unsure of (see uncertainTridentUse): the hand, the trident, and the client tick in -
@@ -1718,7 +1843,6 @@ final class PlayConnection implements ClientContext {
     // - keyHandlingReport). Without such a report, the slot is known to be the one selected already once the tick -
     // - shows an action that would have reported another -
     private void performTickActions(SandboxLevel level, SandboxPlayer player) {
-        this.riderUses.clear();
         List<Packet<?>> actions = this.tickPackets.actions;
         if (actions.isEmpty()) {
             return;
@@ -1746,14 +1870,14 @@ final class PlayConnection implements ClientContext {
         int keyHandlingReport = keyHandlingReport(actions);
         int firstKeyHandlingAction = actions.getFirst() instanceof ServerboundSetCarriedItemPacket ? 1 : 0;
         boolean keyHandlingSlotKnown = keyHandlingReport >= 0 || actions.stream().anyMatch(PlayConnection::reportsCarriedItem);
-        boolean swingAccompanied = false;
+        InteractionHand accompaniedSwing = null;
         for (int index = 0; index < actions.size(); index++) {
             if (index == firstKeyHandlingAction && keyHandlingReport > index) {
                 this.selectHotbarSlot(player, ((ServerboundSetCarriedItemPacket) actions.get(keyHandlingReport)).getSlot(), false);
             }
             Packet<?> action = actions.get(index);
             try {
-                swingAccompanied = this.performTickAction(action, index, leadingSwitch, start, keyHandlingSlotKnown, swingAccompanied, level, player);
+                accompaniedSwing = this.performTickAction(action, index, leadingSwitch, start, keyHandlingSlotKnown, accompaniedSwing, level, player);
             } catch (RuntimeException problem) {
                 this.problemLog.log("rejected " + action.type() + " replayed at the end of a client tick", problem);
                 this.tickPackets.reject(Check.BAD_PACKETS, action.type() + " could not be performed (" + problem + ")");
@@ -1761,17 +1885,18 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - Performs one action of the tick; returns whether a swing that follows is part of an attack or a block action. -
-    // - Every action is checked against what the client's key handling allows before it is performed; the sandbox -
-    // - still performs a rejected one as the client did, since the client's player went on from it. keyHandlingSlotKnown -
-    // - tells whether the tick shows the slot its key handling acted with (see performTickActions) -
-    private boolean performTickAction(
+    // - Performs one action of the tick; returns the hand of the swing that belongs to it when one follows right -
+    // - after it (see swingAfter), null when a swing that follows would be one of the key handling's own. Every action -
+    // - is checked against what the client's key handling allows before it is performed; the sandbox still performs a -
+    // - rejected one as the client did, since the client's player went on from it. keyHandlingSlotKnown tells whether -
+    // - the tick shows the slot its key handling acted with (see performTickActions) -
+    private @Nullable InteractionHand performTickAction(
             Packet<?> action,
             int index,
             @Nullable ServerboundSetCarriedItemPacket leadingSwitch,
             KeyHandlingStart start,
             boolean keyHandlingSlotKnown,
-            boolean swingAccompanied,
+            @Nullable InteractionHand accompaniedSwing,
             SandboxLevel level,
             SandboxPlayer player
     ) {
@@ -1785,19 +1910,20 @@ final class PlayConnection implements ClientContext {
             case ServerboundPlayerActionPacket playerAction -> {
                 Packet<?> next = this.nextAction(index);
                 this.checkPlayerAction(level, player, playerAction, packet, next, keyHandlingSlotKnown, start);
-                return this.performPlayerAction(playerAction, next, keyHandlingSlotKnown, this.onlySwingsFollow(index), level, player) || swingAccompanied;
+                InteractionHand swing = this.performPlayerAction(playerAction, next, keyHandlingSlotKnown, this.onlySwingsFollow(index), level, player);
+                return swing != null ? swing : accompaniedSwing;
             }
             case ServerboundUseItemOnPacket useItemOn -> {
                 this.checkUseItemOn(level, player, useItemOn, packet, start);
-                // - A placed block faces by the player's rotation -
-                this.checkActionRotation(player, "used an item on a block");
-                this.gameMode.useItemOn(level, player, useItemOn.hand(), useItemOn.hitResult(), useItemOn.sequence(), this.tickPackets);
+                InteractionResult result = this.gameMode.useItemOn(level, player, useItemOn.getHand(), useItemOn.getHitResult(), useItemOn.getSequence(),
+                        this.tickPackets);
+                return swingAfter(useItemOn.getHand(), result, accompaniedSwing);
             }
             case ServerboundUseItemPacket useItem -> {
                 // - The rotation the packet carries is the player's own, which the tick's movement reported (see -
                 // - checkUseItem); the player keeps that one -
                 this.checkUseItem(level, player, useItem, packet, start);
-                this.useItem(level, player, useItem);
+                return swingAfter(useItem.getHand(), this.useItem(level, player, useItem), accompaniedSwing);
             }
             case ServerboundAttackPacket attack -> {
                 Entity target = level.getEntity(attack.entityId());
@@ -1812,32 +1938,51 @@ final class PlayConnection implements ClientContext {
                     this.checkSwingFollows(checkedAttack, next);
                     this.attackEntity(level, player, target, this.onlySwingsFollow(index));
                 }
-                return true;
+                return InteractionHand.MAIN_HAND;
             }
             case ServerboundInteractPacket interact -> {
                 Entity target = level.getEntity(interact.entityId());
                 if (target == null) {
                     // - What interacting does on the client never moves the player, but it may use up or fill the -
-                    // - held item -
+                    // - held item. Whether the client's player swung its hand after it is unknown as well, so a swing -
+                    // - of that hand right after it counts as its own -
                     this.tickPackets.notes.add("interacted with entity " + interact.entityId() + ", which the sandbox does not know");
                     this.markInventoryUnknown(InventoryMenu.CONTAINER_ID);
-                } else {
-                    this.checkInteraction(level, player, target, interact.hand(),
-                            new CheckedAction("interacted with " + describeEntity(target), packet, Flag.NO_PREDICTION), start);
-                    this.gameMode.interact(player, target, interact.hand(), interact.location());
+                    return interact.hand();
                 }
+                this.checkInteraction(level, player, target, interact.hand(),
+                        new CheckedAction("interacted with " + describeEntity(target), packet, Flag.NO_PREDICTION), start);
+                return swingAfter(interact.hand(), this.gameMode.interact(player, target, interact.hand(), interact.location()), accompaniedSwing);
             }
-            case ServerboundPunchPacket ignored -> {
-                if (!swingAccompanied) {
-                    // - What the crosshair pointed at depends on the player's rotation -
-                    this.checkActionRotation(player, "swung at what the crosshair pointed at");
-                    this.gameMode.swingAlone(level, player, start.crosshair(), index == actions.size() - 1, this.uncertainBreakOnSight(start) == null);
+            case ServerboundSwingPacket swing -> {
+                if (swing.getHand() == accompaniedSwing) {
+                    // - The swing of the action right before it -
+                    return null;
                 }
-                return false;
+                if (swing.getHand() != InteractionHand.MAIN_HAND) {
+                    this.tickPackets.rejectAction(Check.BAD_PACKETS, "swung its off hand without an item use of that hand right before, which a vanilla "
+                            + "client never does", packet, Flag.NO_PREDICTION);
+                    return null;
+                }
+                this.gameMode.swingAlone(level, player, start.crosshair(), index == actions.size() - 1, this.uncertainBreakOnSight(start) == null);
+                return null;
             }
             default -> throw new IllegalArgumentException("No handler for the action " + action.type());
         }
-        return swingAccompanied;
+        return accompaniedSwing;
+    }
+
+    // - Minecraft.startUseItem swings the hand it used right after an item use or an interaction that succeeded with a -
+    // - swing of the client (InteractionResult.SwingSource.CLIENT); LocalPlayer.swing sends that swing. A swing of the -
+    // - off hand can only come from such a use, so one right after an off hand use belongs to it even where the -
+    // - sandbox's use did not swing; a swing of the main hand after a use that did not swing is one of the key -
+    // - handling's own (Minecraft.continueAttack's) -
+    private static @Nullable InteractionHand swingAfter(InteractionHand hand, InteractionResult result, @Nullable InteractionHand accompaniedSwing) {
+        if (result instanceof InteractionResult.Success success && success.swingSource() == InteractionResult.SwingSource.CLIENT
+                || hand == InteractionHand.OFF_HAND) {
+            return hand;
+        }
+        return accompaniedSwing;
     }
 
     // - What the client's key handling could do depends on the items it held: the item in the hand, the attack range -
@@ -1906,12 +2051,12 @@ final class PlayConnection implements ClientContext {
             if (distance > maximumRange) {
                 this.rejectOutOfReach(action, distance, maximumRange, describeItem(weapon));
             } else {
-                this.rejectCrosshairMiss(action, player, target, start, maximumRange);
+                this.rejectCrosshairMiss(action, target, start, maximumRange);
             }
         } else if (distance >= player.entityInteractionRange()) {
             this.rejectOutOfReach(action, distance, player.entityInteractionRange(), "the player");
         } else {
-            this.rejectCrosshairMiss(action, player, target, start, player.entityInteractionRange());
+            this.rejectCrosshairMiss(action, target, start, player.entityInteractionRange());
         }
     }
 
@@ -1947,18 +2092,17 @@ final class PlayConnection implements ClientContext {
         if (!player.isWithinEntityInteractionRange(target, 0.0)) {
             this.rejectOutOfReach(action, Math.sqrt(target.getBoundingBox().distanceToSqr(player.getEyePosition())), reach, "the player");
         } else if (start.hitsOn(target).isEmpty()) {
-            this.rejectCrosshairMiss(action, player, target, start, reach);
+            this.rejectCrosshairMiss(action, target, start, reach);
         }
     }
 
     // - The block actions of MultiPlayerGameMode and the stab of a piercing weapon, as the client's key handling -
     // - allows them (see checkBlockBreaking and checkStab). The client drops, swaps and releases items whenever it -
-    // - handles its keys, and aborts breaking whenever it stops, also while the server teleports it -
-    // - (ClientPacketListener.handleMovePlayer): those only change what the client itself holds or breaks. Whether the -
-    // - client could finish or turn depends on its mining state, which the sandbox knows only while no start of -
-    // - breaking left it open (SandboxGameMode.miningStateKnown); a finish or turn comes from continueDestroyBlock, -
+    // - handles its keys, and aborts breaking whenever it stops: those only change what the client itself holds or -
+    // - breaks. Whether the client could finish depends on its mining state, which the sandbox knows only while no -
+    // - start of breaking left it open (SandboxGameMode.miningStateKnown); a finish comes from continueDestroyBlock, -
     // - which reports the slot it acts with first, while a start's item is known as keyHandlingSlotKnown tells. A -
-    // - start, a finish and a turn are followed by their swing (see checkSwingFollows); next is the tick's action -
+    // - start, a finish and a stab are followed by their swing (see checkSwingFollows); next is the tick's action -
     // - after this one, null when this one ends the tick's actions -
     private void checkPlayerAction(
             SandboxLevel level, SandboxPlayer player, ServerboundPlayerActionPacket action, long packet, @Nullable Packet<?> next,
@@ -1984,46 +2128,42 @@ final class PlayConnection implements ClientContext {
                 }
                 this.checkSwingFollows(finish, next);
             }
-            case CHANGE_DESTROY_DIRECTION -> {
-                CheckedAction turn = new CheckedAction("turned to another face of " + describeBlock(level, pos) + " while breaking it", packet, prediction);
-                this.checkBlockBreaking(level, player, turn, pos, action.getDirection(), false, true, start);
-                // - MultiPlayerGameMode.continueDestroyBlock only turns while it goes on breaking that block -
-                if (!this.gameMode.sameDestroyTarget(player, pos)) {
-                    this.rejectUnlessUncertain(turn, Check.INTERACTION, turn.description() + ", which a vanilla client only does for the block it is breaking",
-                            miningStateUnknown);
-                }
-                this.checkSwingFollows(turn, next);
+            case STAB -> {
+                CheckedAction stab = new CheckedAction("stabbed", packet, Flag.NO_PREDICTION);
+                this.checkStab(level, player, stab, start);
+                this.checkSwingFollows(stab, next);
             }
-            case STAB -> this.checkStab(level, player, new CheckedAction("stabbed", packet, Flag.NO_PREDICTION), start);
             case ABORT_DESTROY_BLOCK, DROP_ITEM, DROP_ALL_ITEMS, RELEASE_USE_ITEM, SWAP_ITEM_WITH_OFFHAND -> {
             }
         }
     }
 
-    // - Minecraft.startAttack swings right after every attack and every start of breaking it makes, and continueAttack -
-    // - right after every tick in which continueDestroyBlock went on breaking, which is where the finish, the turn and -
-    // - a start on another block or in creative mode come from: the player's own swing (LivingEntity.swing, which -
-    // - sends nothing on the client) and then ServerboundPunchPacket, before the key handling sends anything else. -
+    // - Minecraft.startAttack swings the main hand right after every attack, every start of breaking and every stab it -
+    // - makes, and continueAttack right after every tick in which continueDestroyBlock went on breaking, which is -
+    // - where the finish and a start on another block or in creative mode come from: LocalPlayer.swing swings the -
+    // - player and sends ServerboundSwingPacket, before the key handling sends anything else. -
     // - MultiPlayerGameMode.attack is the only sender of an attack and startAttack its only caller, and the block -
-    // - actions come only from startAttack and continueAttack (see checkBlockBreaking), so a vanilla client follows -
-    // - each of these actions with a swing as the tick's next action; a stab (MultiPlayerGameMode.piercingAttack) and -
-    // - an abort have none. The server shows the other players the swing of an attack or a break only for that packet -
-    // - (ServerGamePacketListenerImpl.handlePunch), so a client that leaves it out hides its attacks and breaks from -
-    // - them. The swing does not depend on the items, so it is checked also while the sandbox's items differ from the -
-    // - client's (see reject). next is the tick's action after this one, null when this one ends the tick's actions -
+    // - actions and the stab come only from startAttack and continueAttack (see checkBlockBreaking and checkStab), so -
+    // - a vanilla client follows each of these actions with a swing of the main hand as the tick's next action; an -
+    // - abort has none. The server shows the other players the swing of an attack or a break only for that packet -
+    // - (ServerGamePacketListenerImpl.handleAnimate), so a client that leaves it out hides them from them; it swings -
+    // - the arm for a stab itself (PiercingWeapon.attack), but no vanilla client leaves out the swing after one. The -
+    // - swing does not depend on the items, so it is checked also while the sandbox's items differ from the client's -
+    // - (see reject). The swings after item uses and drops depend on what they did, so their absence is not checked. -
+    // - next is the tick's action after this one, null when this one ends the tick's actions -
     private void checkSwingFollows(CheckedAction action, @Nullable Packet<?> next) {
-        if (!(next instanceof ServerboundPunchPacket)) {
+        if (!(next instanceof ServerboundSwingPacket swing && swing.getHand() == InteractionHand.MAIN_HAND)) {
             this.tickPackets.rejectAction(Check.NO_SWING, action.description() + " without the swing a vanilla client sends right after it",
                     action.packet(), action.predictionSequence());
         }
     }
 
     // - MultiPlayerGameMode.startDestroyBlock and continueDestroyBlock, from Minecraft.startAttack and continueAttack, -
-    // - the only senders of START_DESTROY_BLOCK, STOP_DESTROY_BLOCK and CHANGE_DESTROY_DIRECTION. They act on the block -
+    // - the only senders of START_DESTROY_BLOCK and STOP_DESTROY_BLOCK. They act on the block -
     // - and face the crosshair points at, which is not air (both skip air). startAttack does nothing while the player -
     // - uses an item as the key handling starts, and continueAttack, which comes after everything else in it, while -
     // - the player uses one then (a release earlier in the tick ends the use), so a start needs either free and a -
-    // - finish or turn the latter. Neither breaks blocks with a piercing weapon: startAttack stabs with it, and -
+    // - finish the latter. Neither breaks blocks with a piercing weapon: startAttack stabs with it, and -
     // - continueAttack leaves blocks alone. A start also leaves alone a block the game mode keeps the player from -
     // - breaking (Player.blockActionRestricted) and one outside the world border. The item the client started with is -
     // - only known when itemKnown (see SandboxGameMode.startDestroyBlock), so otherwise a check that depends on it -
@@ -2056,13 +2196,13 @@ final class PlayConnection implements ClientContext {
     // - BlockHitResult.STREAM_CODEC encodes it (see sentAs), only inside the world border, and only while the use key -
     // - acts (see checkHandsFree), the player breaks no block and the hands up to this one hold enabled items -
     private void checkUseItemOn(SandboxLevel level, SandboxPlayer player, ServerboundUseItemOnPacket useItemOn, long packet, KeyHandlingStart start) {
-        BlockHitResult sent = useItemOn.hitResult();
+        BlockHitResult sent = useItemOn.getHitResult();
         BlockPos pos = sent.getBlockPos();
-        CheckedAction action = new CheckedAction("used " + describeItem(player.getItemInHand(useItemOn.hand())) + " on " + describeBlock(level, pos),
-                packet, predictionOf(useItemOn.sequence()));
+        CheckedAction action = new CheckedAction("used " + describeItem(player.getItemInHand(useItemOn.getHand())) + " on " + describeBlock(level, pos),
+                packet, predictionOf(useItemOn.getSequence()));
         this.checkHandsFree(action, "use", start);
         this.checkNotBreaking(action);
-        this.checkItemsEnabled(level, player, useItemOn.hand(), action);
+        this.checkItemsEnabled(level, player, useItemOn.getHand(), action);
         if (!level.getWorldBorder().isWithinBounds(pos)) {
             this.reject(action, Check.INTERACTION, action.description() + " outside the world border");
         }
@@ -2110,12 +2250,12 @@ final class PlayConnection implements ClientContext {
     // - a spectator (useItem sends nothing then), only while the use key acts (see checkHandsFree), the player breaks -
     // - no block and the hands up to this one hold enabled items, and facing where the player faces: the packet -
     // - carries the player's rotation of that moment. Nothing turns the player between the key handling and the end -
-    // - of its tick but a boat it rides (turningBoat) and a minecart that may turn it (see passengerTurnUnknown), so -
-    // - the rotation the tick's movement reported (see simulateTick) is that rotation exactly. A boat turns only the -
-    // - yaw, which is decided after the tick (see checkRiderUses) -
+    // - of its own tick, where LocalPlayer.tick reports the rotation; a vehicle turns a rider only after that -
+    // - (Entity.rideTick), so the rotation the tick's movement reported (see simulateTick) is that rotation exactly, -
+    // - also while the player rides -
     private void checkUseItem(SandboxLevel level, SandboxPlayer player, ServerboundUseItemPacket useItem, long packet, KeyHandlingStart start) {
-        ItemStack item = player.getItemInHand(useItem.hand());
-        CheckedAction action = new CheckedAction("used " + describeItem(item), packet, predictionOf(useItem.sequence()));
+        ItemStack item = player.getItemInHand(useItem.getHand());
+        CheckedAction action = new CheckedAction("used " + describeItem(item), packet, predictionOf(useItem.getSequence()));
         this.checkHandsFree(action, "use", start);
         this.checkNotBreaking(action);
         if (this.gameMode.isSpectator()) {
@@ -2124,78 +2264,11 @@ final class PlayConnection implements ClientContext {
         if (item.isEmpty()) {
             this.reject(action, Check.INTERACTION, action.description() + ", an empty hand, which a vanilla client does not use");
         }
-        this.checkItemsEnabled(level, player, useItem.hand(), action);
-        if (passengerTurnUnknown(player)) {
-            this.tickPackets.notes.add("not checked: " + action.description() + " with a rotation the minecart may have turned");
-            return;
-        }
-        AbstractBoat boat = turningBoat(player);
-        // - Entity.setYRot keeps a vanilla client's yaw finite, so a yaw that is not can be rejected right away -
-        boolean yawAfterTick = boat != null && Float.isFinite(useItem.yRot());
-        if (useItem.xRot() != player.getXRot() || !yawAfterTick && useItem.yRot() != player.getYRot()) {
+        this.checkItemsEnabled(level, player, useItem.getHand(), action);
+        if (useItem.getXRot() != player.getXRot() || useItem.getYRot() != player.getYRot()) {
             this.reject(action, Check.HITBOX, String.format(Locale.ROOT, "%s facing %.3f/%.3f, where the player faced %.3f/%.3f (yaw/pitch)",
-                    action.description(), useItem.yRot(), useItem.xRot(), player.getYRot(), player.getXRot()));
-        } else if (yawAfterTick) {
-            this.riderUses.add(new RiderUse(action, useItem.yRot(), useItem.xRot(), boat));
+                    action.description(), useItem.getYRot(), useItem.getXRot(), player.getYRot(), player.getXRot()));
         }
-    }
-
-    // - The yaw a boat's rider used items with (see checkUseItem), once the tick has turned the boat: -
-    // - AbstractBoat.positionRider turns the rider by the boat's turn of the tick and clampRotation keeps its yaw -
-    // - within 105 degrees of the boat's, after which the client reports the rider's rotation (LocalPlayer.sendChanges). -
-    // - The sandbox's boat, as the tick left it, turns the yaw the item was used with the same way, and has to arrive -
-    // - where the client's rider did, up to the rounding RIDER_ROTATION_ULPS allows. A boat the client steers has to -
-    // - have turned as the client reported, as it decides the rider's turn; one it does not steer turns neither itself -
-    // - nor its rider during the tick (AbstractBoat.tick) and follows the server like the client's -
-    private void checkRiderUses(SandboxPlayer player) {
-        if (this.riderUses.isEmpty()) {
-            return;
-        }
-        ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
-        ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
-        for (RiderUse use : this.riderUses) {
-            AbstractBoat boat = use.boat();
-            String unchecked = null;
-            if (player.getVehicle() != boat) {
-                unchecked = "the player no longer rode that boat after the tick";
-            } else if (movePacket == null || !movePacket.hasRotation()) {
-                unchecked = "the client reported no rotation after the tick";
-            } else if (boat.isLocalInstanceAuthoritative()
-                    && (boat != player.getRootVehicle() || vehicleMove == null || vehicleMove.movingTo().yRot() != boat.getClientPositionAndRotation().yRot())) {
-                unchecked = "the sandbox did not turn the boat as the client reported";
-            }
-            String described = String.format(Locale.ROOT, "%s facing %.3f/%.3f (yaw/pitch) in a boat", use.action().description(), use.yRot(), use.xRot());
-            if (unchecked != null) {
-                this.tickPackets.notes.add("not checked: " + described + ", since " + unchecked);
-                continue;
-            }
-            float reportedYaw = movePacket.getYRot(player.getYRot());
-            float turnedYaw = riderYawAfterBoatTurn(player, boat, use.yRot());
-            float tolerance = RIDER_ROTATION_ULPS * Math.ulp(Math.max(Math.abs(reportedYaw), Math.abs(boat.getYRot())) + HALF_TURN_DEGREES);
-            if (Math.abs(turnedYaw - reportedYaw) > tolerance) {
-                this.reject(use.action(), Check.HITBOX, String.format(Locale.ROOT, "%s, which the boat turns to a yaw of %.3f, where the client reported %.3f",
-                        described, turnedYaw, reportedYaw));
-            }
-        }
-        this.riderUses.clear();
-    }
-
-    // - The yaw AbstractBoat.positionRider turns the player to from this yaw, run on the boat and the player as the -
-    // - tick left them. Everything positionRider changes on the player is put back afterwards: its yaw, the head and -
-    // - body yaw, and its position, which a piston may have moved after the boat positioned it -
-    private static float riderYawAfterBoatTurn(SandboxPlayer player, AbstractBoat boat, float yaw) {
-        float yRot = player.getYRot();
-        float yHeadRot = player.getYHeadRot();
-        float yBodyRot = player.yBodyRot;
-        Vec3 position = player.position();
-        player.setYRot(yaw);
-        boat.positionRider(player);
-        float turned = player.getYRot();
-        player.setYRot(yRot);
-        player.setYHeadRot(yHeadRot);
-        player.setYBodyRot(yBodyRot);
-        player.setPos(position);
-        return turned;
     }
 
     // - MultiPlayerGameMode.piercingAttack, from Minecraft.startAttack: only while the attack key acts (see -
@@ -2256,15 +2329,9 @@ final class PlayConnection implements ClientContext {
 
     // - The crosshair did not point at the target, although the target lay within reach: it is an entity the crosshair -
     // - never points at (EntitySelector.CAN_BE_PICKED), or the crosshair pointed at something in front of it or beside -
-    // - it. The sight line reaches as far as the action does. Where the player rides a minecart that may have turned -
-    // - it (see passengerTurnUnknown), the rotation the player acted with is unknown, and so is where the crosshair -
-    // - pointed; where the client may have broken a block on the sight line otherwise than the sandbox, so is what -
-    // - the crosshair met -
-    private void rejectCrosshairMiss(CheckedAction action, SandboxPlayer player, Entity target, KeyHandlingStart start, double reach) {
-        if (passengerTurnUnknown(player)) {
-            this.tickPackets.notes.add("not checked: " + action.description() + " with a rotation the minecart may have turned");
-            return;
-        }
+    // - it. The sight line reaches as far as the action does. Where the client may have broken a block on the sight -
+    // - line otherwise than the sandbox, what the crosshair met is unknown -
+    private void rejectCrosshairMiss(CheckedAction action, Entity target, KeyHandlingStart start, double reach) {
         HitResult crosshair = start.crosshair();
         if (!EntitySelector.CAN_BE_PICKED.test(target)) {
             this.reject(action, Check.HITBOX, action.description() + ", which the crosshair never points at");
@@ -2285,14 +2352,11 @@ final class PlayConnection implements ClientContext {
 
     // - The action's block face was not one the crosshair pointed at: the block lay out of the player's block -
     // - interaction range (Player.isWithinBlockInteractionRange, which Minecraft.pick's reach matches), or within it but -
-    // - the crosshair pointed elsewhere, which is unknown in a minecart that may have turned the player (see -
-    // - passengerTurnUnknown) and where the client may have broken a block on the sight line otherwise than the -
-    // - sandbox -
+    // - the crosshair pointed elsewhere, which is unknown where the client may have broken a block on the sight line -
+    // - otherwise than the sandbox -
     private void rejectBlockMiss(CheckedAction action, SandboxPlayer player, BlockPos pos, KeyHandlingStart start, String face) {
         if (!player.isWithinBlockInteractionRange(pos, 0.0)) {
             this.rejectOutOfReach(action, Math.sqrt(new AABB(pos).distanceToSqr(player.getEyePosition())), player.blockInteractionRange(), "the player");
-        } else if (passengerTurnUnknown(player)) {
-            this.tickPackets.notes.add("not checked: " + action.description() + " with a rotation the minecart may have turned");
         } else {
             this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + " at " + face + ", which the crosshair did not point at: it pointed at "
                     + describeCrosshair(start, true), this.uncertainBreakOnSight(start));
@@ -2349,13 +2413,13 @@ final class PlayConnection implements ClientContext {
     }
 
     // - The packets MultiPlayerGameMode sends right after ensureHasSentCarriedItem, which reports a slot the hotbar -
-    // - keys selected before them: dropping and releasing an item, stabbing, finishing or turning while breaking -
-    // - (continueDestroyBlock), attacking, interacting and using an item -
+    // - keys selected before them: releasing an item, stabbing, finishing while breaking (continueDestroyBlock), -
+    // - attacking, interacting and using an item. LocalPlayer.drop sends its drop without it -
     private static boolean reportsCarriedItem(Packet<?> packet) {
         return switch (packet) {
             case ServerboundPlayerActionPacket playerAction -> switch (playerAction.getAction()) {
-                case DROP_ITEM, DROP_ALL_ITEMS, RELEASE_USE_ITEM, STAB, STOP_DESTROY_BLOCK, CHANGE_DESTROY_DIRECTION -> true;
-                case START_DESTROY_BLOCK, ABORT_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND -> false;
+                case RELEASE_USE_ITEM, STAB, STOP_DESTROY_BLOCK -> true;
+                case START_DESTROY_BLOCK, ABORT_DESTROY_BLOCK, DROP_ITEM, DROP_ALL_ITEMS, SWAP_ITEM_WITH_OFFHAND -> false;
             };
             case ServerboundAttackPacket ignored -> true;
             case ServerboundInteractPacket ignored -> true;
@@ -2432,7 +2496,7 @@ final class PlayConnection implements ClientContext {
     private boolean onlySwingsFollow(int index) {
         List<Packet<?>> actions = this.tickPackets.actions;
         for (int later = index + 1; later < actions.size(); later++) {
-            if (!(actions.get(later) instanceof ServerboundPunchPacket)) {
+            if (!(actions.get(later) instanceof ServerboundSwingPacket)) {
                 return false;
             }
         }
@@ -2448,8 +2512,8 @@ final class PlayConnection implements ClientContext {
     // - MultiPlayerGameMode.useItem. A vanilla client uses an item only while it uses none (Minecraft.handleKeybinds), -
     // - so a use during a trident use the sandbox is unsure of shows that the client's never began. Where a riptide -
     // - trident's start depends on rain the client's sky light may not show yet, the sandbox is unsure of the client's -
-    // - use from here on -
-    private void useItem(SandboxLevel level, SandboxPlayer player, ServerboundUseItemPacket useItem) {
+    // - use from here on. Returns what the use resulted in -
+    private InteractionResult useItem(SandboxLevel level, SandboxPlayer player, ServerboundUseItemPacket useItem) {
         UncertainTridentUse uncertain = this.uncertainTridentUse;
         if (uncertain != null) {
             this.uncertainTridentUse = null;
@@ -2458,13 +2522,14 @@ final class PlayConnection implements ClientContext {
                 this.tickPackets.notes.add("the client's use of " + describeItem(uncertain.trident()) + " had not begun, as its next use of an item shows");
             }
         }
-        ItemStack item = player.getItemInHand(useItem.hand());
+        ItemStack item = player.getItemInHand(useItem.getHand());
         boolean rainUncertain = tridentStartDependsOnLaggingRain(level, player, item);
         ItemStack trident = item.copy();
-        this.gameMode.useItem(level, player, useItem.hand(), useItem.sequence(), this.tickPackets);
+        InteractionResult result = this.gameMode.useItem(level, player, useItem.getHand(), useItem.getSequence(), this.tickPackets);
         if (rainUncertain) {
-            this.uncertainTridentUse = new UncertainTridentUse(useItem.hand(), trident, this.currentClientTick);
+            this.uncertainTridentUse = new UncertainTridentUse(useItem.getHand(), trident, this.currentClientTick);
         }
+        return result;
     }
 
     // - MultiPlayerGameMode.releaseUsingItem. A vanilla client releases only an item it uses, so a release ends a -
@@ -2614,50 +2679,64 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - Returns whether the action belongs to a swing, which then needs no further interpretation. lastChange tells -
-    // - whether only swings follow it in the tick (see onlySwingsFollow) -
-    private boolean performPlayerAction(
+    // - Returns the hand of the swing that belongs to the action when one follows right after it (see -
+    // - performTickAction), null when a swing that follows would be one of its own. lastChange tells whether only -
+    // - swings follow it in the tick (see onlySwingsFollow) -
+    private @Nullable InteractionHand performPlayerAction(
             ServerboundPlayerActionPacket action, @Nullable Packet<?> next, boolean keyHandlingSlotKnown, boolean lastChange, SandboxLevel level,
             SandboxPlayer player
     ) {
         switch (action.getAction()) {
             case START_DESTROY_BLOCK -> {
                 this.gameMode.startDestroyBlock(level, player, action.getPos(), action.getSequence(), keyHandlingSlotKnown, this.tickPackets);
-                return true;
+                return InteractionHand.MAIN_HAND;
             }
             case STOP_DESTROY_BLOCK -> {
                 this.gameMode.finishDestroyBlock(level, player, action.getPos(), action.getSequence(), this.tickPackets);
-                return true;
+                return InteractionHand.MAIN_HAND;
             }
             case ABORT_DESTROY_BLOCK -> {
                 boolean switchingTarget = next instanceof ServerboundPlayerActionPacket nextAction
                         && nextAction.getAction() == ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK;
                 this.gameMode.abortDestroyBlock(player, switchingTarget);
-                return false;
+                return null;
             }
-            case CHANGE_DESTROY_DIRECTION, SWAP_ITEM_WITH_OFFHAND -> {
-                // - Mining goes on, and the swing that follows adds its progress; the server swaps the hands and -
-                // - reports both slots -
-                return false;
+            case SWAP_ITEM_WITH_OFFHAND -> {
+                // - The server swaps the hands and reports both slots -
+                return null;
             }
             case DROP_ITEM -> {
-                this.gameMode.dropItem(player, false);
-                return false;
+                return this.dropItem(player, false, keyHandlingSlotKnown);
             }
             case DROP_ALL_ITEMS -> {
-                this.gameMode.dropItem(player, true);
-                return false;
+                return this.dropItem(player, true, keyHandlingSlotKnown);
             }
             case RELEASE_USE_ITEM -> {
                 this.releaseUsingItem(level, player, lastChange);
-                return false;
+                return null;
             }
             case STAB -> {
+                // - Minecraft.startAttack swings right after MultiPlayerGameMode.piercingAttack -
                 this.gameMode.piercingAttack(player);
-                return false;
+                return InteractionHand.MAIN_HAND;
             }
         }
         throw new IllegalArgumentException("Unknown player action " + action.getAction());
+    }
+
+    // - Minecraft.handleKeybinds drops with LocalPlayer.drop and swings the main hand when the drop removed anything -
+    // - from the selected slot. The drop does not report the slot first (it does not call -
+    // - MultiPlayerGameMode.ensureHasSentCarriedItem), so unless keyHandlingSlotKnown, the client may have dropped -
+    // - from a slot a hotbar key selected in this tick, which only its next tick reports. The swing then follows -
+    // - wherever any hotbar item could have been dropped. Returns the hand of the swing that belongs to the drop -
+    private @Nullable InteractionHand dropItem(SandboxPlayer player, boolean all, boolean keyHandlingSlotKnown) {
+        boolean slotMayDiffer = !keyHandlingSlotKnown && SandboxGameMode.anyOtherHotbarItem(player, () -> true);
+        boolean otherSlotDrops = slotMayDiffer && SandboxGameMode.anyOtherHotbarItem(player, () -> !player.getMainHandItem().isEmpty());
+        boolean dropped = this.gameMode.dropItem(player, all);
+        if (slotMayDiffer) {
+            this.tickPackets.uncertainties.add("the client may have dropped from a hotbar slot a key selected in this tick, which its next tick reports");
+        }
+        return dropped || otherSlotDrops ? InteractionHand.MAIN_HAND : null;
     }
 
     // - What the sandbox cannot know about the tick's movement beyond the tick's own packets: the items, when they -
@@ -2699,7 +2778,7 @@ final class PlayConnection implements ClientContext {
             swept = swept.minmax(vehicleBeforeTick.getBoundingBox()).minmax(vehicleDimensions.makeBoundingBox(vehiclePositionBeforeTick));
             ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
             if (vehicleMove != null) {
-                swept = swept.minmax(vehicleDimensions.makeBoundingBox(vehicleMove.movingTo().position()));
+                swept = swept.minmax(vehicleDimensions.makeBoundingBox(vehicleMove.position()));
             }
         }
         return swept.inflate(MOVEMENT_BLOCK_REACH);
@@ -2917,10 +2996,12 @@ final class PlayConnection implements ClientContext {
     private record Verdict(TickOutcome outcome, List<Flag> flags) {
     }
 
-    // - LocalPlayer.sendChanges while the player rides: a rotation packet every tick with the player's ground and -
-    // - collision state, and, when the player steers the vehicle (it is authoritative on the client), the vehicle's -
-    // - position (ServerboundMoveVehiclePacket, from Entity.getClientPositionAndRotation) and the player's sprinting. -
-    // - The sandbox moved the vehicle with the same vanilla code and the same keys. A vehicle the player does not steer -
+    // - LocalPlayer.tick while the player rides: a rotation packet every tick with the player's ground and collision -
+    // - state, and, when the player steers the vehicle (it is authoritative on the client), the vehicle's position -
+    // - (ServerboundMoveVehiclePacket.fromEntity: where the vehicle interpolates to, or where it is) and the player's -
+    // - sprinting. It sends them at the end of the player's own tick, which runs inside its vehicle's after the vehicle -
+    // - moved (ClientLevel.tickPassenger), and before the vehicle positions and turns the player (Entity.rideTick). The -
+    // - sandbox moved the vehicle with the same vanilla code and the same keys. A vehicle the player does not steer -
     // - moves as the server says, which the sandbox follows like the client. On any difference the sandbox takes over -
     // - what the client reported. vehiclePositionBeforeTick is null when the player changed vehicles during the tick -
     private ClientTickReport compareRiding(
@@ -2958,9 +3039,9 @@ final class PlayConnection implements ClientContext {
         ServerboundMoveVehiclePacket vehicleMove = packets.vehicleMove;
         ClientTickReport.VehicleState vehicleState = null;
         if (steering) {
-            PositionAndRotation predicted = vehicle.getClientPositionAndRotation();
+            ServerboundMoveVehiclePacket predicted = ServerboundMoveVehiclePacket.fromEntity(vehicle);
             Vec3 predictedPosition = predicted.position();
-            boolean predictedVehicleOnGround = vehicle.onGround();
+            boolean predictedVehicleOnGround = predicted.onGround();
             if (vehicleMove == null) {
                 vehicleDifferences.add("expected a vehicle position, none was sent");
                 vehicleState = new ClientTickReport.VehicleState(
@@ -2968,12 +3049,11 @@ final class PlayConnection implements ClientContext {
                         false, Double.NaN, Double.NaN, Double.NaN, Float.NaN, Float.NaN, false, Double.NaN
                 );
             } else {
-                PositionAndRotation reportedVehicle = vehicleMove.movingTo();
-                Vec3 reportedPosition = reportedVehicle.position();
+                Vec3 reportedPosition = vehicleMove.position();
                 if (predictedPosition.x != reportedPosition.x || predictedPosition.y != reportedPosition.y || predictedPosition.z != reportedPosition.z) {
                     vehicleDifferences.add(String.format(Locale.ROOT, "vehicle position %.4g blocks off", predictedPosition.distanceTo(reportedPosition)));
                 }
-                if (predicted.yRot() != reportedVehicle.yRot() || predicted.xRot() != reportedVehicle.xRot()) {
+                if (predicted.yRot() != vehicleMove.yRot() || predicted.xRot() != vehicleMove.xRot()) {
                     vehicleDifferences.add("vehicle rotation");
                 }
                 if (predictedVehicleOnGround != vehicleMove.onGround()) {
@@ -2981,7 +3061,7 @@ final class PlayConnection implements ClientContext {
                 }
                 vehicleState = new ClientTickReport.VehicleState(
                         vehicleType, predictedPosition.x, predictedPosition.y, predictedPosition.z, predicted.yRot(), predicted.xRot(), predictedVehicleOnGround,
-                        true, reportedPosition.x, reportedPosition.y, reportedPosition.z, reportedVehicle.yRot(), reportedVehicle.xRot(), vehicleMove.onGround(),
+                        true, reportedPosition.x, reportedPosition.y, reportedPosition.z, vehicleMove.yRot(), vehicleMove.xRot(), vehicleMove.onGround(),
                         predictedPosition.distanceTo(reportedPosition)
                 );
             }
@@ -2996,18 +3076,13 @@ final class PlayConnection implements ClientContext {
         if (!playerDifferences.isEmpty() || !vehicleDifferences.isEmpty()) {
             // - Continue from the client's state -
             if (steering && vehicleMove != null) {
-                PositionAndRotation reportedVehicle = vehicleMove.movingTo();
-                Vec3 reportedPosition = reportedVehicle.position();
+                Vec3 reportedPosition = vehicleMove.position();
                 if (vehiclePositionBeforeTick != null) {
                     correctHorizontalVelocity(vehicle, vehiclePositionBeforeTick, reportedPosition);
                 }
-                vehicle.absSnapTo(reportedPosition.x, reportedPosition.y, reportedPosition.z, reportedVehicle.yRot(), reportedVehicle.xRot());
+                vehicle.absSnapTo(reportedPosition.x, reportedPosition.y, reportedPosition.z, vehicleMove.yRot(), vehicleMove.xRot());
                 vehicle.setOnGround(vehicleMove.onGround());
-                // - positionRider only has to move the passengers along; a boat turns the player's head a second -
-                // - time, and its rotation, which the client reported, is taken below -
-                float yHeadRot = tickPlayer.getYHeadRot();
-                vehicle.getPassengers().forEach(vehicle::positionRider);
-                tickPlayer.setYHeadRot(yHeadRot);
+                repositionTickedPassengers(vehicle, tickPlayer);
             }
             if (movePacket != null && movePacket.hasRotation() && !movePacket.hasPosition()) {
                 tickPlayer.setOnGround(movePacket.isOnGround());
@@ -3020,14 +3095,6 @@ final class PlayConnection implements ClientContext {
                 tickPlayer.getAbilities().flying = packets.reportedFlying;
             }
         }
-        // - The rotation the client ended its tick with, which it reported. The sandbox's lies a rounding apart after -
-        // - a boat's turn (see passengerTurnOfTick), or further when the turn depends on what the client does not -
-        // - report (see passengerTurnUnknown). The head keeps the sandbox's turn: Player.aiStep points it along the -
-        // - rotation before the vehicle turns both, and AbstractBoat.clampRotation limits only the rotation -
-        if (movePacket != null && movePacket.hasRotation()) {
-            tickPlayer.setYRot(movePacket.getYRot(tickPlayer.getYRot()));
-            tickPlayer.setXRot(movePacket.getXRot(tickPlayer.getXRot()));
-        }
         // - A ridden player's own velocity is zeroed every tick (Entity.rideTick), so no estimate of it lasts -
         this.ticksSinceVelocityEstimate = VELOCITY_ESTIMATE_TICKS;
 
@@ -3038,6 +3105,43 @@ final class PlayConnection implements ClientContext {
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
                 Double.NaN, vehicleState, this.tickStart, verdict.flags(), notes
         );
+    }
+
+    // - After the vehicle was put where the client reported it: the entities riding it that ticked before the player -
+    // - (ClientLevel.tickPassenger ticks the passengers in order, each followed by its own passengers) sat on the -
+    // - vehicle where the sandbox had it, and go where the client's vehicle put them. The player and whatever ticks -
+    // - after it are put there by their own ride tick. Each of them was already turned by the vehicle in its own tick -
+    // - (AbstractBoat.positionRider turns a passenger), so positioning it again keeps its rotation -
+    private static void repositionTickedPassengers(Entity vehicle, SandboxPlayer player) {
+        for (Entity passenger : vehicle.getPassengers()) {
+            if (passenger == player) {
+                return;
+            }
+            positionKeepingRotation(vehicle, passenger);
+            if (passenger.hasIndirectPassenger(player)) {
+                repositionTickedPassengers(passenger, player);
+                return;
+            }
+            for (Entity rider : passenger.getIndirectPassengers()) {
+                positionKeepingRotation(Objects.requireNonNull(rider.getVehicle(), "a passenger rides a vehicle"), rider);
+            }
+        }
+    }
+
+    private static void positionKeepingRotation(Entity vehicle, Entity passenger) {
+        float yRot = passenger.getYRot();
+        float yRotO = passenger.yRotO;
+        float xRot = passenger.getXRot();
+        float yHeadRot = passenger.getYHeadRot();
+        float yBodyRot = passenger instanceof LivingEntity living ? living.yBodyRot : 0.0F;
+        vehicle.positionRider(passenger);
+        passenger.setYRot(yRot);
+        passenger.yRotO = yRotO;
+        passenger.setXRot(xRot);
+        passenger.setYHeadRot(yHeadRot);
+        if (passenger instanceof LivingEntity living) {
+            living.yBodyRot = yBodyRot;
+        }
     }
 
     // - The client does not report its velocity, yet a position difference usually comes from a velocity difference -

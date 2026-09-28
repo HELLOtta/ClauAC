@@ -14,14 +14,92 @@ A predictive (simulation-based) anticheat plugin for [Paper](https://papermc.io/
 
 | Component    | Version                                                                             |
 |--------------|-------------------------------------------------------------------------------------|
-| Server       | Paper 26.3 (as of 2026-09, Paper publishes 26.3 builds on its `ALPHA` channel)      |
-| Client       | Minecraft 26.3 only                                                                 |
+| Server       | Paper 26.2 (build 129 of its `STABLE` channel was tested)                           |
+| Client       | Minecraft 26.2 only                                                                 |
 | Java         | 25                                                                                  |
 | PacketEvents | 2.14.0 (bundled and relocated, see below)                                           |
 
 All versions are declared in [`gradle/libs.versions.toml`](gradle/libs.versions.toml). The `minecraft` entry drives
 both the `api-version` in `plugin.yml` and the version of the development server; `paper-api` pins an exact Paper API
-build so that alpha API changes never slip into a build unnoticed.
+build so that API changes never slip into a build unnoticed.
+
+## The 26.2 build
+
+This branch builds ClauAC for Minecraft 26.2. It is the 26.3 build of the main branch ported to 26.2: the same
+checks and responses, with the simulation compiled against the vanilla 26.2 server and the client code it follows
+ported from the 26.2 client jar. The plugin's version names the release (`0.1.0-SNAPSHOT-mc26.2`), so the two builds
+are never taken for each other. Unless they say otherwise, the measurements and in-game results in the rest of this
+document come from runs of the 26.3 build with the 26.3 client; the runs of this build with the 26.2 client are
+listed below.
+
+### What the 26.2 client does differently
+
+The 26.2 client sends what 26.3 sends, but in other places and partly in other packets. The simulation follows it:
+
+- **When it sends its movement.** `LocalPlayer.tick` sends the player's keys and its position (`sendPosition`), or
+  while it rides its rotation and the position of the vehicle it steers, right after the player's own tick. That tick
+  runs inside `ClientLevel.tickEntities`, among the other entities, so the entities ticked after the player, the
+  block entities (`tickBlockEntities`: a piston or a shulker box that moves the player) and, for a riding player, the
+  vehicle that positions and turns it (`Entity.rideTick`, `positionRider`) all come after the send. 26.3 sends at the
+  end of `Minecraft.tick`, after all of them. The sandbox therefore compares its player with the client's report
+  right after the player's own tick and goes on from the client's state there. A riding player reports the rotation
+  its tick acted with, before the vehicle turns it: the sandbox starts the tick with that rotation, and the boat's turn
+  of the tick shows in the next tick's report.
+- **Swings.** 26.2 has a packet for the swing of an arm, `ServerboundSwingPacket` (`minecraft:swing`) with the hand,
+  where 26.3 has `ServerboundPunchPacket`. `LocalPlayer.swing` sends it for every swing the client makes: right after
+  every attack, start of breaking and stab of `Minecraft.startAttack`, after every tick `continueAttack` goes on
+  breaking, and after drops and item uses the client swings for. The client also sends it when the server swings the
+  player's own arm (`ClientboundAnimatePacket`, `ClientPacketListener.handleAnimate`), while it handles the server's
+  packets and so before the tick's own packets; the sandbox takes such an answer apart from the tick's key handling.
+  See "Swings" for the check.
+- **Teleports.** The client accepts a teleport with its id alone (`ServerboundAcceptTeleportationPacket`) and sends its
+  new position and rotation right after it in a movement packet (`ClientPacketListener.handleMovePlayer`), where 26.3
+  puts them into the acceptance. It also sends such a movement packet when the server moves the vehicle it rode after
+  removing it, which moves the player instead (`handleTeleportEntity`); 26.3 sends nothing then. The sandbox checks
+  these movement packets against its player after the teleport, apart from the tick's movement.
+- **Breaking.** 26.2 has no turn to another face: `continueDestroyBlock` goes on breaking the same block from any face
+  and names the face only with the finish, so breaking a block sends only a start, an abort and a finish.
+
+Smaller differences of the client code the sandbox runs, each ported from the 26.2 client with its source named:
+`RemotePlayer.aiStep` interpolates a remote player's position and counts its swing time itself; the client creates an
+entity only when the level's features enable its type (`EntityType.create` with `EntitySpawnReason.LOAD` checks
+`canSpawn`, where 26.3 skips the checks); in creative mode an attack does not start the delay after a break
+(`MultiPlayerGameMode.attack`); a drop does not report the selected slot before itself (`LocalPlayer.drop`, where 26.3's
+`MultiPlayerGameMode.dropItem` calls `ensureHasSentCarriedItem`); and the level's clock follows the 26.2
+`ClientClockManager`.
+
+### Verified with the 26.2 client
+
+With the real 26.2 client on Paper 26.2 (build 129), every simulated tick of the thirteen test courses was `MATCHED`
+with an offset of exactly 0, 19 674 ticks in all, and no check failed:
+
+| Course | What the player does                                                                   | Ticks |
+|--------|----------------------------------------------------------------------------------------|-------|
+| 1      | walking, jumping, the stairs, sneaking, a sprint jump into the pool, floating, diving  | 430   |
+|        | and swimming                                                                           |       |
+| 2      | speed and jump boost, knockback from a cow, walking into it, creative flight           | 605   |
+| 3      | cows pushing, a boat, eating, placing and breaking dirt, a chest, a sprint hit on a    | 1650  |
+|        | second player, a zombie's knockback, a wind charge and an elytra flight with fireworks |       |
+| 4      | levitation, slow falling, the gravity, jump strength and scale attributes and towers   | 1357  |
+|        | with the offhand, over 150 ms of latency each way                                      |       |
+| 5      | riding a boat, a pig the server moves, a horse, a camel, a pig and a strider steered   | 2285  |
+|        | with their items, a minecart, a happy ghast and a nautilus                             |       |
+| 6      | the alternatives of uncertain ticks, through a proxy that injects packets              | 1762  |
+| 7      | pistons, slime and honey blocks moving the player and the boat it rides                | 2567  |
+| 8      | powder snow with and without leather boots, depth strider, soul speed, swift sneak,    | 2111  |
+|        | frost walker and a spear with lunge                                                    |       |
+| 9      | 25 attacks and 5 interactions with entities                                            | 1487  |
+| 10     | a ladder, vines, scaffolding, crawling through a tunnel, sweet berry bushes, cobwebs,  | 1932  |
+|        | packed and blue ice                                                                    |       |
+| 11     | bubble columns, water and lava, riptide in water and in the rain, ender pearls, the    | 2214  |
+|        | world border                                                                           |       |
+| 12     | a round trip through a nether portal; 58 more ticks on the loading screens were not    | 843   |
+|        | simulated                                                                              |       |
+| 13     | auto-jump                                                                              | 431   |
+
+The report notes of those ticks name only riding a vehicle the server moves, the answers to the server's corrections
+of a vehicle, the hotbar keys the sandbox inferred from steering, the alternatives that matched, and the attack on an
+entity nobody has that course 6 sends through its proxy.
 
 ## Building
 
@@ -29,7 +107,7 @@ build so that alpha API changes never slip into a build unnoticed.
 ./gradlew build
 ```
 
-The first build downloads the official vanilla 26.3 server from Mojang (the version JSON pinned in
+The first build downloads the official vanilla 26.2 server from Mojang (the version JSON pinned in
 [`gradle.properties`](gradle.properties)), verifies it against Mojang's hashes and extracts it to compile the
 `simulation` module against; nothing of it is bundled.
 
@@ -77,13 +155,14 @@ collision code) and ties levels to the Bukkit API. ClauAC therefore loads the **
 own class loader, whose parent is the JDK's platform class loader, so none of Paper's classes are visible to it. Only
 the `simulation-api` package and the logging APIs (SLF4J, Log4j) are shared with the plugin.
 
-On startup ClauAC takes the vanilla server bundler from Paperclip's cache (`cache/mojang_26.3.jar` in the server
+On startup ClauAC takes the vanilla server bundler from Paperclip's cache (`cache/mojang_26.2.jar` in the server
 directory), or downloads it from Mojang when it is missing, verifies it against the hashes recorded at build time and
 extracts the server jar and its libraries to `plugins/ClauAC/runtime/`. The runtime then runs Minecraft's bootstrap on
 its own thread, which takes about 6-7 seconds. The packets of a connection that starts before it is ready are kept in
 order and handed to the simulation once it is, up to 32 MiB per connection and 256 MiB for all waiting connections
 together; a connection beyond either limit is not simulated. The movement code the sandbox runs is the common code the
-client runs as well: in 26.3 it is identical between the client jar and the server jar.
+client runs as well: in 26.2 it is identical between the client jar and the server jar (all 7434 classes the two jars
+share are the same byte for byte).
 
 The client-only parts the simulation depends on are ported from the client jar and cite their original class:
 `ClientLevel` (including its block prediction handling), `ClientChunkCache`, `LocalPlayer`, `KeyboardInput`,
@@ -117,16 +196,17 @@ processed them:
   2^30 lowest ints, away from the small counters other plugins use for their own pings, whose pongs pass through. A
   connection stall of 25 seconds, whose 3052 held packets arrived at once, stays below Paper's limit of 500 packets
   per second over 7 seconds (`packet-limiter` in `paper-global.yml`) that way.
-- A teleport is answered with the teleport acceptance, a rotation packet with a rotation, and the start of a
-  configuration phase with its acknowledgement.
+- A teleport is answered with the teleport acceptance and the player's new position right after it, a rotation packet
+  with a rotation, and the start of a configuration phase with its acknowledgement.
 
 When the client's tick end packet arrives, the sandbox runs `Minecraft.tick` for one tick: it replays what the client
 did with its keys and mouse during that tick from the packets that produced (hotbar selection, breaking and placing
 blocks with the client's own block predictions, using items, attacks, interactions, dropping items), ticks every
-entity, and moves the player with the keys, rotation and sprint commands the client sent. It then mirrors
-`LocalPlayer.sendPosition` and compares: whether a position had to be sent, the exact position, `onGround`,
-horizontal collision, sprinting, flying and the start of gliding. When anything differs, the sandbox continues from the
-client's reported state, including a velocity estimated from the tick it just simulated.
+entity, and moves the player with the keys, rotation and sprint commands the client sent. Right after the player's own
+tick, where `LocalPlayer.tick` sends the movement (see "The 26.2 build"), it mirrors `LocalPlayer.sendPosition` and
+compares: whether a position had to be sent, the exact position, `onGround`, horizontal collision, sprinting, flying
+and the start of gliding. When anything differs, the sandbox continues from the client's reported state, including a
+velocity estimated from the tick it just simulated, and the rest of the tick goes on from there.
 
 A riding player sends a rotation with its ground and collision state every tick instead, and, while it steers the
 vehicle (a boat, a saddled horse or camel, a pig or strider with its item on a stick, a happy ghast with a harness, a
@@ -134,9 +214,9 @@ saddled nautilus), the vehicle's position, rotation and ground state, its sprint
 The sandbox moves the vehicle with the same vanilla code and keys and compares all of it exactly; a vehicle the player
 does not steer moves as the server says, which the sandbox follows like the client. Three things need care:
 
-- A boat turns its rider during the tick, so the rotation the client reports is the one after that turn. The sandbox
-  starts the tick with the reported rotation minus the turn the client reported for the boat, and ends it with the
-  reported rotation.
+- A boat turns its rider after the rider's tick (`AbstractBoat.positionRider`), so the rotation the client reports is
+  the one before that turn, which the tick's key handling acted with. The sandbox starts the tick with the reported
+  rotation, and the boat's turn of the tick shows in the next tick's report.
 - A hotbar key pressed during a tick changes the held item at once, but the client reports the new slot only at the
   start of its next tick. For a vehicle steered by what the player holds, the tick's own packets show the switch: the
   client sends the vehicle's position exactly while it steers. When they contradict the held item, the sandbox selects
@@ -288,8 +368,9 @@ of them runs from the saved state, and the first that matches what the client re
 
 What cannot be tried that way leaves the tick `UNVERIFIED` instead of `MISMATCHED`:
 
-- The alternatives above while the player rides, while blocks move next to it (a piston, a shulker box), which move
-  it only after its tick, and in a tick whose actions after the attack or the trident's release changed the player.
+- The alternatives above while the player rides, and in a tick whose actions after the attack or the trident's release
+  changed the player. Blocks that move next to the player (a piston, a shulker box) move it only after it sent its
+  movement, so they leave the alternatives alone.
 - The client's velocity is never reported. After a difference the sandbox estimates it from the reported movement;
   the rounding of that estimate can move later positions by a few units in the last place, and after an `UNVERIFIED`
   tick, a difference that keeps shrinking in the ticks right after it stays `UNVERIFIED`.
@@ -307,10 +388,8 @@ Known limits:
 
 - An `UNVERIFIED` tick accepts any difference, and its movement reaches the server like that of a `MATCHED` one; only
   what the alternatives cannot cover (see above) is left to it.
-- The rotation a boat's rider starts a tick with is exact up to the rounding of the float rotations it is computed
-  from; the client's own boat adds such rounding at every frame (`AbstractBoat.clampRotation`), and no packet reports
-  it. Only what the crosshair pointed at within that rounding of a boundary could differ; the rotation of an item
-  use is checked through the boat's turn instead (see "Blocks and items").
+- A boat's rider reports the rotation its tick acted with before the boat turns it (see "The 26.2 build"), so what the
+  crosshair pointed at and the rotation of an item use are checked exactly for a rider as well.
 - Not verified in game yet: riding in a boat another player steers.
 - The client opens its own inventory screen without telling the server, and its creative inventory screen ignores
   cursor updates and keeps its own menu when the game mode changes. The sandbox cannot follow those; the differences
@@ -325,7 +404,9 @@ Known limits:
 
 ### Verified so far
 
-With a real 26.3 client on Paper 26.3, every tick of the following produced `MATCHED` with an offset of exactly 0:
+The runs of this build with the real 26.2 client are listed in "The 26.2 build". The rest of this section, like the
+in-game results in the sections after it, comes from the 26.3 build with the 26.3 client, over the same courses and
+tests. With a real 26.3 client on Paper 26.3, every tick of the following produced `MATCHED` with an offset of exactly 0:
 walking, jumping, sneaking, sprinting and sprint jumping, stairs up and down, sinking, swimming and leaving water, a
 50 block fall into water, speed and jump boost effects, knockback from damage, a TNT explosion and a wind charge, teleports,
 creative flight, gliding with an elytra and boosting with fireworks, cows and another player pushing the player,
@@ -440,8 +521,8 @@ Every `MISMATCHED` tick names the checks it failed, each with what exactly faile
 |                     | did, or with another hotbar slot in the middle of its key handling                           |
 | `FastBreak`         | The client finished breaking a block before the vanilla client's breaking progress with the  |
 |                     | same tool and effects reached the whole block (see "Blocks and items")                       |
-| `NoSwing`           | The client left out the swing a vanilla client sends right after every attack and every      |
-|                     | start, finish and turn of breaking a block (see "Swings")                                    |
+| `NoSwing`           | The client left out the swing a vanilla client sends right after every attack, every start   |
+|                     | and finish of breaking a block and every stab (see "Swings")                                 |
 | `SimulationFailure` | The simulation itself failed during the tick, so nothing the client sent in it was checked   |
 
 Something the simulation cannot know (see "What the simulation cannot know") only ever explains a difference in the
@@ -535,7 +616,7 @@ courses matched in all of their ticks as well.
 
 ### Blocks and items
 
-A vanilla client starts, finishes and turns while breaking a block only from `Minecraft.startAttack` and
+A vanilla client starts and finishes breaking a block only from `Minecraft.startAttack` and
 `continueAttack` (`MultiPlayerGameMode.startDestroyBlock` and `continueDestroyBlock`), stabs only from `startAttack`,
 and uses items on blocks and in the air only from `Minecraft.startUseItem` (`useItemOn` and `useItem`), all during its
 key handling. The simulation replays these from the tick's packets like the attacks and checks each against what those
@@ -561,10 +642,9 @@ methods allow:
   border, and a hand holding an item the level's features do not enable ends the key's handling (`Interaction`).
 - An item used in the air carries the player's rotation of that moment, which nothing changes before the tick's
   movement reports it: another rotation fails `Hitbox`, as when a client throws a potion or an ender pearl facing one
-  way while it looks another. A boat turns its rider after the player's tick and keeps its yaw within 105 degrees of
-  its own (`AbstractBoat.positionRider` and `clampRotation`); for a rider the sandbox turns the yaw the item was used
-  with by the boat as the tick left it, which has to arrive where the client reported its rotation, up to the rounding
-  of those float rotations. A spectator and an empty hand use no item (`Interaction`).
+  way while it looks another. A riding player reports its rotation before its vehicle turns it (see "The 26.2
+  build"), so the rotation of a rider's item use has to be that rotation exactly as well. A spectator and an empty
+  hand use no item (`Interaction`).
 - The hotbar keys come first in `Minecraft.handleKeybinds`, and nothing else changes the selected slot during a tick.
   The first action that calls `MultiPlayerGameMode.ensureHasSentCarriedItem` reports the slot right before itself, so
   a vanilla client reports at most one slot after the tick's first packet, and none after such an action. Selecting
@@ -630,31 +710,33 @@ With these checks, the nine test courses matched in all of their 14 378 ticks, a
 
 ### Swings
 
-The 26.3 client has no packet for the swing of its arm. It sends `ServerboundPunchPacket` (`minecraft:punch`, which
-carries nothing) instead, and the server swings the player's arm for the other players when it arrives
-(`ServerGamePacketListenerImpl.handlePunch`, which also starts the player's attack strength over; Paper calls
-`PlayerArmSwingEvent` there as well, and a `PlayerInteractEvent` for a click at the air where its own ray trace meets
-nothing). `Minecraft.startAttack` sends it after every click of the attack button, right after the attack or the start
-of breaking the click made, with only the client's own swing of the arm in between (`LivingEntity.swing`, which sends
-nothing on the client). `continueAttack` sends it after every tick in which `continueDestroyBlock` went on breaking,
-right after the finish, the turn, or the start on another block or in creative mode that come from there. An attack
-comes only from `startAttack` (`MultiPlayerGameMode.attack` is its only sender, and `startAttack` the only caller of
-that), and the block actions only from these two methods, so a vanilla client follows every attack and every start,
-finish and turn of breaking with a swing as the tick's next action. One without it fails `NoSwing` and, with `setback`
-on, never reaches the server, like the actions above. A stab with a piercing weapon
-(`MultiPlayerGameMode.piercingAttack`) and an abort come without a swing. The server swings the arm for a stab itself
-(`PiercingWeapon.attack`), as it does for the use key's item uses and interactions
-(`LivingEntity.swingAndResetAttackStrength` in their handlers), so a client can hide none of those swings. The check
-needs nothing but the order of the tick's packets, so it applies also while the sandbox's items differ from the
-client's.
+The 26.2 client sends the swing of its arm as `ServerboundSwingPacket` (`minecraft:swing`, with the hand), from
+`LocalPlayer.swing`, and the server swings the player's arm for the other players when it arrives
+(`ServerGamePacketListenerImpl.handleAnimate`; Paper calls `PlayerArmSwingEvent` there as well, and a
+`PlayerInteractEvent` for a click at the air where its own ray trace meets nothing). `Minecraft.startAttack` swings the
+main hand after every click of the attack button, right after the attack, the start of breaking or the stab the click
+made: `LocalPlayer.swing` swings the arm and sends the packet at once, so nothing comes between the action and its
+swing.
+`continueAttack` swings it after every tick in which `continueDestroyBlock` went on breaking, right after the finish,
+or the start on another block or in creative mode, that come from there. An attack comes only from `startAttack`
+(`MultiPlayerGameMode.attack` is its only sender, and `startAttack` the only caller of that), and the block actions and
+the stab only from these two methods, so a vanilla client follows every attack, every start and finish of breaking and
+every stab with a swing of its main hand as the tick's next action. One without it fails `NoSwing` and, with `setback`
+on, never reaches the server, like the actions above. An abort comes without a swing. The client swings as well after
+a drop and after an item use or an interaction it swings for (`InteractionResult.SwingSource.CLIENT`), and it answers
+the server's swing of its own arm (`ClientboundAnimatePacket`, `ClientPacketListener.handleAnimate`) with one while it
+handles the server's packets; those swings depend on what the use did or come from the server, so their absence is not
+checked, and the sandbox tells the answers from the swings of the key handling. The check needs nothing but the order
+of the tick's packets, so it applies also while the sandbox's items differ from the client's.
 
 Leaving the swing out makes no attack stronger: `Player.attack` starts the attack strength over itself
-(`Player.onAttack`). What it hides is the swing: the other players do not see the player attack or break, and plugins
-that listen for `PlayerArmSwingEvent` do not hear of it. The ticks between the start and the finish of a break send the
-swing alone, and those swings are what tells the simulation the breaking progress (see "Blocks and items"): a client
-that leaves them out finishes before the progress it showed, which fails `FastBreak` as well. A click that meets nothing
-sends the swing alone, too. A client that leaves that one out sends nothing at all, which no check on the server can
-see; the server then does not start the attack strength over as it does for a vanilla client's miss.
+(`Player.onAttack`), and the server's `handleAnimate` does nothing with it. What it hides is the swing: the other
+players do not see the player attack or break, and plugins that listen for `PlayerArmSwingEvent` do not hear of it.
+The server swings the arm for a stab itself (`PiercingWeapon.attack`), so a stab without the swing hides nothing, but
+no vanilla client sends one. The ticks between the start and the finish of a break send the swing alone, and those swings are what tells the
+simulation the breaking progress (see "Blocks and items"): a client that leaves them out finishes before the progress
+it showed, which fails `FastBreak` as well. A click that meets nothing sends the swing alone, too. A client that leaves
+that one out sends nothing at all, which no check on the server can see.
 
 In game, a proxy between the 26.3 client and the server dropped the client's swings for a while, as a NoSwing cheat
 does, while the player attacked a cow without AI, mined stone with a diamond pickaxe, held the attack button on bedrock
@@ -695,8 +777,9 @@ failed from the server instead (see "Attacks and interactions", "Blocks and item
   player steers a vehicle, the correction puts the vehicle where the server has it, as the server does after a vehicle
   moved wrongly, and stops it: that packet carries no velocity, and the client's and the simulation's would differ
   otherwise. The correction goes out in one of ClauAC's own bundles, so that the pong to the ping behind it shows when
-  the client has taken it; the client's answer to ClauAC's teleport goes no further than the simulation. The server
-  is not involved at all: it never saw the movement that was thrown away.
+  the client has taken it; the client's acceptance of ClauAC's teleport goes no further than the simulation, and the
+  position it sends right after it comes before that pong and so is thrown away like the rest. The server is not
+  involved at all: it never saw the movement that was thrown away.
 - A tick that fails after the client has taken the correction gets a setback of its own, since the simulation went
   on from where the correction put the player. A tick the client played before it took the correction needs none; the
   correction puts the client back anyway.
@@ -829,7 +912,7 @@ Because PacketEvents is bundled, ClauAC creates, loads, initialises and terminat
 
 ### Why adventure is bundled instead of using Paper's
 
-PacketEvents 2.14.0 is compiled against adventure 4.26.1, while Paper 26.3 ships adventure 5.2.0, which is not binary
+PacketEvents 2.14.0 is compiled against adventure 4.26.1, while Paper 26.2 ships adventure 5.2.0, which is not binary
 compatible with it: for example `ClickEvent.Action` is no longer an enum, `TranslatableComponent.args()` and
 `ClickEvent.value()` were removed, and `Buildable.Builder` no longer exists. If PacketEvents used Paper's adventure,
 serialising chat components (JSON and NBT, used by many play packets) would fail at runtime with

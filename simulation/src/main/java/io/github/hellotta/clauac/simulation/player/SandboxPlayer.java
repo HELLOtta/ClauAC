@@ -190,7 +190,7 @@ public final class SandboxPlayer extends Player {
     }
 
     @Override
-    public void handleEntityEvent(@EntityEvent.Value byte id) {
+    public void handleEntityEvent(byte id) {
         switch (id) {
             case EntityEvent.PERMISSION_LEVEL_ALL -> this.permissions = PermissionSet.NO_PERMISSIONS;
             case EntityEvent.PERMISSION_LEVEL_MODERATORS -> this.permissions = LevelBasedPermissionSet.MODERATOR;
@@ -239,6 +239,7 @@ public final class SandboxPlayer extends Player {
             }
             this.mainHandItemAfterLastTick = this.getMainHandItem().copy();
             this.advanceAlternativeAttackStrengths();
+            this.client.onPlayerTicked();
         }
     }
 
@@ -517,7 +518,7 @@ public final class SandboxPlayer extends Player {
                 && (this.isShiftKeyDown() || !this.isSleeping() && !this.canPlayerFitWithinBlocksAndEntitiesWhen(Pose.STANDING));
         this.input.tick(this.reportedKeys);
 
-        if (!this.noPhysics && !this.isPassenger()) {
+        if (!this.noPhysics) {
             this.moveTowardsClosestSpace(this.getX() - this.getBbWidth() * 0.35, this.getZ() + this.getBbWidth() * 0.35);
             this.moveTowardsClosestSpace(this.getX() - this.getBbWidth() * 0.35, this.getZ() - this.getBbWidth() * 0.35);
             this.moveTowardsClosestSpace(this.getX() + this.getBbWidth() * 0.35, this.getZ() - this.getBbWidth() * 0.35);
@@ -847,11 +848,11 @@ public final class SandboxPlayer extends Player {
             if (dmg <= 0.0F) {
                 this.setHealth(newHealth);
                 if (dmg < 0.0F) {
-                    this.damageCooldownTime = 10;
+                    this.invulnerableTime = 10;
                 }
             } else {
                 this.lastHurt = dmg;
-                this.damageCooldownTime = 20;
+                this.invulnerableTime = 20;
                 this.setHealth(newHealth);
                 this.hurtDuration = 10;
                 this.hurtTime = this.hurtDuration;
