@@ -306,19 +306,20 @@ public final class ClientSession implements PlayerSimulation {
     }
 
     // - Applies everything the client provably processed, up to and including the answered packet, which also tells -
-    // - the client's clock how far the client has come. Returns false when no pending packet is the answered one -
-    private boolean applyThrough(Predicate<Packet<?>> answeredPacket, String answer) {
+    // - the client's clock how far the client has come. Returns the answered packet, null when no pending packet is -
+    // - the answered one -
+    private @Nullable Packet<?> applyThrough(Predicate<Packet<?>> answeredPacket, String answer) {
         List<PendingClientbound.PendingPacket> released = this.pending.takeThrough(answeredPacket);
         if (released.isEmpty()) {
             // - Every packet a client can answer reaches the sandbox, so a vanilla client never does this -
             this.reject(Check.BAD_PACKETS, "the client sent " + answer + " for a packet the server never sent");
-            return false;
+            return null;
         }
         this.clientClock.reached(released.getLast().sentAt());
         for (PendingClientbound.PendingPacket packet : released) {
             this.apply(packet);
         }
-        return true;
+        return released.getLast().packet();
     }
 
     private void apply(PendingClientbound.PendingPacket released) {
@@ -397,8 +398,8 @@ public final class ClientSession implements PlayerSimulation {
             case ServerboundAcceptTeleportationPacket accept -> {
                 // - The answer to a teleport the server never sent tells nothing about where the client is -
                 if (this.applyThrough(pending -> pending instanceof ClientboundPlayerPositionPacket position && position.id() == accept.id(),
-                        "teleport acceptance " + accept.id())) {
-                    this.requirePlay().verifyTeleportAnswer(accept);
+                        "teleport acceptance " + accept.id()) instanceof ClientboundPlayerPositionPacket teleport) {
+                    this.requirePlay().verifyTeleportAnswer(teleport, accept);
                 }
             }
             case ServerboundConfigurationAcknowledgedPacket ignored -> {

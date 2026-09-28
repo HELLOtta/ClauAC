@@ -693,20 +693,36 @@ final class PlayConnection implements ClientContext {
         return matches;
     }
 
-    // - The client answers a position packet with its resulting position and rotation. A difference means the -
-    // - sandbox's player was elsewhere before the packet, which matters for relative teleports; the sandbox takes -
-    // - over the client's values -
-    void verifyTeleportAnswer(ServerboundAcceptTeleportationPacket answer) {
+    // - The client answers a position packet with its acceptance, which carries the player's resulting position and -
+    // - rotation (ClientPacketListener.handleMovePlayer). A coordinate the packet gives relative to the player's own -
+    // - (its relatives) differs when the sandbox's player was elsewhere before the packet, and the sandbox takes the -
+    // - client's over. One it sets outright is the packet's on every client (PositionMoveRotation.calculateAbsolute), -
+    // - so an answer that differs in it puts the player where the vanilla client is not, which fails Simulation like -
+    // - any other such position, and the coordinate stays the packet's: the client's next tick starts there, and a -
+    // - setback of that tick on the server goes back there. Otherwise the client could carry a position of its -
+    // - choosing past a setback's correction -
+    void verifyTeleportAnswer(ClientboundPlayerPositionPacket teleport, ServerboundAcceptTeleportationPacket answer) {
         SandboxPlayer current = this.player;
         if (current == null || current.isPassenger()) {
             return;
         }
-        boolean positionDiffers = current.getX() != answer.x() || current.getY() != answer.y() || current.getZ() != answer.z();
-        if (positionDiffers || current.getYRot() != answer.yRot() || current.getXRot() != answer.xRot()) {
+        Set<Relative> relatives = teleport.relatives();
+        boolean xRelative = relatives.contains(Relative.X);
+        boolean yRelative = relatives.contains(Relative.Y);
+        boolean zRelative = relatives.contains(Relative.Z);
+        boolean xDiffers = current.getX() != answer.x();
+        boolean yDiffers = current.getY() != answer.y();
+        boolean zDiffers = current.getZ() != answer.z();
+        if (xDiffers || yDiffers || zDiffers || current.getYRot() != answer.yRot() || current.getXRot() != answer.xRot()) {
             // - The rotation is the client's input and may have turned since its last tick; the sandbox takes it over -
-            // - like the tick's own rotation. A position that differs shows the player was elsewhere than the sandbox -
-            // - thought, with a velocity the sandbox cannot know either -
-            if (positionDiffers) {
+            // - like the tick's own rotation. A relative coordinate that differs shows the player was elsewhere than -
+            // - the sandbox thought, with a velocity the sandbox cannot know either -
+            if (!xRelative && xDiffers || !yRelative && yDiffers || !zRelative && zDiffers) {
+                this.tickPackets.reject(Check.SIMULATION, String.format(Locale.ROOT,
+                        "differs in: the position the client answered teleport %d with, %.6f %.6f %.6f, where it puts the player at %.6f %.6f %.6f",
+                        answer.id(), answer.x(), answer.y(), answer.z(), current.getX(), current.getY(), current.getZ()));
+            }
+            if (xRelative && xDiffers || yRelative && yDiffers || zRelative && zDiffers) {
                 this.tickPackets.uncertainties.add("teleport result differed");
             }
             this.tickPackets.notes.add(String.format(
@@ -714,7 +730,7 @@ final class PlayConnection implements ClientContext {
                     answer.id(), current.getX(), current.getY(), current.getZ(), current.getYRot(), current.getXRot(),
                     answer.x(), answer.y(), answer.z(), answer.yRot(), answer.xRot()
             ));
-            current.setPos(answer.x(), answer.y(), answer.z());
+            current.setPos(xRelative ? answer.x() : current.getX(), yRelative ? answer.y() : current.getY(), zRelative ? answer.z() : current.getZ());
             current.setYRot(answer.yRot());
             current.setXRot(answer.xRot());
         }

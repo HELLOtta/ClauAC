@@ -6,6 +6,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
@@ -79,6 +80,9 @@ public final class SandboxLevel extends Level {
     private static final int LIGHT_QUEUE_SHARE_PER_FRAME = 10;
     public static final long SKY_LIGHT_SETTLE_TICKS = (long) framesToRunLightQueue(LIGHT_QUEUE_RUN_AT_ONCE - 1) * MAX_TICKS_PER_FRAME;
     private static final long NEVER = Long.MIN_VALUE;
+    // - The server's tick rate up to which the client's entities interpolate at their normal speed, the 20 of -
+    // - ClientLevel.getRelativeTickSpeed -
+    private static final float NORMAL_TICK_RATE = SharedConstants.TICKS_PER_SECOND;
 
     private final EntityTickList tickingEntities = new EntityTickList();
     private final TransientEntitySectionManager<Entity> entityStorage = new TransientEntitySectionManager<>(Entity.class, new EntityCallbacks());
@@ -427,6 +431,14 @@ public final class SandboxLevel extends Level {
     @Override
     public TickRateManager tickRateManager() {
         return this.tickRateManager;
+    }
+
+    // - ClientLevel.getRelativeTickSpeed: while the server ticks faster than normal, the client's entities interpolate -
+    // - that much faster towards the positions the server sends them (SteppedInterpolationHandler.doInterpolate) -
+    @Override
+    public float getRelativeTickSpeed() {
+        float tickRate = this.tickRateManager.tickrate();
+        return tickRate > NORMAL_TICK_RATE ? tickRate / NORMAL_TICK_RATE : 1.0F;
     }
 
     @Override

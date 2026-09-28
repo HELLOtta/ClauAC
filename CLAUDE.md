@@ -66,6 +66,12 @@ Findings from running the official 26.3 client in a cloud container without a GP
   `drowning_damage` off on the test world. Phantoms come for a player that has gone more than 72000 ticks without
   sleeping whenever the sky is dark enough (`PhantomSpawner`), which a thunderstorm makes it even at a stopped noon, and
   they killed an idle test player: turn `spawn_phantoms` off, clear the weather and turn `advance_weather` off.
+- **The nether:** resistance 255 takes the damage of an attack away, not its knockback: a piglin that attacked an idle
+  test player twice right beside the portal it had arrived through pushed it out of that portal. In a peaceful level no
+  mob takes a player for its target (`LivingEntity.canAttack`); piglins stay in a peaceful level, most other monsters
+  leave it (`EntityType.isAllowedInPeaceful`). Paper keeps a difficulty for every level, which the `difficulty` command
+  reads and sets for the level it runs in: `execute in minecraft:the_nether run difficulty peaceful` makes the nether
+  peaceful alone.
 - **Console commands:** `~ ~ ~` in a console command means the console's position (the world spawn); run relative
   commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`.
 - **Aiming the test player:** `tp ... facing` and `rotate ... facing` turn the player from the command source's anchor,
@@ -74,6 +80,16 @@ Findings from running the official 26.3 client in a cloud container without a GP
   player without taking it off its vehicle.
 - **Key presses:** `xdotool key` releases the key within the same client tick, which the client's per-tick key polling
   can miss (a double tap of jump to fly never registers). Hold keys with `keydown`, `sleep 0.1`, `keyup`.
+- **Hotbar keys:** the client takes in keys once a frame and handles the number keys that came since in the order of
+  their slots, not of the presses (`Minecraft.handleKeybinds`): two number keys pressed within one frame select the
+  higher slot. It reports the slot at the start of the next tick (`MultiPlayerGameMode.tick` runs before
+  `handleKeybinds`) or with the first action that needs it, so an action a proxy injects right after a number key goes
+  out with the slot before. Wait a second after a number key before anything that depends on it.
+- **Typing into the chat:** the chat key opens the chat only in the client's next tick, and the keys typed until then
+  act as key bindings. Commands typed right after the client joined went missing that way (with the 26.2 client, a
+  press of the chat key opened nothing, and the command's `l` opened the advancements). Type only once a screenshot
+  shows the chat's input line, a black box at half opacity along the bottom of the screen, and press the chat key
+  again when it does not show.
 - **Stopping the client:** `pkill -f <pattern>` also matches the shell that runs the command when the pattern appears
   in it, and kills that shell. Kill the client by the PID of its `net.minecraft.client.main.Main` process instead.
 - **Simulation results:** `run/plugins/ClauAC/reports/*.csv` has one line per client tick; `/clauac debug` shows the
@@ -99,9 +115,22 @@ Findings from running the official 26.3 client in a cloud container without a GP
 - **config.yml of the dev server:** `saveDefaultConfig` never overwrites `run/plugins/ClauAC/config.yml`, so after a
   new setting was added the file lacks it and the setting takes its default. Delete the file before starting the
   server to get the current one with its comments.
-- **Testing setbacks:** a proxy that changes the positions in the client's movement packets imitates a movement
-  cheat without a cheat client; the server's own position of the player can be sampled with
-  `data get entity <name> Pos` on the console meanwhile. Two findings from that: the client answers a vehicle
-  correction (`ClientboundMoveVehiclePacket`) with a vehicle move packet right away, before the pong behind it; and
-  since the simulation continues from what a failed tick reported, a tick that fails after the client took a
-  correction needs a setback of its own, or the ticks after it match and their movement reaches the server.
+- **Testing setbacks:** a proxy that changes the positions in the client's movement packets imitates a movement cheat
+  without a cheat client; the server's own position of the player can be sampled with `data get entity <name> Pos` on
+  the console meanwhile. Findings from that: the client answers a vehicle correction (`ClientboundMoveVehiclePacket`)
+  with a vehicle move packet right away, before the pong behind it; since the simulation continues from what a failed
+  tick reported, a tick that fails after the client took a correction needs a setback of its own, or the ticks after it
+  match and their movement reaches the server; and the client answers a teleport with its acceptance, which carries
+  its resulting position after the teleport's id and which such a proxy has to shift as well to imitate the cheat.
+  With `setbacks.maximum-hold-millis` at 1, shifted answers reach the server unjudged; with the 26.2 client, whose
+  answer is a movement packet, they kept the player floating over the floor, and the server kicked it after 80 ticks
+  (`ServerGamePacketListenerImpl.tick`), so the late test leaves the answers alone.
+- **Pipelines under `pipefail`:** `producer | grep -q` fails whenever grep stops reading before the producer has written
+  everything, since the producer then dies of SIGPIPE. A check of the client's command line
+  (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input
+  whole first, e.g. `grep -q -- "$pattern" <<< "$(tr '\0' '\n' < /proc/<pid>/cmdline)"`.
+- **Server tick rates above 20:** the client still ticks 20 times a second (`Minecraft.getTickTargetMillis`) and
+  moves the living entities it shows towards the server's positions that much faster
+  (`ClientLevel.getRelativeTickSpeed`). `tick_rate_test.sh` teleports a cow without AI through the standing player in
+  small steps, whose pushes show the difference: at `tick rate 40` a sandbox that interpolated at the normal speed
+  failed 13 to 16 ticks of it by 0.0015 to 0.0027 blocks.

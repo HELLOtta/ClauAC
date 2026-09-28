@@ -296,9 +296,10 @@ What cannot be tried that way leaves the tick `UNVERIFIED` instead of `MISMATCHE
 - A switch that stopped an item use when the new item changes an attribute that moves the player (speed, gravity,
   scale, step height and the like), which the alternative leaves out.
 - Items the sandbox had to mark unknown, until the server's resend arrives, and teleports whose resulting position
-  differs from the sandbox's. A rotation that differs is the client's input and is taken over. Interacting with an
-  entity the sandbox does not know never moves the player, but may use up or fill the held item, so the sandbox then
-  marks its items unknown and has them resent.
+  differs from the sandbox's in a coordinate the teleport gives relative to the player's own; one it sets outright has
+  to be the teleport's (see "Setbacks"). A rotation that differs is the client's input and is taken over. Interacting
+  with an entity the sandbox does not know never moves the player, but may use up or fill the held item, so the
+  sandbox then marks its items unknown and has them resent.
 - With the experimental minecart movement, a minecart turns its rider only while the client's "rotate with minecart"
   option is on, which the server never learns. Placing a block or swinging at what the crosshair points at in such a
   minecart depends on the rotation the client had.
@@ -326,16 +327,16 @@ Known limits:
 ### Verified so far
 
 With a real 26.3 client on Paper 26.3, every tick of the following produced `MATCHED` with an offset of exactly 0:
-walking, jumping, sneaking, sprinting and sprint jumping, stairs up and down, sinking, swimming and leaving water, a
-50 block fall into water, speed and jump boost effects, knockback from damage, a TNT explosion and a wind charge, teleports,
-creative flight, gliding with an elytra and boosting with fireworks, cows and another player pushing the player,
-walking into a boat and stepping onto it, a team whose collision rule stops those pushes, eating, blocking with a
-shield and drawing a bow while walking, placing a block and walking into it, breaking blocks, and a sprint hit on a
+walking, jumping, sneaking, sprinting and sprint jumping, stairs up and down, sinking, swimming and leaving water, a 50
+block fall into water, speed and jump boost effects, knockback from damage, a TNT explosion and a wind charge,
+teleports, creative flight, gliding with an elytra and boosting with fireworks, cows and another player pushing the
+player, walking into a boat and stepping onto it, a team whose collision rule stops those pushes, eating, blocking with
+a shield and drawing a bow while walking, placing a block and walking into it, breaking blocks, and a sprint hit on a
 boat and on another player. Riding matched as well, the vehicle included: steering a boat on water through turns and
 leaving it, a horse walking, sprinting and making a charged jump, a camel walking and dashing, a pig steered with a
 carrot on a stick and boosted, a strider on lava, a happy ghast flying up, forward and down, a nautilus swimming and
-dashing, a minecart on powered rails, and a panicking pig the server moved, which the player took over with a hotbar
-key and handed back the same way.
+dashing, a minecart on powered rails, and a panicking pig the server moved, which the player took over with a hotbar key
+and handed back the same way.
 
 Pistons matched too: a piston pushing the player sideways, into a wall, and back while the player walked towards it,
 lifting the block the player stood on, pushing the jumping player down, and lifting the player against a ceiling,
@@ -393,6 +394,13 @@ reported it, which the next tick confirmed; a sprint attack right after a hotbar
 strength that switch left, and an attack on an entity id the sandbox did not know, injected into the connection,
 matched without slowing the player down. While the player was dead the sandbox, like the client, did not move it
 (`NOT_SIMULATED`), and matching resumed after the respawn.
+
+At a server tick rate of 40 (`tick rate 40`), the client still ends 20 ticks a second (`Minecraft.getTickTargetMillis`)
+but moves the living entities it shows twice as fast towards the positions the server sends them
+(`ClientLevel.getRelativeTickSpeed`, by which `SteppedInterpolationHandler` advances). A cow without AI that the server
+teleported through the standing player in steps of a quarter block pushed the player the way the client showed in all
+304, 312 and 318 ticks of three runs at that rate, as it did at the normal rate. Before the sandbox followed the client
+in this, 16 and 13 ticks of two runs failed at the tick rate of 40, by 0.0015 to 0.0027 blocks, and none at 20.
 
 Over worse connections the courses matched as well. A proxy between the client and the server held back what each side
 sent: by 300 ms each way; by 1 s each way, a round trip of 2 s; by 60 ms and up to 120 ms more for every piece it read,
@@ -697,17 +705,26 @@ failed from the server instead (see "Attacks and interactions", "Blocks and item
   otherwise. The correction goes out in one of ClauAC's own bundles, so that the pong to the ping behind it shows when
   the client has taken it; the client's answer to ClauAC's teleport goes no further than the simulation. The server
   is not involved at all: it never saw the movement that was thrown away.
+- The client answers a teleport with its acceptance, which carries its resulting position
+  (`ClientPacketListener.handleMovePlayer`), and a movement cheat that changes the positions the client sends changes
+  that one too. A coordinate the teleport sets outright is the teleport's on every client
+  (`PositionMoveRotation.calculateAbsolute`), so an answer that differs in it fails `Simulation`, and the coordinate
+  stays the teleport's in the sandbox, which the next tick starts from; only a coordinate the teleport gives relative
+  to the player's own is taken over (see "What the simulation cannot know"). Otherwise the answer to a correction would
+  carry the cheat's position past it.
 - A tick that fails after the client has taken the correction gets a setback of its own, since the simulation went
   on from where the correction put the player. A tick the client played before it took the correction needs none; the
-  correction puts the client back anyway.
+  correction puts the client back anyway. Neither does a tick that ended before a teleport of the server went out,
+  the server's own or one of the setbacks below: the client played it before it could take that teleport, which puts
+  it somewhere anyway, while the simulation began the tick where the tick before had left the player.
 - When the simulation falls behind, the packets go on unjudged once the oldest has waited `setbacks.maximum-hold-millis`
   (a second by default), or once more than 2048 packets or 4 MiB are held. The packets of a connection that started
   while the vanilla runtime was starting are never held, since the simulation does not see all of them. The server
   then applies movement that may turn out to fail. Such a setback teleports the player back to where the failed tick
   began, on the server (`Player#teleport`, cause `UNKNOWN`), unless the server put the player somewhere itself after
-  that tick began (a teleport or a respawn), which the setback would undo. A plugin can cancel that teleport; the log
-  says so then. Vehicle movement that reached the server this way stays: the vehicle is only put back where the server
-  has it.
+  that tick began (a teleport or a respawn), which the setback would undo, or such a setback of an earlier tick
+  teleported the player back after this tick ended (see above). A plugin can cancel that teleport; the log says so
+  then. Vehicle movement that reached the server this way stays: the vehicle is only put back where the server has it.
 - A dead or sleeping player is not set back, and neither is a rider that did not steer its vehicle, whose position the
   server decides.
 
@@ -733,6 +750,18 @@ server's own position of the player sampled with `data get entity` in the meanti
   shifted positions; the setbacks were then 51 teleports on the server back to where the failed tick began, 14
   corrections where the verdict came first after all, and one left out because the previous teleport was still on its
   way to the client.
+- The client answers every correction with its acceptance, which carries its resulting position, and the proxy
+  shifted those as well, as a movement cheat would. While the sandbox took over a position that differed there, the
+  answers carried the shift past the setbacks: the server's position of the player rose to 102.6 while positions were
+  reported 2 blocks higher, and went from 98.5 to 116.3 while they were reported 4 blocks ahead. Since such an answer
+  fails `Simulation` (see above), all 56 shifted answers of the same test failed it, and the server's position did not
+  change in either part; the setbacks were 58 teleports and 34 corrections of the boat, which kept 388 movement packets
+  from the server, and Paper's movement checks saw nothing.
+- With `setbacks.maximum-hold-millis` at 1 and the answers left alone, a tick the client had played before it took a
+  teleport of the server back got a setback of its own, back to where the simulation had begun that tick: the report
+  of the tick before, shifted 4 blocks ahead. That moved the server's position of the player from 98.5 to 102.6 in one
+  of two runs. Such ticks are left out now (see above), and in three runs the server's position stayed where it was;
+  7, 3 and 2 setbacks were left out as ticks that ended before a teleport of the server went out.
 
 ### Alerts
 
@@ -786,14 +815,15 @@ the `config.yml` of an earlier version keeps working. The alerts go out through 
 
 ### For other plugins: `ClauACFlagEvent`
 
-ClauAC calls `io.github.hellotta.clauac.api.ClauACFlagEvent` once for every check a tick failed, before it responds to
-it. The event holds the player, the check (`io.github.hellotta.clauac.simulation.api.Check`), the detail and the
-client tick; cancelling it keeps ClauAC from responding to that flag: it does not alert, and it sets the player back
-or keeps the failed action from the server only when another flag of the same tick that nobody cancelled asks for
-it. The event is asynchronous: the simulation
-thread that finished the tick calls it as soon as the result is known, with ClauAC's plugin class loader as the
-thread's context class loader. A listener therefore has to be quick and must hand anything that touches the world or
-the player's state to the server thread. A plugin that listens for it depends on ClauAC in its `plugin.yml`
+ClauAC calls `io.github.hellotta.clauac.api.ClauACFlagEvent` once for every flag of a tick, before it responds to it:
+for every check the tick failed, and once more for every other way it failed the same check (two packets no vanilla
+client sends, or a teleport answered with another position and a tick's own movement that differs). The event holds the
+player, the check (`io.github.hellotta.clauac.simulation.api.Check`), the detail and the client tick; cancelling it
+keeps ClauAC from responding to that flag: it does not alert, and it sets the player back or keeps the failed action
+from the server only when another flag of the same tick that nobody cancelled asks for it. The event is asynchronous:
+the simulation thread that finished the tick calls it as soon as the result is known, with ClauAC's plugin class loader
+as the thread's context class loader. A listener therefore has to be quick and must hand anything that touches the world
+or the player's state to the server thread. A plugin that listens for it depends on ClauAC in its `plugin.yml`
 (`depend: [ClauAC]`), so that it loads after ClauAC and sees its classes:
 
 ```java
