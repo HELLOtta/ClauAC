@@ -440,6 +440,8 @@ Every `MISMATCHED` tick names the checks it failed, each with what exactly faile
 |                     | did, or with another hotbar slot in the middle of its key handling                           |
 | `FastBreak`         | The client finished breaking a block before the vanilla client's breaking progress with the  |
 |                     | same tool and effects reached the whole block (see "Blocks and items")                       |
+| `NoSwing`           | The client left out the swing a vanilla client sends right after every attack and every      |
+|                     | start, finish and turn of breaking a block (see "Swings")                                    |
 | `SimulationFailure` | The simulation itself failed during the tick, so nothing the client sent in it was checked   |
 
 Something the simulation cannot know (see "What the simulation cannot know") only ever explains a difference in the
@@ -504,10 +506,10 @@ Where the packets leave the client's situation open, the check takes whatever a 
   know").
 
 Attacks and interactions are held like the movement (see "Setbacks"). An attack or interaction that fails `Reach`,
-`Hitbox` or `Interaction` with `setback` on never reaches the server; the tick's other actions and its movement go on
-unless another check of the tick keeps them back. The client keeps what it did on its own when it attacked (its
-swing, the end of its sprint), and an interaction that used up or changed the held item has the server send the
-player its inventory. An attack that went on unjudged, because the simulation fell further behind than
+`Hitbox`, `Interaction` or `NoSwing` (see "Swings") with `setback` on never reaches the server; the tick's other actions
+and its movement go on unless another check of the tick keeps them back. The client keeps what it did on its own when it
+attacked (its swing, the end of its sprint), and an interaction that used up or changed the held item has the server
+send the player its inventory. An attack that went on unjudged, because the simulation fell further behind than
 `setbacks.maximum-hold-millis`, has reached the server and cannot be taken back. Paper's own check lets an attack or
 interaction through within the player's range plus 3 blocks (`misc.client-interaction-leniency-distance` in
 `paper-global.yml`) and does not look at the crosshair.
@@ -581,15 +583,15 @@ Where the packets leave the client's situation open, the checks take whatever a 
 - While the sandbox's items differ from the client's (see "What the simulation cannot know"), no action is checked;
   the tick's notes say what each check would have found.
 
-An action that fails `Reach`, `Hitbox`, `Interaction` or `FastBreak` with `setback` on never reaches the server, like a
-failed attack, also when the hold let go of earlier packets of its tick unjudged: only an action that went on unjudged
-itself has reached the server, which answers it. The client predicted what its block actions did and keeps that until
-the server acknowledges the prediction (`MultiPlayerGameMode.startPrediction` numbers them), which the server never does
-for a packet it never received: ClauAC acknowledges the latest prediction of the actions it kept from the server in the
-server's stead, in one of its own bundles, and the client takes back what it predicted
-(`ClientPacketListener.handleBlockChangedAck`). After an item used on a block or in the air is refused, the server
-sends the player its inventory. The simulation still performs a refused action as the
-client did, since the client went on from it: after a refused finish it waits out the delay after a break as well.
+An action that fails `Reach`, `Hitbox`, `Interaction`, `FastBreak` or `NoSwing` with `setback` on never reaches the
+server, like a failed attack, also when the hold let go of earlier packets of its tick unjudged: only an action that
+went on unjudged itself has reached the server, which answers it. The client predicted what its block actions did and
+keeps that until the server acknowledges the prediction (`MultiPlayerGameMode.startPrediction` numbers them), which the
+server never does for a packet it never received: ClauAC acknowledges the latest prediction of the actions it kept from
+the server in the server's stead, in one of its own bundles, and the client takes back what it predicted
+(`ClientPacketListener.handleBlockChangedAck`). After an item used on a block or in the air is refused, the server sends
+the player its inventory. The simulation still performs a refused action as the client did, since the client went on
+from it: after a refused finish it waits out the delay after a break as well.
 
 In game, the player stood before a stone wall with a diamond pickaxe, stone, snowballs, a wooden pickaxe, an iron
 spear and shears in its hotbar. It mined the stone, placed stone on the floor, threw a snowball, pressed a hotbar key
@@ -626,12 +628,40 @@ from the server, 11 block predictions taken back and one time the packets went o
 With these checks, the nine test courses matched in all of their 14 378 ticks, and the attacks and interactions of
 "Attacks and interactions" failed and were kept from the server as before.
 
+### Swings
+
+The 26.3 client has no packet for the swing of its arm. It sends `ServerboundPunchPacket` (`minecraft:punch`, which
+carries nothing) instead, and the server swings the player's arm for the other players when it arrives
+(`ServerGamePacketListenerImpl.handlePunch`, which also starts the player's attack strength over; Paper calls
+`PlayerArmSwingEvent` there as well, and a `PlayerInteractEvent` for a click at the air where its own ray trace meets
+nothing). `Minecraft.startAttack` sends it after every click of the attack button, right after the attack or the start
+of breaking the click made, with only the client's own swing of the arm in between (`LivingEntity.swing`, which sends
+nothing on the client). `continueAttack` sends it after every tick in which `continueDestroyBlock` went on breaking,
+right after the finish, the turn, or the start on another block or in creative mode that come from there. An attack
+comes only from `startAttack` (`MultiPlayerGameMode.attack` is its only sender, and `startAttack` the only caller of
+that), and the block actions only from these two methods, so a vanilla client follows every attack and every start,
+finish and turn of breaking with a swing as the tick's next action. One without it fails `NoSwing` and, with `setback`
+on, never reaches the server, like the actions above. A stab with a piercing weapon
+(`MultiPlayerGameMode.piercingAttack`) and an abort come without a swing. The server swings the arm for a stab itself
+(`PiercingWeapon.attack`), as it does for the use key's item uses and interactions
+(`LivingEntity.swingAndResetAttackStrength` in their handlers), so a client can hide none of those swings. The check
+needs nothing but the order of the tick's packets, so it applies also while the sandbox's items differ from the
+client's.
+
+Leaving the swing out makes no attack stronger: `Player.attack` starts the attack strength over itself
+(`Player.onAttack`). What it hides is the swing: the other players do not see the player attack or break, and plugins
+that listen for `PlayerArmSwingEvent` do not hear of it. The ticks between the start and the finish of a break send the
+swing alone, and those swings are what tells the simulation the breaking progress (see "Blocks and items"): a client
+that leaves them out finishes before the progress it showed, which fails `FastBreak` as well. A click that meets nothing
+sends the swing alone, too. A client that leaves that one out sends nothing at all, which no check on the server can
+see; the server then does not start the attack strength over as it does for a vanilla client's miss.
+
 ### Setbacks
 
 A tick that fails a check whose `setback` is on (every check but `SimulationFailure` by default) is set back: its
 movement never reaches the server, and the client is put back where the server has the player. The checks of the
-actions (`Reach`, `Hitbox`, `Interaction`, `FastBreak`) move nobody: their `setback` keeps the action that failed from
-the server instead (see "Attacks and interactions" and "Blocks and items").
+actions (`Reach`, `Hitbox`, `Interaction`, `FastBreak`, `NoSwing`) move nobody: their `setback` keeps the action that
+failed from the server instead (see "Attacks and interactions", "Blocks and items" and "Swings").
 
 - The server applies the client's movement only once the simulation has judged its tick. From a tick's first movement
   packet on (a position, rotation or ground update of the player, or a vehicle position), or from its first action (an
@@ -725,8 +755,8 @@ reads it again while the server runs.
 | `checks.<name>.alert`          | `true`      | Whether failing the check of that name (see the table above) alerts        |
 | `checks.<name>.setback`        | `true`      | Whether failing it sets the player back; `false` for `SimulationFailure`,  |
 |                                |             | a failure of ClauAC's own that says nothing about the client. For `Reach`, |
-|                                |             | `Hitbox`, `Interaction` and `FastBreak` it keeps the action that failed    |
-|                                |             | from the server instead, and nobody is moved                               |
+|                                |             | `Hitbox`, `Interaction`, `FastBreak` and `NoSwing` it keeps the action     |
+|                                |             | that failed from the server instead, and nobody is moved                   |
 
 The format is [MiniMessage](https://docs.papermc.io/adventure/minimessage/format/) text. The filled-in values are
 escaped, so that a detail with a `<` in it shows as it is instead of becoming a MiniMessage tag. A value ClauAC cannot

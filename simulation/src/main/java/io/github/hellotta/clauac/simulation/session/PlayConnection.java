@@ -1783,8 +1783,8 @@ final class PlayConnection implements ClientContext {
                 this.selectHotbarSlot(player, carriedItem.getSlot(), carriedItem == leadingSwitch);
             }
             case ServerboundPlayerActionPacket playerAction -> {
-                this.checkPlayerAction(level, player, playerAction, packet, keyHandlingSlotKnown, start);
-                Packet<?> next = index + 1 < actions.size() ? actions.get(index + 1) : null;
+                Packet<?> next = this.nextAction(index);
+                this.checkPlayerAction(level, player, playerAction, packet, next, keyHandlingSlotKnown, start);
                 return this.performPlayerAction(playerAction, next, keyHandlingSlotKnown, this.onlySwingsFollow(index), level, player) || swingAccompanied;
             }
             case ServerboundUseItemOnPacket useItemOn -> {
@@ -1801,10 +1801,15 @@ final class PlayConnection implements ClientContext {
             }
             case ServerboundAttackPacket attack -> {
                 Entity target = level.getEntity(attack.entityId());
+                Packet<?> next = this.nextAction(index);
                 if (target == null) {
+                    this.checkSwingFollows(new CheckedAction("attacked an entity the sandbox does not know (entity " + attack.entityId() + ")", packet,
+                            Flag.NO_PREDICTION), next);
                     this.attackUnknownEntity(player, this.onlySwingsFollow(index));
                 } else {
-                    this.checkAttack(level, player, target, new CheckedAction("attacked " + describeEntity(target), packet, Flag.NO_PREDICTION), start);
+                    CheckedAction checkedAttack = new CheckedAction("attacked " + describeEntity(target), packet, Flag.NO_PREDICTION);
+                    this.checkAttack(level, player, target, checkedAttack, start);
+                    this.checkSwingFollows(checkedAttack, next);
                     this.attackEntity(level, player, target, this.onlySwingsFollow(index));
                 }
                 return true;
@@ -1952,9 +1957,12 @@ final class PlayConnection implements ClientContext {
     // - (ClientPacketListener.handleMovePlayer): those only change what the client itself holds or breaks. Whether the -
     // - client could finish or turn depends on its mining state, which the sandbox knows only while no start of -
     // - breaking left it open (SandboxGameMode.miningStateKnown); a finish or turn comes from continueDestroyBlock, -
-    // - which reports the slot it acts with first, while a start's item is known as keyHandlingSlotKnown tells -
+    // - which reports the slot it acts with first, while a start's item is known as keyHandlingSlotKnown tells. A -
+    // - start, a finish and a turn are followed by their swing (see checkSwingFollows); next is the tick's action -
+    // - after this one, null when this one ends the tick's actions -
     private void checkPlayerAction(
-            SandboxLevel level, SandboxPlayer player, ServerboundPlayerActionPacket action, long packet, boolean keyHandlingSlotKnown, KeyHandlingStart start
+            SandboxLevel level, SandboxPlayer player, ServerboundPlayerActionPacket action, long packet, @Nullable Packet<?> next,
+            boolean keyHandlingSlotKnown, KeyHandlingStart start
     ) {
         BlockPos pos = action.getPos();
         int prediction = predictionOf(action.getSequence());
@@ -1962,8 +1970,11 @@ final class PlayConnection implements ClientContext {
                 ? null
                 : "the client may have started breaking with another hotbar item than the sandbox, which breaks another block";
         switch (action.getAction()) {
-            case START_DESTROY_BLOCK -> this.checkBlockBreaking(level, player, new CheckedAction("started breaking " + describeBlock(level, pos), packet, prediction),
-                    pos, action.getDirection(), true, keyHandlingSlotKnown, start);
+            case START_DESTROY_BLOCK -> {
+                CheckedAction startOfBreak = new CheckedAction("started breaking " + describeBlock(level, pos), packet, prediction);
+                this.checkBlockBreaking(level, player, startOfBreak, pos, action.getDirection(), true, keyHandlingSlotKnown, start);
+                this.checkSwingFollows(startOfBreak, next);
+            }
             case STOP_DESTROY_BLOCK -> {
                 CheckedAction finish = new CheckedAction("finished breaking " + describeBlock(level, pos), packet, prediction);
                 this.checkBlockBreaking(level, player, finish, pos, action.getDirection(), false, true, start);
@@ -1971,6 +1982,7 @@ final class PlayConnection implements ClientContext {
                 if (whyNoFinish != null) {
                     this.rejectUnlessUncertain(finish, Check.FAST_BREAK, finish.description() + " " + whyNoFinish, miningStateUnknown);
                 }
+                this.checkSwingFollows(finish, next);
             }
             case CHANGE_DESTROY_DIRECTION -> {
                 CheckedAction turn = new CheckedAction("turned to another face of " + describeBlock(level, pos) + " while breaking it", packet, prediction);
@@ -1980,10 +1992,29 @@ final class PlayConnection implements ClientContext {
                     this.rejectUnlessUncertain(turn, Check.INTERACTION, turn.description() + ", which a vanilla client only does for the block it is breaking",
                             miningStateUnknown);
                 }
+                this.checkSwingFollows(turn, next);
             }
             case STAB -> this.checkStab(level, player, new CheckedAction("stabbed", packet, Flag.NO_PREDICTION), start);
             case ABORT_DESTROY_BLOCK, DROP_ITEM, DROP_ALL_ITEMS, RELEASE_USE_ITEM, SWAP_ITEM_WITH_OFFHAND -> {
             }
+        }
+    }
+
+    // - Minecraft.startAttack swings right after every attack and every start of breaking it makes, and continueAttack -
+    // - right after every tick in which continueDestroyBlock went on breaking, which is where the finish, the turn and -
+    // - a start on another block or in creative mode come from: the player's own swing (LivingEntity.swing, which -
+    // - sends nothing on the client) and then ServerboundPunchPacket, before the key handling sends anything else. -
+    // - MultiPlayerGameMode.attack is the only sender of an attack and startAttack its only caller, and the block -
+    // - actions come only from startAttack and continueAttack (see checkBlockBreaking), so a vanilla client follows -
+    // - each of these actions with a swing as the tick's next action; a stab (MultiPlayerGameMode.piercingAttack) and -
+    // - an abort have none. The server shows the other players the swing of an attack or a break only for that packet -
+    // - (ServerGamePacketListenerImpl.handlePunch), so a client that leaves it out hides its attacks and breaks from -
+    // - them. The swing does not depend on the items, so it is checked also while the sandbox's items differ from the -
+    // - client's (see reject). next is the tick's action after this one, null when this one ends the tick's actions -
+    private void checkSwingFollows(CheckedAction action, @Nullable Packet<?> next) {
+        if (!(next instanceof ServerboundPunchPacket)) {
+            this.tickPackets.rejectAction(Check.NO_SWING, action.description() + " without the swing a vanilla client sends right after it",
+                    action.packet(), action.predictionSequence());
         }
     }
 
@@ -2406,6 +2437,12 @@ final class PlayConnection implements ClientContext {
             }
         }
         return true;
+    }
+
+    // - The action the client sent right after this action of the tick, or null when this one ends the tick's actions -
+    private @Nullable Packet<?> nextAction(int index) {
+        List<Packet<?>> actions = this.tickPackets.actions;
+        return index + 1 < actions.size() ? actions.get(index + 1) : null;
     }
 
     // - MultiPlayerGameMode.useItem. A vanilla client uses an item only while it uses none (Minecraft.handleKeybinds), -

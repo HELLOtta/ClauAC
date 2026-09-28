@@ -21,8 +21,8 @@ setbacks:
 
 # - What ClauAC does when a client tick fails a check, per check. alert: whether players with alerts on hear of it. -
 # - setback: for a check of the movement, whether the tick's movement is thrown away and the client put back where -
-# - the server has the player; for a check of the actions (Reach, Hitbox, Interaction, FastBreak), whether the -
-# - action that failed it is kept from the server, and the client takes back the blocks it changed with it -
+# - the server has the player; for a check of the actions (Reach, Hitbox, Interaction, FastBreak, NoSwing), whether -
+# - the action that failed it is kept from the server, and the client takes back the blocks it changed with it -
 checks:
   # - The player did not move the way the vanilla client moves it -
   Simulation:
@@ -65,6 +65,11 @@ checks:
     setback: true
   # - The client finished breaking a block sooner than a vanilla client with the same tool and effects can -
   FastBreak:
+    alert: true
+    setback: true
+  # - The client left out the swing a vanilla client sends right after every attack and every start, finish and -
+  # - turn of breaking a block, which hides the swing of its arm from the other players -
+  NoSwing:
     alert: true
     setback: true
   # - The simulation itself failed during a tick; nothing the client sent could be checked -

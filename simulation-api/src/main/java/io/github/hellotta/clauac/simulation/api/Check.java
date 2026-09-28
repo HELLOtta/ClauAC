@@ -32,6 +32,10 @@ public enum Check {
     // - The client finished breaking a block before its breaking progress, the progress of the vanilla client with -
     // - the same tool and effects in the same place, reached the whole block -
     FAST_BREAK("FastBreak", true),
+    // - The client left out the swing (ServerboundPunchPacket) a vanilla client sends right after every attack and -
+    // - every start, finish and turn of breaking a block, which the server shows the other players as the swing of -
+    // - the player's arm -
+    NO_SWING("NoSwing", true),
     // - The simulation itself failed during the tick; nothing the client sent could be checked -
     SIMULATION_FAILURE("SimulationFailure", false);
 
