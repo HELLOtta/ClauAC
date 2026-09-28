@@ -71,7 +71,8 @@ Findings from running the official 26.3 client in a cloud container without a GP
   mob takes a player for its target (`LivingEntity.canAttack`); piglins stay in a peaceful level, most other monsters
   leave it (`EntityType.isAllowedInPeaceful`). Paper keeps a difficulty for every level, which the `difficulty` command
   reads and sets for the level it runs in: `execute in minecraft:the_nether run difficulty peaceful` makes the nether
-  peaceful alone.
+  peaceful alone. Chunks that load in a peaceful level drop the monsters stored in them that do not stay there, and the
+  server logs a warning `Skipping Entity with id <type>` for each (`EntityType.canSpawn`).
 - **Console commands:** `~ ~ ~` in a console command means the console's position (the world spawn); run relative
   commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`.
 - **Aiming the test player:** `tp ... facing` and `rotate ... facing` turn the player from the command source's anchor,
