@@ -656,6 +656,25 @@ that leaves them out finishes before the progress it showed, which fails `FastBr
 sends the swing alone, too. A client that leaves that one out sends nothing at all, which no check on the server can
 see; the server then does not start the attack strength over as it does for a vanilla client's miss.
 
+In game, a proxy between the 26.3 client and the server dropped the client's swings for a while, as a NoSwing cheat
+does, while the player attacked a cow without AI, mined stone with a diamond pickaxe, held the attack button on bedrock
+and broke a slime block, which breaks at once; the proxy also sent an attack on an entity id nobody had, without a
+swing. Nine actions failed `NoSwing`, each in its own tick: the attack; the starts of breaking the stone, the bedrock,
+the slime block and the floor behind it, which the crosshair met through the slime block the client had just broken
+while the button was still down; the two finishes of the stone, which failed `FastBreak` as well; the turn to another
+face of the stone, which `continueDestroyBlock` sends in the first tick it goes on breaking a block after a finish, as
+the client did once the stone came back; and the attack on the unknown entity. None of them reached the server: the cow
+kept its health, the stone and the slime block stayed, and `/clauac status` counted 9 actions kept from the server and 6
+block predictions taken back. With the swings, before and after, every tick matched and the server applied what the
+client did. An alert reads:
+
+    [ClauAC] Tester failed NoSwing x1 attacked minecraft:cow (entity 375) without the swing a vanilla client sends right after it
+
+The combat and block tests now send the swing a vanilla client sends after each attack and block action they inject,
+and each of their steps failed exactly the checks it failed before; course 6 sends its attack on an unknown entity with
+that swing as well. With the check, the thirteen courses matched in all of their 19 719 simulated ticks, and the tests
+of `Timer`, the tick budget, alerts and setbacks, held and late, passed as before.
+
 ### Setbacks
 
 A tick that fails a check whose `setback` is on (every check but `SimulationFailure` by default) is set back: its
