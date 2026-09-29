@@ -3,7 +3,10 @@ package io.github.hellotta.clauac.simulation.world;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
@@ -35,6 +38,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.FuelValues;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.border.WorldBorder;
@@ -78,6 +82,9 @@ public final class SandboxLevel extends Level {
     private static final int LIGHT_QUEUE_SHARE_PER_FRAME = 10;
     public static final long SKY_LIGHT_SETTLE_TICKS = (long) framesToRunLightQueue(LIGHT_QUEUE_RUN_AT_ONCE - 1) * MAX_TICKS_PER_FRAME;
     private static final long NEVER = Long.MIN_VALUE;
+    // - A block change that sets off nothing else (see putBlocks): no neighbor or shape updates, no drops, no side -
+    // - effects of block entities and no onPlace -
+    private static final int PUT_FLAGS = Block.UPDATE_SKIP_ALL_SIDEEFFECTS;
 
     private final EntityTickList tickingEntities = new EntityTickList();
     private final TransientEntitySectionManager<Entity> entityStorage = new TransientEntitySectionManager<>(Entity.class, new EntityCallbacks());
@@ -110,6 +117,11 @@ public final class SandboxLevel extends Level {
     private long ticks;
     private final Long2LongOpenHashMap chunkArrivals = new Long2LongOpenHashMap();
     private final Long2LongOpenHashMap skyLightSourceMoves = new Long2LongOpenHashMap();
+    // - The blocks changed since recordBlockChanges began, each with what it held before its first change; null -
+    // - while nothing is recorded -
+    private @Nullable Map<BlockPos, BlockSnapshot> recordedBlocks;
+    // - Whether the recording is a trial, whose changes are taken back afterwards (see recordBlockChanges) -
+    private boolean blockTrial;
 
     // - clockManager and scoreboard belong to the connection and outlive levels, like on the client -
     public SandboxLevel(
@@ -327,9 +339,17 @@ public final class SandboxLevel extends Level {
         }
     }
 
-    // - Every block change of the level but the server's (see setServerVerifiedBlockState) goes through here -
+    // - Every block change of the level but the server's (see setServerVerifiedBlockState) goes through here, and a -
+    // - recording (see recordBlockChanges) notes what the block held before -
     @Override
     public boolean setBlock(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlags, int updateLimit) {
+        Map<BlockPos, BlockSnapshot> recorded = this.recordedBlocks;
+        if (recorded != null && !recorded.containsKey(pos)) {
+            recorded.put(pos.immutable(), this.blockSnapshot(pos));
+        }
+        if (this.blockTrial) {
+            return super.setBlock(pos, blockState, updateFlags, updateLimit);
+        }
         int sourceBefore = this.lowestSkyLightSource(pos);
         boolean success = this.setBlockAndRetainPrediction(pos, blockState, updateFlags, updateLimit);
         if (success) {
@@ -343,6 +363,72 @@ public final class SandboxLevel extends Level {
     private void noteSkyLightSourceMove(BlockPos pos, int sourceBefore) {
         if (this.lowestSkyLightSource(pos) != sourceBefore) {
             this.skyLightSourceMoves.put(columnKey(pos), this.ticks);
+        }
+    }
+
+    // - A move of the column's lowest sky light source in the client's world that the sandbox's blocks did not make -
+    // - at the time, noted as of the level tick when it happened -
+    public void noteSkyLightSourceMoved(BlockPos pos, long tick) {
+        long column = columnKey(pos);
+        this.skyLightSourceMoves.put(column, Math.max(this.skyLightSourceMoves.get(column), tick));
+    }
+
+    // - The client ticks this level ran, the clock of skyLightMayLag -
+    public long ticks() {
+        return this.ticks;
+    }
+
+    // - A block with its block entity: null for a block without one, or one whose block entity the level has not -
+    // - made yet, and for a block the server sent, whose block entity the chunk makes as it takes the block -
+    public record BlockSnapshot(BlockState state, @Nullable BlockEntity blockEntity) {
+    }
+
+    // - The block at the position with its block entity, without making a block entity the level has not made yet -
+    public BlockSnapshot blockSnapshot(BlockPos pos) {
+        BlockState state = this.getBlockState(pos);
+        BlockEntity blockEntity = state.hasBlockEntity() ? this.getChunkAt(pos).getBlockEntity(pos, LevelChunk.EntityCreationType.CHECK) : null;
+        return new BlockSnapshot(state, blockEntity);
+    }
+
+    // - Records every block change from now on (see setBlock): each changed position with what it held before its -
+    // - first change. A trial changes blocks only for a moment, to find out what they would become, and putBlocks -
+    // - then takes the changes back: they keep no prediction aside and note no sky light source move. Block entities -
+    // - that vanilla code adds or removes outside setBlock are not recorded; a break on the client does neither -
+    public void recordBlockChanges(boolean trial) {
+        if (this.recordedBlocks != null) {
+            throw new IllegalStateException("A recording of block changes runs already");
+        }
+        this.recordedBlocks = new LinkedHashMap<>();
+        this.blockTrial = trial;
+    }
+
+    // - Ends the recording and returns what it recorded -
+    public Map<BlockPos, BlockSnapshot> stopRecordingBlockChanges() {
+        Map<BlockPos, BlockSnapshot> recorded = Objects.requireNonNull(this.recordedBlocks, "No recording of block changes runs");
+        this.recordedBlocks = null;
+        this.blockTrial = false;
+        return recorded;
+    }
+
+    // - Puts blocks in place with their block entities as they are given and with nothing else a block change does -
+    // - (PUT_FLAGS): the chunk takes them as they are, with its heightmaps and sky light sources, and gives a block the -
+    // - block entity it makes (LevelChunk.setBlockState) unless another one is given, whose place it then takes. -
+    // - Returns what the positions held before, which puts them back as they were -
+    public Map<BlockPos, BlockSnapshot> putBlocks(Map<BlockPos, BlockSnapshot> blocks) {
+        Map<BlockPos, BlockSnapshot> before = new LinkedHashMap<>();
+        for (Map.Entry<BlockPos, BlockSnapshot> entry : blocks.entrySet()) {
+            BlockPos pos = entry.getKey();
+            before.put(pos, this.blockSnapshot(pos));
+            this.putBlock(pos, entry.getValue());
+        }
+        return before;
+    }
+
+    private void putBlock(BlockPos pos, BlockSnapshot block) {
+        super.setBlock(pos, block.state(), PUT_FLAGS, 0);
+        BlockEntity wanted = block.blockEntity();
+        if (wanted != null && this.getChunkAt(pos).getBlockEntity(pos, LevelChunk.EntityCreationType.CHECK) != wanted) {
+            this.setBlockEntity(wanted);
         }
     }
 
@@ -529,7 +615,7 @@ public final class SandboxLevel extends Level {
 
     // - The lowest y of the column that the sky lights fully, from the chunk's sky light sources; above every y where -
     // - the client has no chunk -
-    private int lowestSkyLightSource(BlockPos pos) {
+    public int lowestSkyLightSource(BlockPos pos) {
         LevelChunk chunk = this.chunkSource.getChunkNow(SectionPos.blockToSectionCoord(pos.getX()), SectionPos.blockToSectionCoord(pos.getZ()));
         return chunk != null
                 ? chunk.getSkyLightSources().getLowestSourceY(SectionPos.sectionRelative(pos.getX()), SectionPos.sectionRelative(pos.getZ()))

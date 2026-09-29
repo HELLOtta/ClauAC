@@ -146,6 +146,14 @@ The tests of the checks and responses failed only what they cheated:
   cursor, put down by a click in the survival inventory, left the sandbox's items differing from the client's for
   three ticks, which matched (see "Verified so far"). The thirteen courses matched in all of their 19 648 simulated
   ticks, and the combat and block tests failed exactly the checks they failed before.
+- The test of the two situations that left the sandbox unsure until it tried their outcomes (see "Disablers") left none
+  of the 1856 ticks of its connection `UNVERIFIED`: the 6 attack ticks with shifted positions and the 84 at the leaves
+  failed `Simulation`, the passes without a shift matched, and the server's position of the player stayed at 100.0. A
+  vanilla client's starts of breaking with an item the sandbox could not know yet matched in all 1984 ticks of their
+  check, the tick into the gap the shears had broken matching only in that world, and the sprint attacks of the attack
+  probe in all 4868 ticks, 14 of them only as the knockback attack of the other strength. The thirteen courses matched
+  in all of their 19 923 simulated ticks, the combat, block and NoSwing tests failed exactly the checks they failed
+  before, and the tests of the disablers and of the creative inventory passed as before.
 
 Over worse connections the courses matched as well. Through the proxy of "Verified so far", with each of its five kinds
 of delay, courses 1, 2, 3, 5, 7, 8, 9, 10, 11 and 12 and the block and combat tests matched in all of their 36 425
@@ -412,8 +420,28 @@ of them runs from the saved state, and the first that matches what the client re
   instead, when that tick's player already held the new item. That switch may have stopped the item use of the
   previous tick, which is then held back until the next tick reports the switch; an alternative that matched this way
   and gets no switch reported is `MISMATCHED`. With the attack strength that earlier switch left, an attack may have
-  slowed the player down (a knockback attack) where the sandbox's did not, or the other way round: that attack runs
-  again with the other strength.
+  been a knockback attack, one that pushes its target and slows the player down, where the sandbox's was none, or the
+  other way round. The sandbox's attack is then the one that is none, and the knockback attack is the alternative: at
+  the player's tick it pushes the target and slows down the velocity the attack left, and then adds the pushes the
+  player took from the entities that ticked ahead of it (`Entity.push`), which gives the client's velocity exactly,
+  whatever else the tick's key handling did after the attack. In game no entity ticked ahead of the player: the client
+  adds each entity behind its own player (`ClientLevel.tickEntities` goes in the order of adding), and anew when the
+  server sends the entities again after a respawn. A target that ticked ahead of the player would already have moved
+  without the attack's push, which would only matter to one that flies on with its velocity, a shulker bullet: the
+  others the client hurts ignore pushes (item frames and the like), never move (end crystals) or drop their velocity in
+  their tick (a vehicle the client does not steer).
+- A start of breaking reports no hotbar slot (`MultiPlayerGameMode.startDestroyBlock`), and the slot a hotbar key
+  selected in the same key handling reaches the server only at the start of the next tick, or never when another key
+  selected the old slot again first. Where another hotbar item would have done something else with the block (shears
+  break leaves at once where a stick starts breaking them; a sword breaks nothing in creative mode), the client may be
+  in another world than the sandbox's: with other blocks, which it keeps predicted until the server acknowledges the
+  start, and another mining state. The sandbox keeps each such world beside its own (`UncertainStart`) until the
+  client shows which it is in: an action that only another world explains puts the sandbox in that world, and so does
+  a tick whose movement matches only with that world's blocks, which the player's tick tries as an alternative. The
+  server's acknowledgement and block updates reach the other worlds as they reach the client, and a world left with
+  nothing that differs from the sandbox's goes away. An action that breaks blocks or changes the mining while worlds
+  are still open, and would go on differently in each, takes the sandbox's world: the one of the item the server knows
+  to be held.
 - An attack on an entity the sandbox does not know fails `Hitbox`, since no vanilla client makes it (see "Attacks and
   interactions"). Where it is the last thing of the tick that changes the player, the attack slowing the player down
   is tried as well; otherwise the sandbox takes it for an attack that did nothing to the player.
@@ -432,9 +460,12 @@ of them runs from the saved state, and the first that matches what the client re
 
 What cannot be tried that way leaves the tick `UNVERIFIED` instead of `MISMATCHED`:
 
-- The alternatives above while the player rides, and in a tick whose actions after the attack or the trident's release
-  changed the player. Blocks that move next to the player (a piston, a shulker box) move it only after it sent its
-  movement, so they leave the alternatives alone.
+- The alternatives above while the player rides, in a tick whose actions after the trident's release changed the
+  player, and for an attack after which something other than a push changed the player's velocity or sprint before
+  its tick: nothing in the client's key handling does, but an entity ticking ahead of the player could. Blocks that
+  move next to the player (a piston, a shulker box) move it only after it sent its movement, so they leave the
+  alternatives alone. The other worlds of a start of breaking stand for no uncertainty: where they cannot be tried, the
+  tick is judged in the sandbox's world (see the known limits below).
 - The client's velocity is never reported. After a difference the sandbox estimates it from the reported movement;
   the rounding of that estimate can move later positions by a few units in the last place, and after an `UNVERIFIED`
   tick, a difference that keeps shrinking in the ticks right after it stays `UNVERIFIED`.
@@ -459,6 +490,11 @@ Known limits:
   show up in the next checked click and are resolved by the inventory resend.
 - A relative rotation packet whose answer the client computed from a rotation the sandbox has not seen yet is applied
   at the next pong instead.
+- The other worlds of a start of breaking with a hotbar item the sandbox does not know (see above) are not tried while
+  the player rides, and an action that breaks blocks or changes the mining while they are open takes the sandbox's
+  world. A vanilla client in another world then fails: one that broke a block with another item in the same frame as
+  the item's hotbar key and rode into the gap before the server's acknowledgement gave the block back. The data of a
+  block entity the server sends reaches only the sandbox's world.
 - A connection that was already playing when ClauAC started watching it (after a plugin reload) is not simulated:
   the simulation has to see a connection from its first configuration packet on.
 - The tick budget (see "Cost and limits") only bounds what the simulation costs; the `Timer` check (see "Responses")
@@ -468,17 +504,18 @@ Known limits:
 ### Disablers
 
 An uncertainty explains any difference in the movement, so what leaves a tick `UNVERIFIED` has to be the client's
-situation, never something a client can send at will: a client that could would keep its movement unchecked for as
-long as it went on sending it, as the cheats called disablers do. Items the sandbox had to mark unknown after a click
-that differed (see "Following the client's timeline") are therefore only noted in the ticks until the server's resend
+situation, never something a client can send at will: a client that could would keep its movement unchecked for as long
+as it went on sending it, as the cheats called disablers do. Items the sandbox had to mark unknown after a click that
+differed (see "Following the client's timeline") are therefore only noted in the ticks until the server's resend
 arrives, and an attack or interaction on an entity the sandbox does not know fails `Hitbox` (see "Attacks and
-interactions") and leaves the tick's movement checked; the alternative of such an attack stands for no uncertainty
-where it cannot be tried. Before, both left the tick `UNVERIFIED`, and while the items were unknown the checks of the
-actions only noted what they found. What still leaves a tick `UNVERIFIED` (see above) takes more than a packet: the
-player riding or blocks moving next to it while an alternative is open, an attack on an entity the crosshair points at
-whose strength depends on when a hotbar switch happened and after which the tick's actions go on, a relative teleport
-of the server, a block the client may have broken otherwise than the sandbox, or a minecart with the experimental
-movement.
+interactions") and leaves the tick's movement checked; the alternative of such an attack stands for no uncertainty where
+it cannot be tried. Before, both left the tick `UNVERIFIED`, and while the items were unknown the checks of the actions
+only noted what they found. What still leaves a tick `UNVERIFIED` (see above) takes more than a packet: the player
+riding while an alternative is open, an entity ticking ahead of the player that moved it after an attack, a relative
+teleport of the server, or a minecart with the experimental movement. Two more situations did until the sandbox tried
+their outcomes: an attack whose strength depends on when a hotbar switch happened and after which the tick's key
+handling went on, and a start of breaking, which never shows the item it was made with, where another hotbar item would
+have broken the block otherwise (see above). A client could have sent either behind every tick end.
 
 In game, a proxy reported the positions of a walking player 2 blocks higher, as in the tests of the setbacks, and sent
 something no vanilla client sends behind every tick end of the client, from a second before the shift on; it left the

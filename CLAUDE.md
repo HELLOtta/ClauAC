@@ -87,7 +87,11 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
   their slots, not of the presses (`Minecraft.handleKeybinds`): two number keys pressed within one frame select the
   higher slot. It reports the slot at the start of the next tick (`MultiPlayerGameMode.tick` runs before
   `handleKeybinds`) or with the first action that needs it, so an action a proxy injects right after a number key goes
-  out with the slot before. Wait a second after a number key before anything that depends on it.
+  out with the slot before. Wait a second after a number key before anything that depends on it. A start of breaking
+  does not report the slot (`MultiPlayerGameMode.startDestroyBlock`): `xdotool keydown <n> mousedown 1` starts breaking
+  with the new item a tick before the server learns of it. The server keeps a player's slot, over restarts too, and
+  gives it to the client when it joins, so a test finds the slot an earlier test left: one that depends on the held
+  item selects its slot with its key first. A slot left that way once made a proxy's switch to it no switch.
 - **Typing into the chat:** the chat key opens the chat only in the client's next tick, and the keys typed until then
   act as key bindings. Right after a 26.2 client joined, a press of the chat key opened nothing: the command typed
   after it never reached the server, and its `l` opened the advancements. Commands typed right after a 26.3 client
@@ -133,8 +137,16 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
   to the corrections stay unshifted (`shift-answers off`): otherwise the first shifted tick fails before the sandbox is
   unsure, and the check of the answers keeps the player in its setback, which hid the disabler in a first try. A
   sprint attack slows its attacker down only when charged (`after-tick-end every N` leaves time to charge), and a
-  knockback enchantment never does on the client: `LivingEntity.getKnockback` adds it only in a `ServerLevel`.
+  knockback enchantment never does on the client: `LivingEntity.getKnockback` adds it only in a `ServerLevel`. It does
+  only when the client counts the attack as a hit (`Entity.hurtOrSimulate` calls `hurtClient` there): a boat does
+  (`VehicleEntity.hurtClient`), a living entity never (`Entity.hurtClient`, which `LivingEntity` keeps), so a sprint
+  attack on a mob or another player leaves the client's speed alone.
 - **Pipelines under `pipefail`:** `producer | grep -q` fails whenever grep stops reading before the producer has written
   everything, since the producer then dies of SIGPIPE. A check of the client's command line
   (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input
   whole first, e.g. `grep -q -- "$pattern" <<< "$(tr '\0' '\n' < /proc/<pid>/cmdline)"`.
+- **Entity tick order:** the client ticks its entities in the order it added them (`ClientLevel.tickEntities`,
+  `EntityTickList`), and every entity came after the local player. A respawn in the same level adds the new player
+  behind the entities the client has, but the server then sends each entity around it again, which
+  `ClientLevel.addEntity` adds anew behind the player (it removes the one with the same id first): a cow summoned
+  before the respawn pushed the player only after the player's tick.

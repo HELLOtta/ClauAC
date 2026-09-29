@@ -5,7 +5,6 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.OptionalInt;
 import java.util.Set;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -86,6 +85,10 @@ public final class SandboxPlayer extends Player {
     // - What the last Player.attack did to the player itself, recorded while it ran (see attack) -
     private @Nullable AttackRecord lastAttack;
     private boolean attacking;
+    // - The pushes the player took since recordPushes, null while they are not recorded -
+    private @Nullable List<RecordedPush> recordedPushes;
+    // - How often setSprinting ran, which tells whether anything touched the sprint between two points of a tick -
+    private int sprintChanges;
 
     public SandboxPlayer(Level level, GameProfile profile, ClientContext client) {
         super(level, profile);
@@ -252,20 +255,25 @@ public final class SandboxPlayer extends Player {
         }
     }
 
-    // - Player.attack decides at its start whether the attack is a knockback attack, one made sprinting at full -
-    // - strength. The decision is recorded for this player's ticker and for every alternative one before -
-    // - Player.onAttack resets them all -
+    // - Player.attack decides at its start from the attack strength ticker whether the attack is a knockback attack, -
+    // - one made sprinting at full strength. Where the tickers the client may have had decide differently (see -
+    // - alternativeAttackStrengths), the attack runs under one that makes it none, and the knockback attack is the -
+    // - other outcome (see lastAttackOtherwise). Player.onAttack resets every ticker right after the decision, and -
+    // - MultiPlayerGameMode.attack resets them after an attack that Player.attack refused -
     @Override
     public void attack(Entity entity) {
         boolean sprinting = this.isSprinting();
         boolean knockbackAttack = sprinting && this.isFullStrengthAttack(this.attackStrengthTicker);
-        List<Integer> tickersWithOtherKnockbackAttack = new ArrayList<>();
+        AlternativeAttackStrength otherwise = null;
         for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
             if ((sprinting && this.isFullStrengthAttack(alternative.ticker)) != knockbackAttack) {
-                tickersWithOtherKnockbackAttack.add(alternative.ticker);
+                otherwise = alternative;
             }
         }
-        this.lastAttack = new AttackRecord(knockbackAttack, List.copyOf(tickersWithOtherKnockbackAttack));
+        if (otherwise != null && knockbackAttack) {
+            this.attackStrengthTicker = otherwise.ticker;
+        }
+        this.lastAttack = new AttackRecord(entity, otherwise != null);
         this.attacking = true;
         try {
             super.attack(entity);
@@ -285,29 +293,49 @@ public final class SandboxPlayer extends Player {
         return knockback;
     }
 
-    // - Player.attack calls this exactly when the attack hurt its target; a positive knockback slows the attacker -
+    // - Player.attack calls this exactly when the attack hurt its target; a positive knockback pushes the target and -
+    // - slows the attacker. The call is recorded with the rotation it pushes along, for the other outcome -
     @Override
     public void causeExtraKnockback(Entity entity, float knockbackAmount, Vec3 oldMovement, DamageSource damageSource, float damage, boolean comesFromEffect) {
         if (this.attacking && this.lastAttack != null) {
             this.lastAttack.hurtTarget = true;
             this.lastAttack.knockback = knockbackAmount;
+            this.lastAttack.targetMovementBefore = oldMovement;
+            this.lastAttack.damageSource = damageSource;
+            this.lastAttack.damage = damage;
+            this.lastAttack.comesFromEffect = comesFromEffect;
+            this.lastAttack.yRot = this.getYRot();
         }
         super.causeExtraKnockback(entity, knockbackAmount, oldMovement, damageSource, damage, comesFromEffect);
     }
 
-    // - An attack strength ticker the client may have had instead (see alternativeAttackStrengths) under which the -
-    // - last attack would have slowed the player down when this player's did not, or not when it did. Whether an -
-    // - attack hurts does not depend on its strength on the client, since Entity.hurtClient takes no damage -
-    public OptionalInt tickerForOtherAttackSlowdown() {
+    // - The knockback attack that another ticker the client may have had (see alternativeAttackStrengths) would have -
+    // - made of the last attack, which ran as none (see attack). Null unless the attack hurt its target and the -
+    // - knockback attack's bonus alone gives it a positive knockback, the one that pushes the target and slows the -
+    // - attacker down: nothing else Player.attack does on the client depends on the attack's strength, and whether an -
+    // - attack hurts does not either, since Entity.hurtClient takes no damage -
+    public @Nullable KnockbackAttack lastAttackOtherwise() {
         AttackRecord attack = this.lastAttack;
-        if (attack == null || !attack.hurtTarget || attack.tickersWithOtherKnockbackAttack.isEmpty()) {
-            return OptionalInt.empty();
+        if (attack == null || !attack.otherTickerMakesKnockbackAttack || !attack.hurtTarget || attack.knockback > 0.0F
+                || attack.baseKnockback + KNOCKBACK_ATTACK_BONUS <= 0.0F) {
+            return null;
         }
-        float otherKnockback = attack.baseKnockback + (attack.knockbackAttack ? 0.0F : KNOCKBACK_ATTACK_BONUS);
-        if (otherKnockback > 0.0F == attack.knockback > 0.0F) {
-            return OptionalInt.empty();
+        return new KnockbackAttack(attack.target, attack.baseKnockback + KNOCKBACK_ATTACK_BONUS, Objects.requireNonNull(attack.targetMovementBefore),
+                Objects.requireNonNull(attack.damageSource), attack.damage, attack.comesFromEffect, attack.yRot);
+    }
+
+    // - The other outcome of an attack (see lastAttackOtherwise): Player.causeExtraKnockback with the knockback -
+    // - attack's knockback, under the rotation the attack was made with. It pushes the target and slows the player -
+    // - down (slowDownAfterAttack) -
+    public void makeKnockbackAttack(KnockbackAttack attack) {
+        float yRot = this.getYRot();
+        this.setYRot(attack.yRot());
+        try {
+            super.causeExtraKnockback(attack.target(), attack.knockback(), attack.targetMovementBefore(), attack.damageSource(), attack.damage(),
+                    attack.comesFromEffect());
+        } finally {
+            this.setYRot(yRot);
         }
-        return OptionalInt.of(attack.tickersWithOtherKnockbackAttack.getFirst());
     }
 
     // - Whether an attack now would slow the player down if it hurt its target, under this player's ticker or an -
@@ -332,20 +360,47 @@ public final class SandboxPlayer extends Player {
     }
 
     // - The part of Player.causeExtraKnockback that acts on the attacker, for an attack whose target the sandbox does -
-    // - not know: an attack that hurt its target with a positive knockback slows the attacker and stops its sprint -
+    // - not know or cannot push any more: an attack that hurt its target with a positive knockback slows the attacker -
+    // - and stops its sprint -
     public void slowDownAfterAttack() {
         this.setDeltaMovement(this.getDeltaMovement().multiply(0.6, 1.0, 0.6));
         this.setSprinting(false);
     }
 
-    // - Whether the client's attack strength ticker may differ from this player's (see alternativeAttackStrengths) -
-    public boolean hasAlternativeAttackStrengths() {
-        return !this.alternativeAttackStrengths.isEmpty();
+    // - Starts recording the pushes the player takes (Entity.push, through which other entities push it), unless -
+    // - they are recorded already; returns how many were recorded so far -
+    public int recordPushes() {
+        if (this.recordedPushes == null) {
+            this.recordedPushes = new ArrayList<>();
+        }
+        return this.recordedPushes.size();
     }
 
-    // - Gives the player the attack strength ticker the client may have had instead, before its attack runs again -
-    public void useAttackStrengthTicker(int ticker) {
-        this.attackStrengthTicker = ticker;
+    // - Stops recording the pushes and returns those recorded, in their order -
+    public List<RecordedPush> stopRecordingPushes() {
+        List<RecordedPush> pushes = this.recordedPushes != null ? List.copyOf(this.recordedPushes) : List.of();
+        this.recordedPushes = null;
+        return pushes;
+    }
+
+    @Override
+    public void push(double x, double y, double z) {
+        List<RecordedPush> pushes = this.recordedPushes;
+        Vec3 velocityBefore = this.getDeltaMovement();
+        super.push(x, y, z);
+        if (pushes != null) {
+            pushes.add(new RecordedPush(x, y, z, velocityBefore, this.getDeltaMovement()));
+        }
+    }
+
+    @Override
+    public void setSprinting(boolean sprinting) {
+        super.setSprinting(sprinting);
+        this.sprintChanges++;
+    }
+
+    public int sprintChanges() {
+        return this.sprintChanges;
     }
 
     // - Player.cannotAttackWithItem as Minecraft.startAttack asks it, under this player's ticker and under every -
@@ -876,18 +931,35 @@ public final class SandboxPlayer extends Player {
         private boolean heldMainHandItem = true;
     }
 
-    // - An attack as Player.attack made it: whether it was a knockback attack, the alternative tickers that would -
-    // - have decided otherwise, and once it hurt its target, the base knockback and the knockback in total -
+    // - An attack as Player.attack made it: its target, whether an alternative ticker would have made it a knockback -
+    // - attack, the base knockback, and once it hurt its target, the arguments of Player.causeExtraKnockback with the -
+    // - rotation the push went along -
     private static final class AttackRecord {
-        private final boolean knockbackAttack;
-        private final List<Integer> tickersWithOtherKnockbackAttack;
-        private boolean hurtTarget;
+        private final Entity target;
+        private final boolean otherTickerMakesKnockbackAttack;
         private float baseKnockback;
+        private boolean hurtTarget;
         private float knockback;
+        private @Nullable Vec3 targetMovementBefore;
+        private @Nullable DamageSource damageSource;
+        private float damage;
+        private boolean comesFromEffect;
+        private float yRot;
 
-        private AttackRecord(boolean knockbackAttack, List<Integer> tickersWithOtherKnockbackAttack) {
-            this.knockbackAttack = knockbackAttack;
-            this.tickersWithOtherKnockbackAttack = tickersWithOtherKnockbackAttack;
+        private AttackRecord(Entity target, boolean otherTickerMakesKnockbackAttack) {
+            this.target = target;
+            this.otherTickerMakesKnockbackAttack = otherTickerMakesKnockbackAttack;
         }
+    }
+
+    // - The knockback attack another ticker would have made of an attack (see lastAttackOtherwise), as the arguments -
+    // - of Player.causeExtraKnockback and the rotation it pushes along -
+    public record KnockbackAttack(
+            Entity target, float knockback, Vec3 targetMovementBefore, DamageSource damageSource, float damage, boolean comesFromEffect, float yRot
+    ) {
+    }
+
+    // - A push the player took while its pushes were recorded (see recordPushes), with its velocity before and after -
+    public record RecordedPush(double x, double y, double z, Vec3 velocityBefore, Vec3 velocityAfter) {
     }
 }
