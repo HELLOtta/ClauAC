@@ -18,6 +18,8 @@ import io.github.hellotta.clauac.simulation.world.SandboxRecipeContainer;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -26,6 +28,9 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
@@ -153,6 +158,7 @@ import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.border.WorldBorder;
 import net.minecraft.world.level.entity.EntityInLevelCallback;
 import net.minecraft.world.level.storage.TagValueInput;
@@ -189,11 +195,6 @@ final class PlayConnection implements ClientContext {
     private static final double MOVING_BLOCK_REACH = 2.0;
     // - The player pushes the entities its box touches during its tick; its movement can carry the box this far -
     private static final double PUSH_REACH = 1.0;
-    // - Blocks beside the boxes a movement sweeps through still change it: the block the player stands on, the step -
-    // - up, the blocks it touches -
-    private static final double MOVEMENT_BLOCK_REACH = 1.0;
-    // - A broken block takes its second half along (a door, a bed, a tall plant), which lies next to it -
-    private static final double SECOND_HALF_REACH = 1.0;
     // - The difference in the reported position itself, which a velocity estimate can explain (see compareWithClient) -
     private static final String POSITION_DIFFERENCE = "position";
     // - Attributes that do not change how the local player moves within a tick: they count for attacks, mining, reach, -
@@ -282,6 +283,14 @@ final class PlayConnection implements ClientContext {
     private @Nullable UncertainTridentUse uncertainTridentUse;
     // - The alternative of the uncertain trident use that the current tick offers -
     private @Nullable TickAlternative tridentUseAlternative;
+    // - The tick's attacks that may have slowed the player down where the sandbox's did not, in their order, until -
+    // - the player's tick makes alternatives of them (see attackEntity) -
+    private final List<AttackSlowdown> attackSlowdowns = new ArrayList<>();
+    // - The alternatives of the player's tick that put another world's blocks in place (see -
+    // - addOtherWorldAlternatives), and what those blocks replaced while an alternative runs, which -
+    // - restoreTickStart puts back -
+    private final Map<TickAlternative, UncertainStart.OtherWorld> worldAlternatives = new IdentityHashMap<>();
+    private final List<Map<BlockPos, SandboxLevel.BlockSnapshot>> worldUndo = new ArrayList<>();
     // - The client tick being simulated -
     private long currentClientTick;
     private int ticksSinceVelocityEstimate = VELOCITY_ESTIMATE_TICKS;
@@ -399,13 +408,12 @@ final class PlayConnection implements ClientContext {
                     level.getChunkSource().replaceWithPacketData(chunk.x(), chunk.z(), chunk.chunkData());
             case ClientboundForgetLevelChunkPacket forget -> level.getChunkSource().drop(forget.pos());
             case ClientboundChunksBiomesPacket biomes -> handleChunksBiomes(biomes, level);
-            case ClientboundBlockUpdatePacket blockUpdate ->
-                    level.setServerVerifiedBlockState(blockUpdate.getPos(), blockUpdate.getBlockState(), SERVER_BLOCK_UPDATE_FLAGS);
-            case ClientboundSectionBlocksUpdatePacket sectionUpdate ->
-                    sectionUpdate.runUpdates((pos, state) -> level.setServerVerifiedBlockState(pos, state, SERVER_BLOCK_UPDATE_FLAGS));
+            case ClientboundBlockUpdatePacket blockUpdate -> this.setServerBlockState(level, blockUpdate.getPos(), blockUpdate.getBlockState());
+            case ClientboundSectionBlocksUpdatePacket sectionUpdate -> sectionUpdate.runUpdates((pos, state) -> this.setServerBlockState(level, pos, state));
             case ClientboundBlockChangedAckPacket ack -> {
+                this.tickPackets.notes.addAll(this.gameMode.onBlockChangedAck(level, player, ack.sequence()));
                 level.handleBlockChangedAck(ack.sequence());
-                this.gameMode.onBlockChangedAck(ack.sequence());
+                this.gameMode.dropConvergedWorlds(level);
             }
             case ClientboundBlockEventPacket blockEvent -> level.blockEvent(blockEvent.getPos(), blockEvent.getBlock(), blockEvent.getB0(), blockEvent.getB1());
             case ClientboundBlockEntityDataPacket blockEntityData -> handleBlockEntityData(blockEntityData, level);
@@ -573,6 +581,7 @@ final class PlayConnection implements ClientContext {
             this.levelData = newLevelData;
             respawnLevel = this.createLevel(newLevelData, spawnInfo);
             this.level = respawnLevel;
+            this.gameMode.onLevelChanged();
         }
 
         this.cameraEntity = null;
@@ -639,14 +648,26 @@ final class PlayConnection implements ClientContext {
         });
     }
 
-    // - The teleport also ends the client's mining; the resulting ABORT_DESTROY_BLOCK reaches the sandbox with the -
-    // - client's next tick and then changes nothing more -
+    // - A block the server sends; the other worlds of an uncertain start take it as the client would there (see -
+    // - SandboxGameMode.onServerBlockState) -
+    private void setServerBlockState(SandboxLevel level, BlockPos pos, BlockState state) {
+        this.gameMode.onServerBlockState(level, pos, state);
+        level.setServerVerifiedBlockState(pos, state, SERVER_BLOCK_UPDATE_FLAGS);
+        this.gameMode.dropConvergedWorlds(level);
+    }
+
+    // - The teleport also ends the client's mining, in whichever world it is; the resulting ABORT_DESTROY_BLOCK -
+    // - reaches the sandbox with the client's next tick and then changes nothing more -
     private void handleMovePlayer(ClientboundPlayerPositionPacket packet, SandboxLevel level, SandboxPlayer player) {
         if (!player.isPassenger()) {
             EntityHandlers.setValuesFromPositionPacket(packet.change(), packet.relatives(), player, false);
         }
         level.getBlockPredictions().onTeleport();
+        boolean sandboxWasDestroying = this.gameMode.isDestroying();
         this.gameMode.abortDestroyBlock(player, false);
+        if (this.gameMode.abortInOtherWorlds(sandboxWasDestroying)) {
+            this.tickPackets.notes.add("the attack strength ticker may differ from the client's: ending its mining at the teleport reset it in one world only");
+        }
     }
 
     // - Without the answer the client sends right away -
@@ -888,7 +909,7 @@ final class PlayConnection implements ClientContext {
 
     // - The sandbox cannot know which items the client has; it asks the plugin to have the server send them all. Until -
     // - they arrive, the ticks note that the items may differ, but their movement and actions are checked as ever -
-    // - (see collectOngoingUncertainties and reject) -
+    // - (see noteUnknownItems and reject) -
     private void markInventoryUnknown(int menuId) {
         boolean alreadyUnknown = this.unknownInventoryMenu.isPresent();
         this.unknownInventoryMenu = OptionalInt.of(menuId);
@@ -1102,10 +1123,12 @@ final class PlayConnection implements ClientContext {
         } finally {
             tickLevel.setLocalPlayerTick(null);
         }
+        // - Where the player did not tick on its own, riding, the tick's attacks leave alternatives nothing tried -
+        this.addAttackSlowdownAlternatives(tickPlayer, false);
         tickLevel.tickBlockEntities();
         this.checkRiderUses(tickPlayer);
+        this.noteUnknownItems();
         List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
-        this.collectOngoingUncertainties(uncertainties, tickPlayer, positionBeforeTick, vehicleBeforeTick, vehiclePositionBeforeTick);
         List<String> notes = new ArrayList<>(this.tickPackets.notes);
         this.judgeAlternatives(uncertainties, notes);
         ClientTickReport report;
@@ -1121,6 +1144,11 @@ final class PlayConnection implements ClientContext {
                 for (TickAlternative alternative : matched.combination()) {
                     if (!alternative.stoppedItem().isEmpty()) {
                         heldStoppedItem = alternative.stoppedItem();
+                    }
+                    // - The tick matched only in another world of the uncertain start, whose blocks stayed in place -
+                    UncertainStart.OtherWorld world = this.worldAlternatives.get(alternative);
+                    if (world != null) {
+                        this.gameMode.adopt(tickLevel, world, true);
                     }
                 }
                 // - The tick matched only with the other state of the uncertain trident use, which the sandbox now has -
@@ -1149,6 +1177,8 @@ final class PlayConnection implements ClientContext {
     // - held everything the tick changed. Blocks moving next to the player (pistons, shulker boxes) only move it -
     // - after this point, so the tick is not judged here then; neither is it once snapshots failed on this connection -
     private void tickLocalPlayer(SandboxLevel level, SandboxPlayer player) {
+        this.addAttackSlowdownAlternatives(player, true);
+        this.addOtherWorldAlternatives(level);
         List<TickAlternative> alternatives = this.tickPackets.alternatives;
         UncertainTridentUse uncertainUse = this.uncertainTridentUse;
         if (uncertainUse != null) {
@@ -1210,13 +1240,15 @@ final class PlayConnection implements ClientContext {
             }
             StateSnapshot simulatedEnd = this.captureState(start.roots());
             for (List<TickAlternative> combination : combinationsOf(alternatives)) {
-                this.restoreTickStart(start, player);
+                this.restoreTickStart(level, start, player);
                 for (TickAlternative alternative : combination) {
                     alternative.change().apply(player);
                 }
                 level.tickNonPassenger(player);
                 if (this.slotDifferences(player).isEmpty()) {
                     this.alternativeResult = new AlternativeResult.Matched(combination);
+                    // - The blocks of the worlds that matched stay (see simulateTick) -
+                    this.worldUndo.clear();
                     return;
                 }
             }
@@ -1230,25 +1262,63 @@ final class PlayConnection implements ClientContext {
         } catch (StateSnapshot.SnapshotException problem) {
             this.disableAlternatives("the player's state could not be restored", problem);
             throw new IllegalStateException("the player's state could not be restored to try the tick's alternatives", problem);
+        } finally {
+            this.undoWorldBlocks(level);
         }
+    }
+
+    // - The other worlds of the uncertain start that have blocks of their own, as alternatives of the player's tick: -
+    // - the tick with the world's blocks in place, which restoreTickStart takes away again unless the tick matched -
+    // - with them. They stand for no uncertainty: the client's world is the sandbox's or one of these, and a world -
+    // - that cannot be tried leaves the tick to the sandbox's world -
+    private void addOtherWorldAlternatives(SandboxLevel level) {
+        this.worldAlternatives.clear();
+        UncertainStart uncertain = this.gameMode.uncertainStart();
+        if (uncertain == null) {
+            return;
+        }
+        for (UncertainStart.OtherWorld world : uncertain.others()) {
+            if (!world.blocks().isEmpty()) {
+                TickAlternative alternative = new TickAlternative(null, describeOtherWorld(uncertain, world), ItemStack.EMPTY,
+                        player -> this.worldUndo.add(level.putBlocks(world.blocks())));
+                this.worldAlternatives.put(alternative, world);
+                this.tickPackets.alternatives.add(alternative);
+            }
+        }
+    }
+
+    // - Puts back what the blocks of other worlds replaced for an alternative, the last first -
+    private void undoWorldBlocks(SandboxLevel level) {
+        for (int index = this.worldUndo.size() - 1; index >= 0; index--) {
+            level.putBlocks(this.worldUndo.get(index));
+        }
+        this.worldUndo.clear();
     }
 
     // - Runs the simulated tick again from its start and returns where the result differs from the first run's, or -
     // - null -
     private @Nullable String repeatTick(SandboxLevel level, SandboxPlayer player, TickStart start, StateSnapshot firstEnd) throws StateSnapshot.SnapshotException {
-        this.restoreTickStart(start, player);
+        this.restoreTickStart(level, start, player);
         level.tickNonPassenger(player);
         return firstEnd.firstDifference(this.captureState(start.roots()));
     }
 
     // - What the player's tick starts from: the player with the level's random, which its tick may draw from, what the -
-    // - tick reports through ClientContext, and the motion of the entities it may push -
+    // - tick reports through ClientContext, and the motion of the entities it may push and of those the tick's -
+    // - alternatives push -
     private TickStart saveTickStart(SandboxLevel level, SandboxPlayer player) throws StateSnapshot.SnapshotException {
         List<Object> roots = List.of(player, level.getRandom());
         AABB pushArea = player.getBoundingBox().expandTowards(player.getDeltaMovement()).inflate(PUSH_REACH);
         List<EntityMotion> pushable = new ArrayList<>();
         for (Entity entity : level.getEntities(player, pushArea)) {
             pushable.add(new EntityMotion(entity, entity.getDeltaMovement(), entity.needsSync));
+        }
+        for (TickAlternative alternative : this.tickPackets.alternatives) {
+            for (Entity pushed : alternative.pushedEntities()) {
+                if (pushable.stream().noneMatch(motion -> motion.entity() == pushed)) {
+                    pushable.add(new EntityMotion(pushed, pushed.getDeltaMovement(), pushed.needsSync));
+                }
+            }
         }
         ClientTickPackets packets = this.tickPackets;
         return new TickStart(roots, this.captureState(roots), packets.predictedAbilitiesSent, packets.predictedFallFlyingStart,
@@ -1269,7 +1339,8 @@ final class PlayConnection implements ClientContext {
         this.cost.snapshotRestored(System.nanoTime() - start);
     }
 
-    private void restoreTickStart(TickStart start, SandboxPlayer player) throws StateSnapshot.SnapshotException {
+    private void restoreTickStart(SandboxLevel level, TickStart start, SandboxPlayer player) throws StateSnapshot.SnapshotException {
+        this.undoWorldBlocks(level);
         this.restoreState(start.snapshot());
         ClientTickPackets packets = this.tickPackets;
         packets.predictedAbilitiesSent = start.predictedAbilitiesSent();
@@ -1625,6 +1696,17 @@ final class PlayConnection implements ClientContext {
     private record EntityMotion(Entity entity, Vec3 deltaMovement, boolean needsSync) {
     }
 
+    // - An attack that may have slowed the player down where the sandbox's did not (see attackEntity): the knockback -
+    // - attack another attack strength ticker would have made of it, null for an entity the sandbox does not know, -
+    // - which the alternative only slows the player down for; the target's tick count at the attack; the player's -
+    // - velocity, sprint and count of sprint changes right after the attack; how many pushes the player had taken -
+    // - before it; what the alternative is, and the uncertainty it stands for -
+    private record AttackSlowdown(
+            SandboxPlayer.@Nullable KnockbackAttack knockbackAttack, int targetTickCount, Vec3 velocityAfterAttack, boolean sprintingAfterAttack,
+            int sprintChangesAfterAttack, int pushesBefore, String description, @Nullable String uncertainty
+    ) {
+    }
+
     // - What trying the tick's alternatives at the player's tick found -
     private sealed interface AlternativeResult {
 
@@ -1718,6 +1800,24 @@ final class PlayConnection implements ClientContext {
     private record CheckedAction(String description, long packet, int predictionSequence) {
     }
 
+    // - The key handling's start in another world of the uncertain start (see otherWorldStarts) -
+    private record WorldStart(UncertainStart.OtherWorld world, KeyHandlingStart start) {
+    }
+
+    // - The key handling's start in the world the sandbox takes the client to be in, and in the other worlds of the -
+    // - uncertain start, for the tick's actions: an action only another world explains puts the sandbox in that world -
+    // - (see checkInWorlds) -
+    private static final class KeyHandlingWorlds {
+
+        private KeyHandlingStart start;
+        private final List<WorldStart> others;
+
+        private KeyHandlingWorlds(KeyHandlingStart start, List<WorldStart> others) {
+            this.start = start;
+            this.others = others;
+        }
+    }
+
     // - An item use while a boat turns the player: the use, the rotation the client sent with it and the boat -
     private record RiderUse(CheckedAction action, float yRot, float xRot, AbstractBoat boat) {
     }
@@ -1738,6 +1838,8 @@ final class PlayConnection implements ClientContext {
     // - shows an action that would have reported another -
     private void performTickActions(SandboxLevel level, SandboxPlayer player) {
         this.riderUses.clear();
+        this.attackSlowdowns.clear();
+        player.stopRecordingPushes();
         List<Packet<?>> actions = this.tickPackets.actions;
         if (actions.isEmpty()) {
             return;
@@ -1762,6 +1864,7 @@ final class PlayConnection implements ClientContext {
         boolean useUncertain = useMayHaveStopped || this.uncertainTridentUse != null && player.isUsingItem();
         KeyHandlingStart start = new KeyHandlingStart(player.isUsingItem() && !useUncertain, useUncertain, player.isHandsBusy(), camera,
                 player.raycastHitResult(TICK_PARTIAL_TICK, camera), crosshairWithSwitchedItem, pickReach);
+        KeyHandlingWorlds worlds = new KeyHandlingWorlds(start, this.otherWorldStarts(level, player, start, switchedItemHeldOut ? switchedTo : null));
         int keyHandlingReport = keyHandlingReport(actions);
         int firstKeyHandlingAction = actions.getFirst() instanceof ServerboundSetCarriedItemPacket ? 1 : 0;
         boolean keyHandlingSlotKnown = keyHandlingReport >= 0 || actions.stream().anyMatch(PlayConnection::reportsCarriedItem);
@@ -1771,11 +1874,162 @@ final class PlayConnection implements ClientContext {
                 this.selectHotbarSlot(player, ((ServerboundSetCarriedItemPacket) actions.get(keyHandlingReport)).getSlot(), false);
             }
             Packet<?> action = actions.get(index);
+            UncertainStart uncertainBefore = this.gameMode.uncertainStart();
             try {
-                swingAccompanied = this.performTickAction(action, index, leadingSwitch, start, keyHandlingSlotKnown, swingAccompanied, level, player);
+                swingAccompanied = this.performTickAction(action, index, leadingSwitch, worlds, keyHandlingSlotKnown, swingAccompanied, level, player);
             } catch (RuntimeException problem) {
                 this.problemLog.log("rejected " + action.type() + " replayed at the end of a client tick", problem);
                 this.tickPackets.reject(Check.BAD_PACKETS, action.type() + " could not be performed (" + problem + ")");
+            }
+            // - A start the action left uncertain opens worlds whose crosshair is the key handling's: the client picks -
+            // - once before it (Minecraft.pick) -
+            UncertainStart uncertainAfter = this.gameMode.uncertainStart();
+            if (uncertainAfter != null && uncertainAfter != uncertainBefore) {
+                worlds.others.clear();
+                for (UncertainStart.OtherWorld world : uncertainAfter.others()) {
+                    worlds.others.add(new WorldStart(world, worlds.start));
+                }
+            }
+        }
+    }
+
+    // - The key handling's start in each other world of the uncertain start: the crosshair with the world's blocks in -
+    // - place, for the item held out and the one a hotbar key may have switched to (see KeyHandlingStart) -
+    private List<WorldStart> otherWorldStarts(SandboxLevel level, SandboxPlayer player, KeyHandlingStart start, @Nullable ItemStack switchedTo) {
+        UncertainStart uncertain = this.gameMode.uncertainStart();
+        if (uncertain == null) {
+            return new ArrayList<>();
+        }
+        List<WorldStart> starts = new ArrayList<>();
+        for (UncertainStart.OtherWorld world : uncertain.others()) {
+            if (world.blocks().isEmpty()) {
+                starts.add(new WorldStart(world, start));
+                continue;
+            }
+            Map<BlockPos, SandboxLevel.BlockSnapshot> undo = level.putBlocks(world.blocks());
+            try {
+                HitResult crosshair = player.raycastHitResult(TICK_PARTIAL_TICK, start.camera());
+                HitResult crosshairWithSwitchedItem = start.crosshairWithSwitchedItem() != null && switchedTo != null
+                        ? player.raycastHitResult(TICK_PARTIAL_TICK, start.camera(), switchedTo)
+                        : null;
+                starts.add(new WorldStart(world, new KeyHandlingStart(start.usingItem(), start.useMayHaveStopped(), start.handsBusy(), start.camera(), crosshair,
+                        crosshairWithSwitchedItem, start.pickReach())));
+            } finally {
+                level.putBlocks(undo);
+            }
+        }
+        return starts;
+    }
+
+    // - Runs a check of an action in the world the sandbox takes the client to be in, where a vanilla client made the -
+    // - action if no check rejects it and, where it does something only in some worlds, explains says it does. -
+    // - Where that is not so while an uncertain start leaves other worlds open (see UncertainStart), the check runs in -
+    // - each of those with the world's blocks, mining state and crosshair in place (see inWorld): an action only -
+    // - another world explains shows that the client is in that one, which the sandbox then takes (see adoptWorld). -
+    // - Otherwise the rejections stand as the sandbox's world gave them -
+    private void checkInWorlds(SandboxLevel level, KeyHandlingWorlds worlds, Consumer<KeyHandlingStart> check, Predicate<KeyHandlingStart> explains) {
+        Set<Flag> rejections = this.tickPackets.rejections;
+        List<String> notes = this.tickPackets.notes;
+        Set<Flag> before = new LinkedHashSet<>(rejections);
+        int notesBefore = notes.size();
+        check.accept(worlds.start);
+        if (worlds.others.isEmpty() || rejections.size() == before.size() && explains.test(worlds.start)) {
+            return;
+        }
+        List<Flag> sandboxRejections = new ArrayList<>(rejections);
+        sandboxRejections.removeAll(before);
+        List<String> sandboxNotes = new ArrayList<>(notes.subList(notesBefore, notes.size()));
+        for (WorldStart other : List.copyOf(worlds.others)) {
+            rejections.retainAll(before);
+            notes.subList(notesBefore, notes.size()).clear();
+            boolean explained = this.inWorld(level, other.world(), () -> {
+                check.accept(other.start());
+                return rejections.size() == before.size() && explains.test(other.start());
+            });
+            if (explained) {
+                this.adoptWorld(level, worlds, other);
+                return;
+            }
+        }
+        rejections.retainAll(before);
+        rejections.addAll(sandboxRejections);
+        notes.subList(notesBefore, notes.size()).clear();
+        notes.addAll(sandboxNotes);
+    }
+
+    private void checkInWorlds(SandboxLevel level, KeyHandlingWorlds worlds, Consumer<KeyHandlingStart> check) {
+        this.checkInWorlds(level, worlds, check, start -> true);
+    }
+
+    // - Tests something in another world of the uncertain start: with its blocks and a copy of its mining state in -
+    // - place, which go back to the sandbox's afterwards -
+    private boolean inWorld(SandboxLevel level, UncertainStart.OtherWorld world, BooleanSupplier test) {
+        Map<BlockPos, SandboxLevel.BlockSnapshot> undo = level.putBlocks(world.blocks());
+        SandboxGameMode.MiningState sandboxMining = this.gameMode.swapMining(world.mining().copy());
+        try {
+            return test.getAsBoolean();
+        } finally {
+            this.gameMode.swapMining(sandboxMining);
+            level.putBlocks(undo);
+        }
+    }
+
+    // - The client's action showed that it is in this other world of the uncertain start, which the sandbox takes, -
+    // - with the crosshair the key handling had there -
+    private void adoptWorld(SandboxLevel level, KeyHandlingWorlds worlds, WorldStart other) {
+        UncertainStart uncertain = this.gameMode.uncertainStart();
+        if (uncertain != null) {
+            this.tickPackets.notes.add("the client's action showed that it had made " + describeOtherWorld(uncertain, other.world()));
+        }
+        this.gameMode.adopt(level, other.world(), false);
+        worlds.start = other.start();
+        worlds.others.clear();
+    }
+
+    // - The client broke blocks or changed its mining while a start was still uncertain, and the worlds that explain -
+    // - the action would each go on differently, which the sandbox does not follow apart: it takes the client to be -
+    // - in its own world, the one of the item the server knows to be held -
+    private void settleUncertainStart(KeyHandlingWorlds worlds, String action) {
+        UncertainStart uncertain = this.gameMode.uncertainStart();
+        if (uncertain != null) {
+            this.tickPackets.notes.add("took the start of breaking at " + uncertain.pos().toShortString() + " for one with the held item, as the client "
+                    + action + " before it showed which");
+            this.gameMode.forgetUncertainStart();
+            worlds.others.clear();
+        }
+    }
+
+    // - What a swing alone (see SandboxGameMode.swingAlone) says about the world: a click that started nothing, on -
+    // - nothing, on an entity or on a block that startDestroyBlock would not start, or, where it ends the tick's -
+    // - actions, continueAttack going on with the block under the crosshair (SandboxGameMode.wouldStart and -
+    // - continuesAlone) -
+    private boolean swingExplained(SandboxLevel level, SandboxPlayer player, HitResult crosshair, boolean last) {
+        if (!(crosshair instanceof BlockHitResult hit) || crosshair.getType() != HitResult.Type.BLOCK || level.getBlockState(hit.getBlockPos()).isAir()) {
+            return true;
+        }
+        return !this.gameMode.wouldStart(level, player, hit.getBlockPos()) || last && this.gameMode.continuesAlone(level, player, crosshair);
+    }
+
+    // - Whether the crosshair met a block that is not air, where a swing alone goes on breaking rather than resetting -
+    // - the attack strength ticker (see SandboxGameMode.swingAlone) -
+    private static boolean onBlock(SandboxLevel level, HitResult crosshair) {
+        return crosshair instanceof BlockHitResult hit && crosshair.getType() == HitResult.Type.BLOCK && !level.getBlockState(hit.getBlockPos()).isAir();
+    }
+
+    // - A swing alone while a start is uncertain: after what it shows (swingExplained), the worlds left that would -
+    // - do different things with it (see SandboxGameMode.swingAlone), or go on breaking with it, settle it -
+    private void settleSwing(SandboxLevel level, SandboxPlayer player, KeyHandlingWorlds worlds, boolean last) {
+        this.checkInWorlds(level, worlds, start -> {
+        }, start -> this.swingExplained(level, player, start.crosshair(), last));
+        if (worlds.others.isEmpty()) {
+            return;
+        }
+        boolean sandboxOnBlock = onBlock(level, worlds.start.crosshair());
+        for (WorldStart other : worlds.others) {
+            boolean otherOnBlock = this.inWorld(level, other.world(), () -> onBlock(level, other.start().crosshair()));
+            if (otherOnBlock != sandboxOnBlock || sandboxOnBlock && last) {
+                this.settleUncertainStart(worlds, "swung");
+                return;
             }
         }
     }
@@ -1788,7 +2042,7 @@ final class PlayConnection implements ClientContext {
             Packet<?> action,
             int index,
             @Nullable ServerboundSetCarriedItemPacket leadingSwitch,
-            KeyHandlingStart start,
+            KeyHandlingWorlds worlds,
             boolean keyHandlingSlotKnown,
             boolean swingAccompanied,
             SandboxLevel level,
@@ -1803,19 +2057,23 @@ final class PlayConnection implements ClientContext {
             }
             case ServerboundPlayerActionPacket playerAction -> {
                 Packet<?> next = this.nextAction(index);
-                this.checkPlayerAction(level, player, playerAction, packet, next, keyHandlingSlotKnown, start);
+                Packet<?> previous = index > 0 ? actions.get(index - 1) : null;
+                this.checkPlayerAction(level, player, playerAction, packet, next, previous, keyHandlingSlotKnown, worlds);
                 return this.performPlayerAction(playerAction, next, keyHandlingSlotKnown, this.onlySwingsFollow(index), level, player) || swingAccompanied;
             }
             case ServerboundUseItemOnPacket useItemOn -> {
-                this.checkUseItemOn(level, player, useItemOn, packet, start);
+                this.checkInWorlds(level, worlds, start -> this.checkUseItemOn(level, player, useItemOn, packet, start));
+                this.settleUncertainStart(worlds, "used an item on a block");
                 // - A placed block faces by the player's rotation -
                 this.checkActionRotation(player, "used an item on a block");
                 this.gameMode.useItemOn(level, player, useItemOn.hand(), useItemOn.hitResult(), useItemOn.sequence(), this.tickPackets);
             }
             case ServerboundUseItemPacket useItem -> {
                 // - The rotation the packet carries is the player's own, which the tick's movement reported (see -
-                // - checkUseItem); the player keeps that one -
-                this.checkUseItem(level, player, useItem, packet, start);
+                // - checkUseItem); the player keeps that one. The use predicts what the item does, which may change -
+                // - blocks -
+                this.checkUseItem(level, player, useItem, packet, worlds);
+                this.settleUncertainStart(worlds, "used an item");
                 this.useItem(level, player, useItem);
             }
             case ServerboundAttackPacket attack -> {
@@ -1826,12 +2084,13 @@ final class PlayConnection implements ClientContext {
                             Flag.NO_PREDICTION);
                     this.rejectUnknownTarget(unknownAttack);
                     this.checkSwingFollows(unknownAttack, next);
-                    this.attackUnknownEntity(player, this.onlySwingsFollow(index));
+                    this.attackUnknownEntity(player);
                 } else {
                     CheckedAction checkedAttack = new CheckedAction("attacked " + describeEntity(target), packet, Flag.NO_PREDICTION);
-                    this.checkAttack(level, player, target, checkedAttack, start);
+                    int rejectionsBefore = this.tickPackets.rejections.size();
+                    this.checkInWorlds(level, worlds, start -> this.checkAttack(level, player, target, checkedAttack, start));
                     this.checkSwingFollows(checkedAttack, next);
-                    this.attackEntity(level, player, target, this.onlySwingsFollow(index));
+                    this.attackEntity(player, target, this.tickPackets.rejections.size() > rejectionsBefore);
                 }
                 return true;
             }
@@ -1842,8 +2101,8 @@ final class PlayConnection implements ClientContext {
                     this.rejectUnknownTarget(new CheckedAction("interacted with an entity the sandbox does not know (entity " + interact.entityId() + ")", packet,
                             Flag.NO_PREDICTION));
                 } else {
-                    this.checkInteraction(level, player, target, interact.hand(),
-                            new CheckedAction("interacted with " + describeEntity(target), packet, Flag.NO_PREDICTION), start);
+                    CheckedAction interaction = new CheckedAction("interacted with " + describeEntity(target), packet, Flag.NO_PREDICTION);
+                    this.checkInWorlds(level, worlds, start -> this.checkInteraction(level, player, target, interact.hand(), interaction, start));
                     this.gameMode.interact(player, target, interact.hand(), interact.location());
                 }
             }
@@ -1851,7 +2110,9 @@ final class PlayConnection implements ClientContext {
                 if (!swingAccompanied) {
                     // - What the crosshair pointed at depends on the player's rotation -
                     this.checkActionRotation(player, "swung at what the crosshair pointed at");
-                    this.gameMode.swingAlone(level, player, start.crosshair(), index == actions.size() - 1, this.uncertainBreakOnSight(start) == null);
+                    boolean last = index == actions.size() - 1;
+                    this.settleSwing(level, player, worlds, last);
+                    this.gameMode.swingAlone(level, player, worlds.start.crosshair(), last);
                 }
                 return false;
             }
@@ -1866,16 +2127,6 @@ final class PlayConnection implements ClientContext {
     // - checks find then would let it act as it likes -
     private void reject(CheckedAction action, Check check, String detail) {
         this.tickPackets.rejectAction(check, detail, action.packet(), action.predictionSequence());
-    }
-
-    // - A rejection that a block the client may have broken otherwise than the sandbox can explain (see -
-    // - SandboxGameMode.startDestroyBlock), which is then noted instead -
-    private void rejectUnlessUncertain(CheckedAction action, Check check, String detail, @Nullable String uncertainty) {
-        if (uncertainty != null) {
-            this.tickPackets.notes.add("not checked: " + detail + ", since " + uncertainty);
-            return;
-        }
-        this.reject(action, check, detail);
     }
 
     // - The block prediction a packet carries: MultiPlayerGameMode.startPrediction numbers them from 1, and a packet -
@@ -1972,47 +2223,61 @@ final class PlayConnection implements ClientContext {
     // - allows them (see checkBlockBreaking and checkStab). The client drops, swaps and releases items whenever it -
     // - handles its keys, and aborts breaking whenever it stops, also while the server teleports it -
     // - (ClientPacketListener.handleMovePlayer): those only change what the client itself holds or breaks. Whether the -
-    // - client could finish or turn depends on its mining state, which the sandbox knows only while no start of -
-    // - breaking left it open (SandboxGameMode.miningStateKnown); a finish or turn comes from continueDestroyBlock, -
-    // - which reports the slot it acts with first, while a start's item is known as keyHandlingSlotKnown tells. A -
-    // - start, a finish and a turn are followed by their swing (see checkSwingFollows); next is the tick's action -
-    // - after this one, null when this one ends the tick's actions -
+    // - client could start, finish or turn depends on its mining state, which a start with an item the sandbox does not -
+    // - know may leave in more than one world (see UncertainStart), which checkInWorlds tries; a finish or turn comes -
+    // - from continueDestroyBlock, which reports the slot it acts with first, while a start's item is known as -
+    // - keyHandlingSlotKnown tells. An action that breaks blocks or changes the mining settles such a start (see -
+    // - settleUncertainStart). A start, a finish and a turn are followed by their swing (see checkSwingFollows); next -
+    // - is the tick's action after this one, null when this one ends the tick's actions, and previous the one before -
     private void checkPlayerAction(
             SandboxLevel level, SandboxPlayer player, ServerboundPlayerActionPacket action, long packet, @Nullable Packet<?> next,
-            boolean keyHandlingSlotKnown, KeyHandlingStart start
+            @Nullable Packet<?> previous, boolean keyHandlingSlotKnown, KeyHandlingWorlds worlds
     ) {
         BlockPos pos = action.getPos();
         int prediction = predictionOf(action.getSequence());
-        String miningStateUnknown = this.gameMode.miningStateKnown()
-                ? null
-                : "the client may have started breaking with another hotbar item than the sandbox, which breaks another block";
         switch (action.getAction()) {
             case START_DESTROY_BLOCK -> {
                 CheckedAction startOfBreak = new CheckedAction("started breaking " + describeBlock(level, pos), packet, prediction);
-                this.checkBlockBreaking(level, player, startOfBreak, pos, action.getDirection(), true, keyHandlingSlotKnown, start);
+                boolean abortedFirst = previous instanceof ServerboundPlayerActionPacket previousAction
+                        && previousAction.getAction() == ServerboundPlayerActionPacket.Action.ABORT_DESTROY_BLOCK;
+                this.checkInWorlds(level, worlds,
+                        start -> this.checkBlockBreaking(level, player, startOfBreak, pos, action.getDirection(), true, keyHandlingSlotKnown, start),
+                        start -> this.gameMode.startFits(level, player, pos, abortedFirst));
+                this.settleUncertainStart(worlds, "started breaking another block");
                 this.checkSwingFollows(startOfBreak, next);
             }
             case STOP_DESTROY_BLOCK -> {
                 CheckedAction finish = new CheckedAction("finished breaking " + describeBlock(level, pos), packet, prediction);
-                this.checkBlockBreaking(level, player, finish, pos, action.getDirection(), false, true, start);
-                String whyNoFinish = this.gameMode.whyNoFinish(level, player, pos);
-                if (whyNoFinish != null) {
-                    this.rejectUnlessUncertain(finish, Check.FAST_BREAK, finish.description() + " " + whyNoFinish, miningStateUnknown);
-                }
+                this.checkInWorlds(level, worlds, start -> {
+                    this.checkBlockBreaking(level, player, finish, pos, action.getDirection(), false, true, start);
+                    String whyNoFinish = this.gameMode.whyNoFinish(level, player, pos);
+                    if (whyNoFinish != null) {
+                        this.reject(finish, Check.FAST_BREAK, finish.description() + " " + whyNoFinish);
+                    }
+                });
+                this.settleUncertainStart(worlds, "finished breaking a block");
                 this.checkSwingFollows(finish, next);
             }
             case CHANGE_DESTROY_DIRECTION -> {
                 CheckedAction turn = new CheckedAction("turned to another face of " + describeBlock(level, pos) + " while breaking it", packet, prediction);
-                this.checkBlockBreaking(level, player, turn, pos, action.getDirection(), false, true, start);
-                // - MultiPlayerGameMode.continueDestroyBlock only turns while it goes on breaking that block -
-                if (!this.gameMode.sameDestroyTarget(player, pos)) {
-                    this.rejectUnlessUncertain(turn, Check.INTERACTION, turn.description() + ", which a vanilla client only does for the block it is breaking",
-                            miningStateUnknown);
-                }
+                this.checkInWorlds(level, worlds, start -> {
+                    this.checkBlockBreaking(level, player, turn, pos, action.getDirection(), false, true, start);
+                    // - MultiPlayerGameMode.continueDestroyBlock only turns while it goes on breaking that block -
+                    if (!this.gameMode.sameDestroyTarget(player, pos)) {
+                        this.reject(turn, Check.INTERACTION, turn.description() + ", which a vanilla client only does for the block it is breaking");
+                    }
+                });
+                this.settleUncertainStart(worlds, "turned while breaking a block");
                 this.checkSwingFollows(turn, next);
             }
-            case STAB -> this.checkStab(level, player, new CheckedAction("stabbed", packet, Flag.NO_PREDICTION), start);
-            case ABORT_DESTROY_BLOCK, DROP_ITEM, DROP_ALL_ITEMS, RELEASE_USE_ITEM, SWAP_ITEM_WITH_OFFHAND -> {
+            case STAB -> this.checkInWorlds(level, worlds, start -> this.checkStab(level, player, new CheckedAction("stabbed", packet, Flag.NO_PREDICTION), start));
+            case ABORT_DESTROY_BLOCK -> {
+                // - MultiPlayerGameMode.stopDestroyBlock and startDestroyBlock abort only while breaking a block -
+                this.checkInWorlds(level, worlds, start -> {
+                }, start -> this.gameMode.isDestroying());
+                this.settleUncertainStart(worlds, "stopped breaking");
+            }
+            case DROP_ITEM, DROP_ALL_ITEMS, RELEASE_USE_ITEM, SWAP_ITEM_WITH_OFFHAND -> {
             }
         }
     }
@@ -2061,7 +2326,7 @@ final class PlayConnection implements ClientContext {
             this.reject(action, Check.INTERACTION, action.description() + " outside the world border");
         }
         if (level.getBlockState(pos).isAir()) {
-            this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + ", where no block is", this.uncertainBreakOnSight(start));
+            this.reject(action, Check.HITBOX, action.description() + ", where no block is");
         } else if (!start.pointsAt(pos, face)) {
             this.rejectBlockMiss(action, player, pos, start, "its " + face.getSerializedName() + " face");
         }
@@ -2088,9 +2353,8 @@ final class PlayConnection implements ClientContext {
         String sentFace = "its " + sent.getDirection().getSerializedName() + " face";
         if (start.pointsAt(pos, sent.getDirection())) {
             Vec3 point = sent.getLocation();
-            this.rejectUnlessUncertain(action, Check.HITBOX, String.format(Locale.ROOT, "%s at %.4f, %.4f, %.4f of %s, which the crosshair met at %s",
-                    action.description(), point.x - pos.getX(), point.y - pos.getY(), point.z - pos.getZ(), sentFace, describeBlockPoints(crosshairHits, pos)),
-                    this.uncertainBreakOnSight(start));
+            this.reject(action, Check.HITBOX, String.format(Locale.ROOT, "%s at %.4f, %.4f, %.4f of %s, which the crosshair met at %s",
+                    action.description(), point.x - pos.getX(), point.y - pos.getY(), point.z - pos.getZ(), sentFace, describeBlockPoints(crosshairHits, pos)));
         } else {
             this.rejectBlockMiss(action, player, pos, start, sentFace);
         }
@@ -2128,11 +2392,11 @@ final class PlayConnection implements ClientContext {
     // - of its tick but a boat it rides (turningBoat) and a minecart that may turn it (see passengerTurnUnknown), so -
     // - the rotation the tick's movement reported (see simulateTick) is that rotation exactly. A boat turns only the -
     // - yaw, which is decided after the tick (see checkRiderUses) -
-    private void checkUseItem(SandboxLevel level, SandboxPlayer player, ServerboundUseItemPacket useItem, long packet, KeyHandlingStart start) {
+    private void checkUseItem(SandboxLevel level, SandboxPlayer player, ServerboundUseItemPacket useItem, long packet, KeyHandlingWorlds worlds) {
         ItemStack item = player.getItemInHand(useItem.hand());
         CheckedAction action = new CheckedAction("used " + describeItem(item), packet, predictionOf(useItem.sequence()));
-        this.checkHandsFree(action, "use", start);
-        this.checkNotBreaking(action);
+        this.checkHandsFree(action, "use", worlds.start);
+        this.checkInWorlds(level, worlds, start -> this.checkNotBreaking(action));
         if (this.gameMode.isSpectator()) {
             this.reject(action, Check.INTERACTION, action.description() + " as a spectator, who uses no items");
         }
@@ -2282,8 +2546,8 @@ final class PlayConnection implements ClientContext {
     // - never points at (EntitySelector.CAN_BE_PICKED), or the crosshair pointed at something in front of it or beside -
     // - it. The sight line reaches as far as the action does. Where the player rides a minecart that may have turned -
     // - it (see passengerTurnUnknown), the rotation the player acted with is unknown, and so is where the crosshair -
-    // - pointed; where the client may have broken a block on the sight line otherwise than the sandbox, so is what -
-    // - the crosshair met -
+    // - pointed; the other worlds of an uncertain start, with their own crosshairs, are checked as well (see -
+    // - checkInWorlds) -
     private void rejectCrosshairMiss(CheckedAction action, SandboxPlayer player, Entity target, KeyHandlingStart start, double reach) {
         if (passengerTurnUnknown(player)) {
             this.tickPackets.notes.add("not checked: " + action.description() + " with a rotation the minecart may have turned");
@@ -2297,54 +2561,31 @@ final class PlayConnection implements ClientContext {
         Vec3 eyes = start.camera().getEyePosition(TICK_PARTIAL_TICK);
         Vec3 sightEnd = eyes.add(start.camera().getViewVector(TICK_PARTIAL_TICK).scale(reach));
         boolean inSight = target.getBoundingBox().inflate(target.getPickRadius()).clip(eyes, sightEnd).isPresent();
-        String uncertainty = this.uncertainBreakOnSight(start);
         if (inSight && crosshair.getType() != HitResult.Type.MISS) {
-            this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + " behind " + describeCrosshair(start, false) + ", which the crosshair pointed at",
-                    uncertainty);
+            this.reject(action, Check.HITBOX, action.description() + " behind " + describeCrosshair(start, false) + ", which the crosshair pointed at");
         } else {
-            this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + ", which the crosshair did not point at: it pointed at "
-                    + describeCrosshair(start, false), uncertainty);
+            this.reject(action, Check.HITBOX, action.description() + ", which the crosshair did not point at: it pointed at " + describeCrosshair(start, false));
         }
     }
 
     // - The action's block face was not one the crosshair pointed at: the block lay out of the player's block -
     // - interaction range (Player.isWithinBlockInteractionRange, which Minecraft.pick's reach matches), or within it but -
     // - the crosshair pointed elsewhere, which is unknown in a minecart that may have turned the player (see -
-    // - passengerTurnUnknown) and where the client may have broken a block on the sight line otherwise than the -
-    // - sandbox -
+    // - passengerTurnUnknown) -
     private void rejectBlockMiss(CheckedAction action, SandboxPlayer player, BlockPos pos, KeyHandlingStart start, String face) {
         if (!player.isWithinBlockInteractionRange(pos, 0.0)) {
             this.rejectOutOfReach(action, Math.sqrt(new AABB(pos).distanceToSqr(player.getEyePosition())), player.blockInteractionRange(), "the player");
         } else if (passengerTurnUnknown(player)) {
             this.tickPackets.notes.add("not checked: " + action.description() + " with a rotation the minecart may have turned");
         } else {
-            this.rejectUnlessUncertain(action, Check.HITBOX, action.description() + " at " + face + ", which the crosshair did not point at: it pointed at "
-                    + describeCrosshair(start, true), this.uncertainBreakOnSight(start));
+            this.reject(action, Check.HITBOX, action.description() + " at " + face + ", which the crosshair did not point at: it pointed at "
+                    + describeCrosshair(start, true));
         }
     }
 
-    // - A block the client may have broken otherwise than the sandbox (SandboxGameMode.uncertainBreaks) on the -
-    // - camera's sight line as far as the pick looked, so that the client's crosshair may have met another block or -
-    // - entity than the sandbox's; null when there is none. A break takes a second half along (a door, a bed, a tall -
-    // - plant), which lies next to the block -
-    private @Nullable String uncertainBreakOnSight(KeyHandlingStart start) {
-        List<SandboxGameMode.UncertainBreak> uncertainBreaks = this.gameMode.uncertainBreaks();
-        if (uncertainBreaks.isEmpty()) {
-            return null;
-        }
-        Vec3 eyes = start.camera().getEyePosition(TICK_PARTIAL_TICK);
-        Vec3 sightEnd = eyes.add(start.camera().getViewVector(TICK_PARTIAL_TICK).scale(start.pickReach()));
-        for (SandboxGameMode.UncertainBreak uncertain : uncertainBreaks) {
-            AABB around = new AABB(uncertain.pos()).inflate(SECOND_HALF_REACH);
-            if (around.contains(eyes) || around.clip(eyes, sightEnd).isPresent()) {
-                return describeUncertainBreak(uncertain);
-            }
-        }
-        return null;
-    }
-
-    private static String describeUncertainBreak(SandboxGameMode.UncertainBreak uncertain) {
-        return "the client may have broken the block at " + uncertain.pos().toShortString() + " otherwise than the sandbox, starting with another hotbar item";
+    // - What the start of breaking with another hotbar item did in this world, for the notes -
+    private static String describeOtherWorld(UncertainStart uncertain, UncertainStart.OtherWorld world) {
+        return "the start of breaking at " + uncertain.pos().toShortString() + " with " + describeItem(world.item());
     }
 
     // - How far along the camera's sight line Minecraft.pick looks for a player holding out this item: as far as the -
@@ -2432,7 +2673,7 @@ final class PlayConnection implements ClientContext {
         return EntityType.getKey(entity.getType()) + " (entity " + entity.getId() + ")";
     }
 
-    private static String describeItem(ItemStack stack) {
+    static String describeItem(ItemStack stack) {
         return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
     }
 
@@ -2574,54 +2815,99 @@ final class PlayConnection implements ClientContext {
     }
 
     // - MultiPlayerGameMode.attack on an entity the sandbox knows. The client's player may have held its main hand -
-    // - item one tick longer (see SandboxPlayer.considerEarlierHotbarSwitch); with the attack strength that left, the -
-    // - attack may have slowed the player down where the sandbox's did not, or the other way round. That attack is -
-    // - the alternative, made again with the other ticker from a snapshot of the player taken before the attack. It -
-    // - needs the attack to be the last thing of the tick that changes the player -
-    private void attackEntity(SandboxLevel level, SandboxPlayer player, Entity target, boolean lastChange) {
-        StateSnapshot beforeAttack = null;
-        if (lastChange && player.isSprinting() && player.hasAlternativeAttackStrengths() && this.alternativesDisabled == null) {
-            try {
-                beforeAttack = this.captureState(List.of(player, level.getRandom()));
-            } catch (StateSnapshot.SnapshotException problem) {
-                this.disableAlternatives("the player's state before an attack could not be saved", problem);
-            }
-        }
+    // - item one tick longer (see SandboxPlayer.considerEarlierHotbarSwitch), and with the attack strength that left, -
+    // - the attack may have been a knockback attack where the sandbox's was none (see SandboxPlayer.attack): one that -
+    // - pushed its target and slowed the player down. That outcome is the alternative, which the player's tick tries -
+    // - (see addAttackSlowdownAlternatives). An attack that failed a check stands for no uncertainty -
+    private void attackEntity(SandboxPlayer player, Entity target, boolean rejected) {
         this.gameMode.attack(player, target);
-        OptionalInt otherTicker = player.tickerForOtherAttackSlowdown();
-        if (otherTicker.isEmpty()) {
-            return;
+        SandboxPlayer.KnockbackAttack knockbackAttack = player.lastAttackOtherwise();
+        if (knockbackAttack != null) {
+            this.attackSlowdowns.add(new AttackSlowdown(knockbackAttack, target.tickCount, player.getDeltaMovement(), player.isSprinting(),
+                    player.sprintChanges(), player.recordPushes(), "the knockback attack a hotbar switch in the previous tick left",
+                    rejected ? null : "attack strength depends on when the client switched its hotbar slot"));
         }
-        String uncertainty = "attack strength depends on when the client switched its hotbar slot";
-        if (beforeAttack == null) {
-            this.tickPackets.uncertainties.add(uncertainty);
-            return;
-        }
-        StateSnapshot savedBeforeAttack = beforeAttack;
-        int ticker = otherTicker.getAsInt();
-        this.tickPackets.alternatives.add(new TickAlternative(uncertainty, "the attack strength a hotbar switch in the previous tick left", ItemStack.EMPTY,
-                attacking -> {
-                    this.restoreState(savedBeforeAttack);
-                    attacking.useAttackStrengthTicker(ticker);
-                    this.gameMode.attack(attacking, target);
-                }));
     }
 
     // - MultiPlayerGameMode.attack on an entity the sandbox does not know, which fails Hitbox since no vanilla client -
     // - does it (see rejectUnknownTarget). Player.attack then did to the player what the entity allowed: an attack that -
-    // - hurt it with a positive knockback slowed the player down, which is the alternative to it doing nothing where -
-    // - the attack is the last thing of the tick that changes the player. The alternative stands for no uncertainty, -
-    // - and there is none where it cannot be tried: the sandbox takes the attack for one that did nothing, and a tick -
-    // - that moved otherwise fails Simulation as well. An uncertainty would leave the movement of every tick with such -
-    // - an attack unchecked -
-    private void attackUnknownEntity(SandboxPlayer player, boolean lastChange) {
+    // - hurt it with a positive knockback slowed the player down, which is the alternative to it doing nothing (see -
+    // - addAttackSlowdownAlternatives). The alternative stands for no uncertainty, and there is none where it cannot -
+    // - be tried: the sandbox takes the attack for one that did nothing, and a tick that moved otherwise fails -
+    // - Simulation as well. An uncertainty would leave the movement of every tick with such an attack unchecked -
+    private void attackUnknownEntity(SandboxPlayer player) {
         boolean couldSlowDown = player.attackCouldSlowDown();
         this.gameMode.finishAttack(player);
         this.tickPackets.notes.add("attacked an entity the sandbox does not know");
-        if (couldSlowDown && lastChange) {
-            this.tickPackets.alternatives.add(new TickAlternative(null, "the attack on the unknown entity slowing the player down", ItemStack.EMPTY,
-                    SandboxPlayer::slowDownAfterAttack));
+        if (couldSlowDown) {
+            this.attackSlowdowns.add(new AttackSlowdown(null, 0, player.getDeltaMovement(), player.isSprinting(), player.sprintChanges(),
+                    player.recordPushes(), "the attack on the unknown entity slowing the player down", null));
         }
+    }
+
+    // - The tick's attacks that may have slowed the player down where the sandbox's did not (see attackEntity), as -
+    // - alternatives right before the player's tick, or untried where the player does not tick on its own. The -
+    // - client's player slowed down at the attack, before the rest of the tick's key handling and before the entities -
+    // - that tick ahead of it, which may push it (Entity.push, which only adds to its velocity): the alternative slows -
+    // - the velocity the attack left down and adds the same pushes after it, which gives the client's velocity -
+    // - exactly. It needs nothing else to have changed the player's velocity or sprint since the attack. Nothing does -
+    // - in a vanilla client's key handling, while a shulker whose lid moves the player can, which leaves the attack's -
+    // - uncertainty. A knockback attack pushes its target as well; a target that ticked ahead of the player already -
+    // - moved without that push, which the sandbox cannot give it any more. That only matters to a target that flies -
+    // - on with its velocity, a shulker bullet: the others the client hurts ignore pushes (BlockAttachedEntity), never -
+    // - move (EndCrystal) or drop their velocity in their tick (a vehicle the client does not steer) -
+    private void addAttackSlowdownAlternatives(SandboxPlayer player, boolean playerTicks) {
+        List<SandboxPlayer.RecordedPush> pushes = player.stopRecordingPushes();
+        for (AttackSlowdown slowdown : this.attackSlowdowns) {
+            List<SandboxPlayer.RecordedPush> pushesSince = pushes.subList(slowdown.pushesBefore(), pushes.size());
+            if (playerTicks && !onlyPushedSince(player, slowdown, pushesSince)) {
+                this.tickPackets.notes.add("not tried: " + slowdown.description()
+                        + ", since something other than a push changed the player's velocity or sprint after the attack");
+                String uncertainty = slowdown.uncertainty();
+                if (uncertainty != null && !this.tickPackets.uncertainties.contains(uncertainty)) {
+                    this.tickPackets.uncertainties.add(uncertainty);
+                }
+                continue;
+            }
+            SandboxPlayer.KnockbackAttack knockbackAttack = slowdown.knockbackAttack();
+            Entity pushedTarget = knockbackAttack != null && knockbackAttack.target().tickCount == slowdown.targetTickCount() ? knockbackAttack.target() : null;
+            String description = slowdown.description();
+            if (knockbackAttack != null && pushedTarget == null) {
+                description += " (without the push of " + describeEntity(knockbackAttack.target()) + ", which had moved since)";
+            }
+            if (!pushesSince.isEmpty()) {
+                description += pushesSince.size() == 1 ? ", with the push the player took after it"
+                        : ", with the " + pushesSince.size() + " pushes the player took after it";
+            }
+            Vec3 velocityAfterAttack = slowdown.velocityAfterAttack();
+            this.tickPackets.alternatives.add(new TickAlternative(slowdown.uncertainty(), description, ItemStack.EMPTY, slowed -> {
+                slowed.setDeltaMovement(velocityAfterAttack);
+                if (pushedTarget != null) {
+                    slowed.makeKnockbackAttack(knockbackAttack);
+                } else {
+                    slowed.slowDownAfterAttack();
+                }
+                for (SandboxPlayer.RecordedPush push : pushesSince) {
+                    slowed.push(push.x(), push.y(), push.z());
+                }
+            }, pushedTarget != null ? List.of(pushedTarget) : List.of()));
+        }
+        this.attackSlowdowns.clear();
+    }
+
+    // - Whether the player's sprint stayed untouched since the attack, and its velocity only took the recorded pushes -
+    private static boolean onlyPushedSince(SandboxPlayer player, AttackSlowdown slowdown, List<SandboxPlayer.RecordedPush> pushes) {
+        if (player.sprintChanges() != slowdown.sprintChangesAfterAttack() || player.isSprinting() != slowdown.sprintingAfterAttack()) {
+            return false;
+        }
+        Vec3 velocity = slowdown.velocityAfterAttack();
+        for (SandboxPlayer.RecordedPush push : pushes) {
+            if (!push.velocityBefore().equals(velocity)) {
+                return false;
+            }
+            velocity = push.velocityAfter();
+        }
+        return player.getDeltaMovement().equals(velocity);
     }
 
     // - The server ignores a slot outside the hotbar, which a vanilla client never selects -
@@ -2682,50 +2968,13 @@ final class PlayConnection implements ClientContext {
         throw new IllegalArgumentException("Unknown player action " + action.getAction());
     }
 
-    // - What the sandbox cannot know about the tick's movement beyond the tick's own packets: a block the client may -
-    // - have broken otherwise than the sandbox where the movement went past it, or where ending the prediction of its -
-    // - break may have put the client's player back (see SandboxGameMode.recentUncertainBreaks). Items that may differ -
-    // - from the client's (see markInventoryUnknown) are only noted: a client can make any of its clicks differ, and -
-    // - an uncertainty for them would leave the movement of every tick after such a click unchecked -
-    private void collectOngoingUncertainties(
-            List<String> uncertainties, SandboxPlayer player, Vec3 positionBeforeTick, Entity vehicleBeforeTick, Vec3 vehiclePositionBeforeTick
-    ) {
+    // - Items that may differ from the client's (see markInventoryUnknown) are only noted: a client can make any of -
+    // - its clicks differ, and an uncertainty for them would leave the movement of every tick after such a click -
+    // - unchecked -
+    private void noteUnknownItems() {
         if (this.unknownInventoryMenu.isPresent()) {
             this.tickPackets.notes.add("the sandbox's items may differ from the client's until the server's resend of them arrives");
         }
-        List<SandboxGameMode.UncertainBreak> uncertainBreaks = this.gameMode.recentUncertainBreaks();
-        this.gameMode.forgetAcknowledgedUncertainBreaks();
-        if (uncertainBreaks.isEmpty()) {
-            return;
-        }
-        AABB swept = this.tickSweep(player, positionBeforeTick, vehicleBeforeTick, vehiclePositionBeforeTick);
-        for (SandboxGameMode.UncertainBreak uncertain : uncertainBreaks) {
-            if (swept.intersects(new AABB(uncertain.pos()).inflate(SECOND_HALF_REACH))) {
-                uncertainties.add(describeUncertainBreak(uncertain));
-                return;
-            }
-        }
-    }
-
-    // - Where the player and the vehicle it rode went during the tick: their boxes before the tick, after the -
-    // - sandbox's tick and where the client reported them, grown by the blocks beside them that still change a -
-    // - movement -
-    private AABB tickSweep(SandboxPlayer player, Vec3 positionBeforeTick, Entity vehicleBeforeTick, Vec3 vehiclePositionBeforeTick) {
-        EntityDimensions dimensions = player.getDimensions(player.getPose());
-        AABB swept = player.getBoundingBox().minmax(dimensions.makeBoundingBox(positionBeforeTick));
-        ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
-        if (movePacket != null && movePacket.hasPosition()) {
-            swept = swept.minmax(dimensions.makeBoundingBox(movePacket.getX(0.0), movePacket.getY(0.0), movePacket.getZ(0.0)));
-        }
-        if (vehicleBeforeTick != player) {
-            EntityDimensions vehicleDimensions = vehicleBeforeTick.getDimensions(vehicleBeforeTick.getPose());
-            swept = swept.minmax(vehicleBeforeTick.getBoundingBox()).minmax(vehicleDimensions.makeBoundingBox(vehiclePositionBeforeTick));
-            ServerboundMoveVehiclePacket vehicleMove = this.tickPackets.vehicleMove;
-            if (vehicleMove != null) {
-                swept = swept.minmax(vehicleDimensions.makeBoundingBox(vehicleMove.movingTo().position()));
-            }
-        }
-        return swept.inflate(MOVEMENT_BLOCK_REACH);
     }
 
     // - A tick the client did not simulate its player in; a rejected packet still makes it MISMATCHED -
