@@ -380,6 +380,17 @@ of these ticks was `UNVERIFIED`: the shifted ones failed `Simulation`, the inter
 server's position of the player stayed where it was. A single charged attack on the unknown entity id with its swing
 failed `Hitbox` alone, and the movement of its tick matched as simulated.
 
+The test of the two situations reported the positions 2 blocks higher in the same way and left the client's answers to
+the corrections alone. On every pass of the player sprinting under a boat, the proxy reported a switch from a stick to a
+feather right behind a tick end and, five ticks later, an attack on the boat with its swing and an item use, whose
+strength depended on whether the switch came a tick earlier; only the attack's tick was reported higher. With the old
+build all 6 such ticks were `UNVERIFIED`, and their positions reached the server. While the player walked into oak
+leaves with shears in its hotbar, the proxy sent a start of breaking the leaves behind every tick end; with the old
+build the movement of 87 of 91 ticks went unchecked, only the starts failed `Hitbox`, and the server's position of the
+player rose to 102.0. With the new build none of the 1891 ticks of the test's connection was `UNVERIFIED`: the 6
+attack ticks and the 93 ticks at the leaves with shifted positions failed `Simulation`, the passes without a shift
+matched, and the server's position of the player stayed at 100.0.
+
 ### Verified so far
 
 With a real 26.3 client on Paper 26.3, every tick of the following produced `MATCHED` with an offset of exactly 0:
@@ -503,6 +514,25 @@ server's position of the player did not change in either setback test, and all 6
 failed `Simulation`. In the test of the disablers none of the 1114 ticks of its connection was `UNVERIFIED`: 261 of its
 movement packets and 131 of its actions were kept from the server, and the server's position of the player stayed
 where it was.
+
+A vanilla client's starts of breaking with an item the sandbox could not know yet matched in all 2130 simulated ticks
+of their check: oak leaves broken with a stick while shears lay in the hotbar; the shears' number key and a click in
+one frame, after which the client broke the leaves at once and walked into the gap until the server's acknowledgement
+gave them back, the tick into the gap matching only with the leaves the shears had broken; a switch to the shears while
+the stick's click was held; and in creative mode a sword's number key and a click in one frame with an empty hand, where
+the client broke nothing. Sprint attacks on a boat soon after a hotbar key selected a sword, with delays around the tick
+at which the client's attack reached full strength a tick before the sandbox's, matched in all 4927 ticks, 5 of the
+attacks only as the knockback attack of the other strength.
+
+The final runs with both situations tried (see "Disablers") matched as well. The thirteen courses matched in all of
+their 20 105 simulated ticks and in all 20 123 of another run in which every tick of the player on foot ran a second
+time from its snapshot and ended the same, and the test of the tick rates matched in all of its 746. Over the five
+connections above, the courses and the block and combat tests matched in all of their 37 436 simulated ticks but the 47
+with the cheats of those tests, which ClauAC refused as over a direct connection. Over a direct connection, ClauAC
+refused every cheat of the combat, block and `NoSwing` tests, and the tests of `Timer`, the tick budget, alerts,
+setbacks, held and late, the disablers and the creative inventory passed as before: the server's position of the player
+did not change in either setback test, all 50 shifted answers of the held one failed `Simulation`, and the test of the
+disablers left none of the 1094 ticks of its connection `UNVERIFIED`.
 
 ## Responses
 
