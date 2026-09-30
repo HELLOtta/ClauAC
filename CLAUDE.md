@@ -145,6 +145,13 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
   everything, since the producer then dies of SIGPIPE. A check of the client's command line
   (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input
   whole first, e.g. `grep -q -- "$pattern" <<< "$(tr '\0' '\n' < /proc/<pid>/cmdline)"`.
+- **Server tick rates above 20:** the client still ticks 20 times a second (`Minecraft.getTickTargetMillis`). The 26.3
+  client moves the living entities it shows towards the server's positions that much faster
+  (`ClientLevel.getRelativeTickSpeed`); 26.2 has no such method, and its `InterpolationHandler.interpolate` goes one
+  step a tick at every tick rate, as the sandbox's does. `tick_rate_test.sh` teleports a cow without AI through the
+  standing player in small steps, whose pushes show the difference: at `tick rate 40` a 26.3 sandbox that interpolated
+  at the normal speed failed 13 to 16 ticks of it by 0.0015 to 0.0027 blocks, and a 26.2 sandbox that interpolated two
+  steps a tick failed 20 ticks by 0.0026 to 0.043 blocks.
 - **Entity tick order:** the client ticks its entities in the order it added them (`ClientLevel.tickEntities`,
   `EntityTickList`), and every entity came after the local player. A respawn in the same level adds the new player
   behind the entities the client has, but the server then sends each entity around it again, which

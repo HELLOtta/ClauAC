@@ -74,6 +74,13 @@ entity only when the level's features enable its type (`EntityType.create` with 
 `MultiPlayerGameMode.dropItem` calls `ensureHasSentCarriedItem`); and the level's clock follows the 26.2
 `ClientClockManager`.
 
+One difference needs nothing of the sandbox. At a server tick rate above 20 both clients still end 20 ticks a second
+(`Minecraft.getTickTargetMillis`), but the 26.3 client moves the living entities it shows that much faster towards the
+positions the server sends them (`ClientLevel.getRelativeTickSpeed`, by which its `SteppedInterpolationHandler`
+advances), which the sandbox of the 26.3 build follows. 26.2 has neither that method nor that handler: its
+`InterpolationHandler.interpolate` goes one step a tick at every tick rate, and the sandbox runs that class as it is,
+the same byte for byte in the 26.2 client and server jars.
+
 ### Verified with the 26.2 client
 
 With the real 26.2 client on Paper 26.2 (build 129), every simulated tick of the thirteen test courses was `MATCHED`
@@ -107,6 +114,14 @@ The report notes of those ticks name only riding a vehicle the server moves, the
 of a vehicle, the hotbar keys the sandbox inferred from steering, the alternatives that matched, and the attack on an
 entity nobody has that course 6 sent through its proxy then; such an attack fails `Hitbox` now, and the test of the
 disablers sends it instead (see "Disablers").
+
+At a server tick rate of 40 (`tick rate 40`), a cow without AI that the server teleported through the standing player
+in steps of a quarter block pushed the player the way the client showed in all 315, 320 and 315 ticks of three runs at
+that rate, as it did in all 312, 325 and 306 at the normal rate. A sandbox that advanced its entities' interpolation by
+two steps a tick at that rate instead, as fast as the 26.3 client's, failed `Simulation` in 20 of 318 ticks at the rate
+of 40, by 0.0026 to 0.021 blocks or by expecting a position the client did not send, and in none of 308 at 20: the
+test tells the two speeds apart, and the 26.2 client interpolates at the normal one (see "What the 26.2 client does
+differently").
 
 The tests of the checks and responses failed only what they cheated:
 
