@@ -140,6 +140,17 @@ Findings from running the official 26.3 client in a cloud container without a GP
   only when the client counts the attack as a hit (`Entity.hurtOrSimulate` calls `hurtClient` there): a boat does
   (`VehicleEntity.hurtClient`), a living entity never (`Entity.hurtClient`, which `LivingEntity` keeps), so a sprint
   attack on a mob or another player leaves the client's speed alone.
+- **Testing the Inventory check:** the proxy's `drop-clientbound minecraft:open_screen` keeps a container screen from
+  the client while the server and the sandbox, which see the packet and the pong behind it, take it as open: the client
+  then walks and turns on as with a cheat that keeps the keys and the mouse working on a screen. `click <menu> <slot>`
+  and `close <menu>` send a container click and a close the client never made (menu 0 is the player's inventory); a
+  click right after a tick with keys has to fail, one right after a tick without keys is what a vanilla client does as
+  well. A dialog of the server over a container screen goes back to that screen when it closes
+  (`DialogScreen.onClose`), so Escape has to be pressed twice to get back into the game. Stopping the proxy disconnects
+  its client, after which console commands on the player fail ("No entity was found"): clean up the world and read the
+  player's status before stopping the proxy.
+- **Editing test scripts:** bash reads a script while it runs it, so an edit to a running script breaks that run (a run
+  of `tick_rate_test.sh` failed with a syntax error at a line the edit had moved). Edit a script only between runs.
 - **Pipelines under `pipefail`:** `producer | grep -q` fails whenever grep stops reading before the producer has written
   everything, since the producer then dies of SIGPIPE. A check of the client's command line
   (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input
