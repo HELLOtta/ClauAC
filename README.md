@@ -646,6 +646,9 @@ Limits:
 - A client that keeps its inventory screen open without doing anything in it shows nothing; the check finds it from its
   first click on. In creative mode the inventory screen sends no clicks, only the items it sets
   (`CreativeModeInventoryScreen.slotClicked`), and an item picked from a bundle is all that shows it.
+- A client that lets go of its keys for the tick before each click in its inventory screen and closes the screen right
+  after the click passes: a vanilla player as fast can open the screen in that tick's key handling, click and close
+  it before the next tick.
 - Screens the client opens on its own (the chat, the pause menu, the advancements and the like) are never known.
 - The server's book, a sign's text, a dialog, a resource pack prompt and the death, credits and demo screens may replace
   the open screen: a book or a sign's text closes to no screen without a packet, while a dialog or a resource pack
