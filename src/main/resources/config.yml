@@ -1,0 +1,83 @@
+# - ClauAC's configuration. /clauac reload reads it again; see the README's "Responses" section -
+
+alerts:
+  # - Players with the permission clauac.alerts get alerts once they turn them on with /clauac alerts, or as soon -
+  # - as they join when this is true -
+  on-join: true
+  # - At most one alert per player and check within this many milliseconds; the flags in between are counted into -
+  # - the next alert -
+  interval-millis: 1000
+  # - The alert, in MiniMessage (https://docs.papermc.io/adventure/minimessage/format/). ClauAC replaces %player% -
+  # - (the player's name), %check% (the check's name), %detail% (what exactly failed), %tick% (the client tick) and -
+  # - %count% (the flags of that player and check since its last alert, this one included) -
+  format: "<dark_gray>[<aqua>ClauAC</aqua>]</dark_gray> <white>%player%</white> <gray>failed</gray> <red>%check%</red> <dark_gray>x%count%</dark_gray> <gray>%detail%</gray>"
+
+setbacks:
+  # - The server applies a tick's movement only once the simulation has checked that tick, so that a setback never -
+  # - has to undo anything on the server. The client's packets wait for that from the tick's first movement packet -
+  # - on, at most this many milliseconds; when the simulation falls further behind, they go on unchecked, and a -
+  # - tick found to fail afterwards sets the player back with a teleport on the server -
+  maximum-hold-millis: 1000
+
+# - What ClauAC does when a client tick fails a check, per check. alert: whether players with alerts on hear of it. -
+# - setback: for a check of the movement, whether the tick's movement is thrown away and the client put back where -
+# - the server has the player; for a check of the actions (Reach, Hitbox, Interaction, FastBreak, NoSwing), whether -
+# - the action that failed it is kept from the server, and the client takes back the blocks it changed with it -
+checks:
+  # - The player did not move the way the vanilla client moves it -
+  Simulation:
+    alert: true
+    setback: true
+  # - The vehicle the player steers did not move the way the vanilla client moves it -
+  Vehicle:
+    alert: true
+    setback: true
+  # - The client sent a packet no vanilla client sends in its situation -
+  BadPackets:
+    alert: true
+    setback: true
+  # - The client ended more ticks than the simulation takes on -
+  TickRate:
+    alert: true
+    setback: true
+  # - The client ended its ticks faster than the timer of a vanilla client runs -
+  Timer:
+    alert: true
+    setback: true
+  # - The client held back its answers to the server's packets -
+  Pings:
+    alert: true
+    setback: true
+  # - The client moved or turned its player while a screen was open, or did something in its inventory screen when -
+  # - it cannot have opened it -
+  Inventory:
+    alert: true
+    setback: true
+  # - The client acted on an entity or a block farther away than the player reaches -
+  Reach:
+    alert: true
+    setback: true
+  # - The client acted on an entity or a block its crosshair did not point at, or used an item facing another way -
+  # - than the player -
+  Hitbox:
+    alert: true
+    setback: true
+  # - The client acted when a vanilla client does not: while using an item, while paddling a boat, as a spectator, -
+  # - while breaking a block, outside the world border, with an item that cannot do what it did, or with another -
+  # - hotbar slot in the middle of a tick -
+  Interaction:
+    alert: true
+    setback: true
+  # - The client finished breaking a block sooner than a vanilla client with the same tool and effects can -
+  FastBreak:
+    alert: true
+    setback: true
+  # - The client left out the swing a vanilla client sends right after every attack and every start, finish and -
+  # - turn of breaking a block, which hides the swing of its arm from the other players -
+  NoSwing:
+    alert: true
+    setback: true
+  # - The simulation itself failed during a tick; nothing the client sent could be checked -
+  SimulationFailure:
+    alert: true
+    setback: false

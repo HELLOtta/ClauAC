@@ -14,6 +14,7 @@ import net.minecraft.server.permissions.LevelBasedPermissionSet;
 import net.minecraft.server.permissions.PermissionSet;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityEvent;
 import net.minecraft.world.entity.EntitySelector;
@@ -39,17 +40,19 @@ import net.minecraft.world.phys.Vec2;
 import net.minecraft.world.phys.Vec3;
 import org.jspecify.annotations.Nullable;
 
-// - Port of the parts of the client-only LocalPlayer and AbstractClientPlayer that decide how the local player moves. -
-// - Everything else is inherited unchanged from the vanilla Player, LivingEntity and Entity classes. Left out on -
-// - purpose, because they only render, play or show something: view bobbing, walked distance, first person hands, -
-// - ambient sounds, water vision, the nausea and portal spinning effect, the tutorial and every screen. The riding -
-// - jump is left out as well: the session reports ticks spent riding as not simulated -
+// - Port of the parts of the client-only LocalPlayer and AbstractClientPlayer that decide how the local player moves, -
+// - on foot and on a vehicle. Everything else is inherited unchanged from the vanilla Player, LivingEntity and Entity -
+// - classes. Left out on purpose, because they only render, play or show something: view bobbing, walked distance, -
+// - first person hands, ambient sounds, water vision, the nausea and portal spinning effect, the tutorial, the riding -
+// - sounds and every screen -
 public final class SandboxPlayer extends Player {
 
     // - Player.attack weighs the attack strength half a tick ahead -
     private static final float ATTACK_STRENGTH_PARTIAL_TICK = 0.5F;
     // - Player.attack only makes a knockback attack, the one that slows the attacker down, above this strength -
     private static final float FULL_ATTACK_STRENGTH = 0.9F;
+    // - The knockback Player.attack adds for a knockback attack -
+    private static final float KNOCKBACK_ATTACK_BONUS = 0.5F;
 
     private final ClientContext client;
     private final CachedPlayerInfo playerInfo;
@@ -57,8 +60,16 @@ public final class SandboxPlayer extends Player {
     private PermissionSet permissions = PermissionSet.NO_PERMISSIONS;
     private Input reportedKeys = Input.EMPTY;
     private boolean crouching;
+    // - LocalPlayer.handsBusy -
+    private boolean handsBusy;
     private boolean flashOnSetHealth;
     private boolean startedUsingItem;
+    // - The answer isInWaterOrRain gives while an alternative tries the other outcome of rain that the client's -
+    // - lagging sky light may have given (see withWaterOrRain); null otherwise -
+    private @Nullable Boolean forcedWaterOrRain;
+    // - LocalPlayer's charge of the jump of a vehicle that can jump (horses, camels) -
+    private int jumpRidingTicks;
+    private float jumpRidingScale;
     private @Nullable InteractionHand usingItemHand;
     // - The other values the client's attackStrengthTicker may have. A hotbar switch the client reports at the start -
     // - of a tick may already have happened during the previous tick's key handling (see PlayConnection); the -
@@ -71,6 +82,13 @@ public final class SandboxPlayer extends Player {
     // - the player's last tick, and its value now -
     private ItemStack mainHandItemBeforeLastTick = ItemStack.EMPTY;
     private ItemStack mainHandItemAfterLastTick = ItemStack.EMPTY;
+    // - What the last Player.attack did to the player itself, recorded while it ran (see attack) -
+    private @Nullable AttackRecord lastAttack;
+    private boolean attacking;
+    // - The pushes the player took since recordPushes, null while they are not recorded -
+    private @Nullable List<RecordedPush> recordedPushes;
+    // - How often setSprinting ran, which tells whether anything touched the sprint between two points of a tick -
+    private int sprintChanges;
 
     public SandboxPlayer(Level level, GameProfile profile, ClientContext client) {
         super(level, profile);
@@ -104,8 +122,13 @@ public final class SandboxPlayer extends Player {
     // - LocalPlayer.raycastHitResult: what the crosshair points at, which Minecraft.pick computes at the start of -
     // - every tick with a partial tick of 1 -
     public HitResult raycastHitResult(float partialTicks, Entity cameraEntity) {
-        ItemStack itemStack = this.getActiveItem();
-        AttackRange itemAttackRange = itemStack.get(DataComponents.ATTACK_RANGE);
+        return this.raycastHitResult(partialTicks, cameraEntity, this.getActiveItem());
+    }
+
+    // - The same for a player holding out this item instead (LivingEntity.getActiveItem): an item with an attack -
+    // - range picks along that range first -
+    public HitResult raycastHitResult(float partialTicks, Entity cameraEntity, ItemStack activeItem) {
+        AttackRange itemAttackRange = activeItem.get(DataComponents.ATTACK_RANGE);
         double blockInteractionRange = this.blockInteractionRange();
         HitResult hitResult = null;
         if (itemAttackRange != null) {
@@ -181,14 +204,29 @@ public final class SandboxPlayer extends Player {
         }
     }
 
-    // - LocalPlayer.rideTick hands the keys to a boat the player steers; the hands-busy flag it also sets only -
-    // - gates the client's own attack and use key handling, which the sandbox learns from the client's packets -
+    // - LocalPlayer.rideTick hands the keys to a boat the player steers, whose paddles keep the player's hands busy: -
+    // - Minecraft.startAttack and startUseItem then do nothing -
     @Override
     public void rideTick() {
         super.rideTick();
+        this.handsBusy = false;
         if (this.getControlledVehicle() instanceof AbstractBoat boat) {
             boat.setInput(this.input.keyPresses.left(), this.input.keyPresses.right(), this.input.keyPresses.forward(), this.input.keyPresses.backward());
+            this.handsBusy = this.handsBusy
+                    | (this.input.keyPresses.left() || this.input.keyPresses.right() || this.input.keyPresses.forward() || this.input.keyPresses.backward());
         }
+    }
+
+    // - LocalPlayer.removeVehicle -
+    @Override
+    public void removeVehicle() {
+        super.removeVehicle();
+        this.handsBusy = false;
+    }
+
+    // - LocalPlayer.isHandsBusy -
+    public boolean isHandsBusy() {
+        return this.handsBusy;
     }
 
     @Override
@@ -216,18 +254,173 @@ public final class SandboxPlayer extends Player {
         }
     }
 
-    // - Whether an attack now would be a knockback attack for one possible ticker and not for another -
-    public boolean attackDependsOnHotbarSwitchTiming() {
-        if (!this.isSprinting()) {
+    // - Player.attack decides at its start from the attack strength ticker whether the attack is a knockback attack, -
+    // - one made sprinting at full strength. Where the tickers the client may have had decide differently (see -
+    // - alternativeAttackStrengths), the attack runs under one that makes it none, and the knockback attack is the -
+    // - other outcome (see lastAttackOtherwise). Player.onAttack resets every ticker right after the decision, and -
+    // - MultiPlayerGameMode.attack resets them after an attack that Player.attack refused -
+    @Override
+    public void attack(Entity entity) {
+        boolean sprinting = this.isSprinting();
+        boolean knockbackAttack = sprinting && this.isFullStrengthAttack(this.attackStrengthTicker);
+        AlternativeAttackStrength otherwise = null;
+        for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
+            if ((sprinting && this.isFullStrengthAttack(alternative.ticker)) != knockbackAttack) {
+                otherwise = alternative;
+            }
+        }
+        if (otherwise != null && knockbackAttack) {
+            this.attackStrengthTicker = otherwise.ticker;
+        }
+        this.lastAttack = new AttackRecord(entity, otherwise != null);
+        this.attacking = true;
+        try {
+            super.attack(entity);
+        } finally {
+            this.attacking = false;
+        }
+    }
+
+    // - Player.attack adds the attack's knockback to this one once the attack hurt its target. On the client it only -
+    // - comes from the attack knockback attribute: the enchantments count on the server (LivingEntity.getKnockback) -
+    @Override
+    protected float getKnockback(Entity target, DamageSource damageSource) {
+        float knockback = super.getKnockback(target, damageSource);
+        if (this.attacking && this.lastAttack != null) {
+            this.lastAttack.baseKnockback = knockback;
+        }
+        return knockback;
+    }
+
+    // - Player.attack calls this exactly when the attack hurt its target; a positive knockback pushes the target and -
+    // - slows the attacker. The call is recorded with the rotation it pushes along, for the other outcome -
+    @Override
+    public void causeExtraKnockback(Entity entity, float knockbackAmount, Vec3 oldMovement, DamageSource damageSource, float damage, boolean comesFromEffect) {
+        if (this.attacking && this.lastAttack != null) {
+            this.lastAttack.hurtTarget = true;
+            this.lastAttack.knockback = knockbackAmount;
+            this.lastAttack.targetMovementBefore = oldMovement;
+            this.lastAttack.damageSource = damageSource;
+            this.lastAttack.damage = damage;
+            this.lastAttack.comesFromEffect = comesFromEffect;
+            this.lastAttack.yRot = this.getYRot();
+        }
+        super.causeExtraKnockback(entity, knockbackAmount, oldMovement, damageSource, damage, comesFromEffect);
+    }
+
+    // - The knockback attack that another ticker the client may have had (see alternativeAttackStrengths) would have -
+    // - made of the last attack, which ran as none (see attack). Null unless the attack hurt its target and the -
+    // - knockback attack's bonus alone gives it a positive knockback, the one that pushes the target and slows the -
+    // - attacker down: nothing else Player.attack does on the client depends on the attack's strength, and whether an -
+    // - attack hurts does not either, since Entity.hurtClient takes no damage -
+    public @Nullable KnockbackAttack lastAttackOtherwise() {
+        AttackRecord attack = this.lastAttack;
+        if (attack == null || !attack.otherTickerMakesKnockbackAttack || !attack.hurtTarget || attack.knockback > 0.0F
+                || attack.baseKnockback + KNOCKBACK_ATTACK_BONUS <= 0.0F) {
+            return null;
+        }
+        return new KnockbackAttack(attack.target, attack.baseKnockback + KNOCKBACK_ATTACK_BONUS, Objects.requireNonNull(attack.targetMovementBefore),
+                Objects.requireNonNull(attack.damageSource), attack.damage, attack.comesFromEffect, attack.yRot);
+    }
+
+    // - The other outcome of an attack (see lastAttackOtherwise): Player.causeExtraKnockback with the knockback -
+    // - attack's knockback, under the rotation the attack was made with. It pushes the target and slows the player -
+    // - down (slowDownAfterAttack) -
+    public void makeKnockbackAttack(KnockbackAttack attack) {
+        float yRot = this.getYRot();
+        this.setYRot(attack.yRot());
+        try {
+            super.causeExtraKnockback(attack.target(), attack.knockback(), attack.targetMovementBefore(), attack.damageSource(), attack.damage(),
+                    attack.comesFromEffect());
+        } finally {
+            this.setYRot(yRot);
+        }
+    }
+
+    // - Whether an attack now would slow the player down if it hurt its target, under this player's ticker or an -
+    // - alternative one (Player.attack and causeExtraKnockback) -
+    public boolean attackCouldSlowDown() {
+        float baseKnockback = super.getKnockback(this, this.damageSources().playerAttack(this));
+        if (baseKnockback > 0.0F) {
+            return true;
+        }
+        if (!this.isSprinting() || baseKnockback + KNOCKBACK_ATTACK_BONUS <= 0.0F) {
             return false;
         }
-        boolean fullStrength = this.isFullStrengthAttack(this.attackStrengthTicker);
+        if (this.isFullStrengthAttack(this.attackStrengthTicker)) {
+            return true;
+        }
         for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
-            if (this.isFullStrengthAttack(alternative.ticker) != fullStrength) {
+            if (this.isFullStrengthAttack(alternative.ticker)) {
                 return true;
             }
         }
         return false;
+    }
+
+    // - The part of Player.causeExtraKnockback that acts on the attacker, for an attack whose target the sandbox does -
+    // - not know or cannot push any more: an attack that hurt its target with a positive knockback slows the attacker -
+    // - and stops its sprint -
+    public void slowDownAfterAttack() {
+        this.setDeltaMovement(this.getDeltaMovement().multiply(0.6, 1.0, 0.6));
+        this.setSprinting(false);
+    }
+
+    // - Starts recording the pushes the player takes (Entity.push, through which other entities push it), unless -
+    // - they are recorded already; returns how many were recorded so far -
+    public int recordPushes() {
+        if (this.recordedPushes == null) {
+            this.recordedPushes = new ArrayList<>();
+        }
+        return this.recordedPushes.size();
+    }
+
+    // - Stops recording the pushes and returns those recorded, in their order -
+    public List<RecordedPush> stopRecordingPushes() {
+        List<RecordedPush> pushes = this.recordedPushes != null ? List.copyOf(this.recordedPushes) : List.of();
+        this.recordedPushes = null;
+        return pushes;
+    }
+
+    @Override
+    public void push(double x, double y, double z) {
+        List<RecordedPush> pushes = this.recordedPushes;
+        Vec3 velocityBefore = this.getDeltaMovement();
+        super.push(x, y, z);
+        if (pushes != null) {
+            pushes.add(new RecordedPush(x, y, z, velocityBefore, this.getDeltaMovement()));
+        }
+    }
+
+    @Override
+    public void setSprinting(boolean sprinting) {
+        super.setSprinting(sprinting);
+        this.sprintChanges++;
+    }
+
+    public int sprintChanges() {
+        return this.sprintChanges;
+    }
+
+    // - Player.cannotAttackWithItem as Minecraft.startAttack asks it, under this player's ticker and under every -
+    // - alternative one (see alternativeAttackStrengths): true only when the client's player could not attack with -
+    // - the item whichever of them it had -
+    public boolean cannotAttackWithItemUnderAnyTicker(ItemStack itemStack) {
+        int ownTicker = this.attackStrengthTicker;
+        try {
+            if (!this.cannotAttackWithItem(itemStack, 0)) {
+                return false;
+            }
+            for (AlternativeAttackStrength alternative : this.alternativeAttackStrengths) {
+                this.attackStrengthTicker = alternative.ticker;
+                if (!this.cannotAttackWithItem(itemStack, 0)) {
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            this.attackStrengthTicker = ownTicker;
+        }
     }
 
     // - Player.getAttackStrengthScale as Player.attack uses it, for any ticker -
@@ -458,6 +651,35 @@ public final class SandboxPlayer extends Player {
             }
         }
 
+        // - Holding jump charges the vehicle's jump, releasing it jumps and sends START_RIDING_JUMP with the power -
+        PlayerRideableJumping jumpableVehicle = this.jumpableVehicle();
+        if (jumpableVehicle != null && jumpableVehicle.getJumpCooldown() == 0) {
+            if (this.jumpRidingTicks < 0) {
+                this.jumpRidingTicks++;
+                if (this.jumpRidingTicks == 0) {
+                    this.jumpRidingScale = 0.0F;
+                }
+            }
+
+            if (wasJumping && !this.input.keyPresses.jump()) {
+                this.jumpRidingTicks = -10;
+                jumpableVehicle.onPlayerJump(Mth.floor(this.getJumpRidingScale() * 100.0F));
+                this.client.onRidingJumpSent(Mth.floor(this.getJumpRidingScale() * 100.0F));
+            } else if (!wasJumping && this.input.keyPresses.jump()) {
+                this.jumpRidingTicks = 0;
+                this.jumpRidingScale = 0.0F;
+            } else if (wasJumping) {
+                this.jumpRidingTicks++;
+                if (this.jumpRidingTicks < 10) {
+                    this.jumpRidingScale = this.jumpRidingTicks * 0.1F;
+                } else {
+                    this.jumpRidingScale = 0.8F + 2.0F / (this.jumpRidingTicks - 9) * 0.1F;
+                }
+            }
+        } else {
+            this.jumpRidingScale = 0.0F;
+        }
+
         super.aiStep();
         if (this.onGround() && abilities.flying && !this.client.isLocalModeSpectator()) {
             abilities.flying = false;
@@ -545,6 +767,10 @@ public final class SandboxPlayer extends Player {
                 : null;
     }
 
+    public float getJumpRidingScale() {
+        return this.jumpRidingScale;
+    }
+
     @Override
     protected boolean isHorizontalCollisionMinor(Vec3 movement) {
         float yRotInRadians = this.getYRot() * (float) (Math.PI / 180.0);
@@ -594,6 +820,32 @@ public final class SandboxPlayer extends Player {
     public void stopUsingItem() {
         super.stopUsingItem();
         this.startedUsingItem = false;
+    }
+
+    // - startUsingItem for a use the client began this many ticks ago: LivingEntity.updatingUsingItem has counted its -
+    // - remaining ticks down once a tick since -
+    public void startUsingItemSince(InteractionHand hand, int ticksUsed) {
+        this.startUsingItem(hand);
+        if (this.isUsingItem()) {
+            this.useItemRemaining -= ticksUsed;
+        }
+    }
+
+    @Override
+    public boolean isInWaterOrRain() {
+        Boolean forced = this.forcedWaterOrRain;
+        return forced != null ? forced : super.isInWaterOrRain();
+    }
+
+    // - Runs the action with isInWaterOrRain giving this answer -
+    public void withWaterOrRain(boolean wet, Runnable action) {
+        Boolean previous = this.forcedWaterOrRain;
+        this.forcedWaterOrRain = wet;
+        try {
+            action.run();
+        } finally {
+            this.forcedWaterOrRain = previous;
+        }
     }
 
     @Override
@@ -676,5 +928,37 @@ public final class SandboxPlayer extends Player {
     private static final class AlternativeAttackStrength {
         private int ticker;
         private boolean heldMainHandItem = true;
+    }
+
+    // - An attack as Player.attack made it: its target, whether an alternative ticker would have made it a knockback -
+    // - attack, the base knockback, and once it hurt its target, the arguments of Player.causeExtraKnockback with the -
+    // - rotation the push went along -
+    private static final class AttackRecord {
+        private final Entity target;
+        private final boolean otherTickerMakesKnockbackAttack;
+        private float baseKnockback;
+        private boolean hurtTarget;
+        private float knockback;
+        private @Nullable Vec3 targetMovementBefore;
+        private @Nullable DamageSource damageSource;
+        private float damage;
+        private boolean comesFromEffect;
+        private float yRot;
+
+        private AttackRecord(Entity target, boolean otherTickerMakesKnockbackAttack) {
+            this.target = target;
+            this.otherTickerMakesKnockbackAttack = otherTickerMakesKnockbackAttack;
+        }
+    }
+
+    // - The knockback attack another ticker would have made of an attack (see lastAttackOtherwise), as the arguments -
+    // - of Player.causeExtraKnockback and the rotation it pushes along -
+    public record KnockbackAttack(
+            Entity target, float knockback, Vec3 targetMovementBefore, DamageSource damageSource, float damage, boolean comesFromEffect, float yRot
+    ) {
+    }
+
+    // - A push the player took while its pushes were recorded (see recordPushes), with its velocity before and after -
+    public record RecordedPush(double x, double y, double z, Vec3 velocityBefore, Vec3 velocityAfter) {
     }
 }
