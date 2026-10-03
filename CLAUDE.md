@@ -161,6 +161,13 @@ Findings from running the official 26.3 client in a cloud container without a GP
   everything, since the producer then dies of SIGPIPE. A check of the client's command line
   (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input
   whole first, e.g. `grep -q -- "$pattern" <<< "$(tr '\0' '\n' < /proc/<pid>/cmdline)"`.
+- **Control FIFOs:** a reader that opens a FIFO, reads until its writers have closed it and then closes it loses what a
+  writer writes in the moment between that end and the close, since the kernel drops what a pipe holds once its last
+  reader is gone, and a writer that writes again after the close dies of SIGPIPE. The test proxy read its control lines
+  that way, and a `close 0` written right after another line never reached it, so that the steps after it ran with the
+  player's inventory open and failed `Inventory`. A second reader that stays open without reading keeps such lines.
+  bash's `printf` writes every line it formats on its own (`printf '%s\n' a b` makes two writes), so a reader that has
+  to take the lines of one redirection together reads until their writer has closed the FIFO.
 - **Server tick rates above 20:** the client still ticks 20 times a second (`Minecraft.getTickTargetMillis`) and
   moves the living entities it shows towards the server's positions that much faster
   (`ClientLevel.getRelativeTickSpeed`). `tick_rate_test.sh` teleports a cow without AI through the standing player in
