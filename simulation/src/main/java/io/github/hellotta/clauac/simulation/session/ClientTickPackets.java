@@ -45,6 +45,9 @@ final class ClientTickPackets {
     boolean fallFlyingStartReported;
     // - The jump power of a START_RIDING_JUMP command of this tick -
     OptionalInt reportedRidingJump = OptionalInt.empty();
+    // - A packet of the server that the client processed since the tick before changed the player's rotation, or -
+    // - replaced the player -
+    boolean turnedByServer;
     // - What the simulated player itself would have sent while ticking -
     boolean predictedAbilitiesSent;
     boolean predictedFallFlyingStart;
@@ -143,6 +146,7 @@ final class ClientTickPackets {
         this.reportedFlying = false;
         this.fallFlyingStartReported = false;
         this.reportedRidingJump = OptionalInt.empty();
+        this.turnedByServer = false;
         this.predictedAbilitiesSent = false;
         this.predictedFallFlyingStart = false;
         this.predictedRidingJump = OptionalInt.empty();

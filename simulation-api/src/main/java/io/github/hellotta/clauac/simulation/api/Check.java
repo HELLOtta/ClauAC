@@ -20,6 +20,11 @@ public enum Check {
     TIMER("Timer", false),
     // - The client held back its answers to the server's packets until the older half was applied without them -
     PINGS("Pings", false),
+    // - The client moved its player with its keys or turned it with its mouse while a screen was open, where a -
+    // - vanilla client lets go of every key and of the mouse as a screen opens; or it did something in its inventory -
+    // - screen when the key handling that opens that screen had not run since its last screen closed, or had pressed -
+    // - keys -
+    INVENTORY("Inventory", false),
     // - The client acted on an entity or a block farther away than the player reaches -
     REACH("Reach", true),
     // - The client acted on an entity or a block its crosshair did not point at: one behind a block or another -

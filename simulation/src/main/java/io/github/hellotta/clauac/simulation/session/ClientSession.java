@@ -47,6 +47,7 @@ import net.minecraft.network.protocol.game.ServerboundContainerSlotStateChangedP
 import net.minecraft.network.protocol.game.ServerboundInteractPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.network.protocol.game.ServerboundMoveVehiclePacket;
+import net.minecraft.network.protocol.game.ServerboundPlaceRecipePacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerAbilitiesPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
@@ -460,6 +461,7 @@ public final class ClientSession implements PlayerSimulation {
             case ServerboundSelectBundleItemPacket bundleItem -> this.requirePlay().onSelectBundleItem(bundleItem.slotId(), bundleItem.selectedItemIndex());
             case ServerboundSelectTradePacket trade -> this.requirePlay().onSelectTrade(trade.getItem());
             case ServerboundRenameItemPacket rename -> this.requirePlay().onRenameItem(rename.getName());
+            case ServerboundPlaceRecipePacket placeRecipe -> this.requirePlay().onPlaceRecipe(placeRecipe.containerId());
             case ServerboundContainerSlotStateChangedPacket slotState ->
                     this.requirePlay().onSlotStateChanged(slotState.slotId(), slotState.containerId(), slotState.newState());
             default -> throw new IllegalArgumentException("No handler for " + packet.type());

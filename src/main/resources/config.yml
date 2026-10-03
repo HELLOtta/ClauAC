@@ -48,6 +48,11 @@ checks:
   Pings:
     alert: true
     setback: true
+  # - The client moved or turned its player while a screen was open, or did something in its inventory screen when -
+  # - it cannot have opened it -
+  Inventory:
+    alert: true
+    setback: true
   # - The client acted on an entity or a block farther away than the player reaches -
   Reach:
     alert: true

@@ -65,6 +65,18 @@ The 26.2 client sends what 26.3 sends, but in other places and partly in other p
   client's breaking either, where 26.3's `handleMovePlayer` calls `MultiPlayerGameMode.stopDestroyBlock`.
 - **Breaking.** 26.2 has no turn to another face: `continueDestroyBlock` goes on breaking the same block from any face
   and names the face only with the finish, so breaking a block sends only a start, an abort and a finish.
+- **Screens.** The client lets go of the keys and the mouse as a screen opens and takes neither while it is open as
+  26.3 does (`Gui.setScreen`, `KeyboardHandler.keyPress`, `MouseHandler.onButton` and `handleAccumulatedMovement`),
+  opens and closes the same screens with the same packets, and clicks, places recipes and picks items of bundles only
+  on the same screens, so the `Inventory` check (see "Screens") is the same. It reports a tick's keys from
+  `LocalPlayer.tick`, and the rotation it answers a teleport with comes in the movement packet behind the acceptance
+  (see the teleports above), which the check looks at as it does the movement packet that answers a teleport of the
+  removed vehicle. A riding player reports its rotation from `LocalPlayer.tick` as well, before its vehicle turns it
+  (`Entity.rideTick` positions the rider after the rider's tick), so that the next report holds that turn; the check
+  leaves the turns of a riding player alone in both versions. The tick in which the dead player's own tick removes it
+  (`LocalPlayer.tickDeath`) still sends the player's movement, since `LocalPlayer.tick` sends it right after the
+  player's own tick; the 26.3 client sends nothing then (`Minecraft.tick` lets only a player still in the level send
+  its changes).
 
 Smaller differences of the client code the sandbox runs, each ported from the 26.2 client with its source named:
 `RemotePlayer.aiStep` interpolates a remote player's position and counts its swing time itself; the client creates an
@@ -169,6 +181,12 @@ The tests of the checks and responses failed only what they cheated:
   probe in all 4868 ticks, 14 of them only as the knockback attack of the other strength. The thirteen courses matched
   in all of their 19 923 simulated ticks, the combat, block and NoSwing tests failed exactly the checks they failed
   before, and the tests of the disablers and of the creative inventory passed as before.
+- The test of the screens (see "Screens") failed `Inventory` only in the ticks of the cheats its proxy imitated. In the
+  test of the disablers, its clicks in the player's inventory showed that screen open, as with the 26.3 client (see
+  "Disablers"). In the first run of the final runs below, the test's proxy lost the line that closes the inventory after
+  the clicks, since it dropped a control line written right after another (see `CLAUDE.md`), and every later tick of the
+  walking player failed `Inventory` as well. With the proxy fixed, `Inventory` failed only in the ticks of the clicks,
+  and none of the 860 ticks of the test's connection was `UNVERIFIED`.
 
 Over worse connections the courses matched as well. Through the proxy of "Verified so far", with each of its five kinds
 of delay, courses 1, 2, 3, 5, 7, 8, 9, 10, 11 and 12 and the block and combat tests matched in all of their 36 425
@@ -185,6 +203,17 @@ In another run of the thirteen courses every tick of the player on foot ran a se
 These runs showed two faults of the port, both fixed since: the answer to a setback's teleport carried a movement
 cheat's position past the setback (see "What the 26.2 client does differently"), and a late setback of a tick that
 ended before an earlier one teleported the player undid that teleport (see "Setbacks").
+
+The final runs of this build with the `Inventory` check matched as well. The thirteen courses matched in all of their
+19 993 simulated ticks and in all 20 037 of another run in which every tick of the player on foot ran a second time from
+its snapshot and ended the same, and the test of the tick rates matched in all of its 740. Over the five connections
+above, the courses and the block and combat tests matched in all of their 37 243 simulated ticks but the 46 with the
+cheats of those tests. Over a direct connection, ClauAC refused every cheat of the combat, block and `NoSwing` tests,
+and the tests of `Timer`, the tick budget, alerts, setbacks, held and late, the two situations and the creative
+inventory passed as before: the server's position of the player did not change in either setback test, and all 41
+shifted answers of the held one failed `Simulation`. The vanilla client's uncertain starts of breaking matched in all
+1992 ticks of their check and its sprint attacks in all 4898. No tick of these runs failed `Inventory` but those of the
+imitated cheats of the test of the screens and of the clicks in the test of the disablers.
 
 ## Building
 
@@ -503,6 +532,9 @@ Known limits:
 - The client opens its own inventory screen without telling the server, and its creative inventory screen ignores
   cursor updates and keeps its own menu when the game mode changes. The sandbox cannot follow those; the differences
   show up in the next checked click and are resolved by the inventory resend.
+- The `Inventory` check knows of the player's own inventory screen only once the client does something in it, never of
+  the screens the client opens on its own, and after some screens of the server not whether a screen is open at all
+  (see "Screens").
 - A relative rotation packet whose answer the client computed from a rotation the sandbox has not seen yet is applied
   at the next pong instead.
 - The other worlds of a start of breaking with a hotbar item the sandbox does not know (see above) are not tried while
@@ -542,6 +574,12 @@ the player sprinted, 13 of 96, which moved the server's position of the player u
 of these ticks was `UNVERIFIED`: the shifted ones failed `Simulation`, the interactions and attacks `Hitbox`, and the
 server's position of the player stayed where it was. A single charged attack on the unknown entity id with its swing
 failed `Hitbox` alone, and the movement of its tick matched as simulated.
+
+Such a click also shows that the player's inventory screen is open (see "Screens"), so that with the `Inventory` check
+every tick in which the walking player kept its keys after the first click fails `Inventory` as well, until the client
+closes that screen. Left open, it made every tick of the test's later steps fail `Inventory`, which would also hide a
+tick the sandbox was unsure of behind `MISMATCHED`; the test therefore has the proxy close the inventory once the
+clicks stop, as a cheat whose later ticks are to pass would.
 
 ### Verified so far
 
@@ -656,6 +694,8 @@ Every `MISMATCHED` tick names the checks it failed, each with what exactly faile
 | `Timer`             | The client ended its ticks faster than the timer of a vanilla client runs (see below)        |
 | `Pings`             | The client left so many of the server's packets unconfirmed that the older half was applied  |
 |                     | without its answers (see "Cost and limits")                                                  |
+| `Inventory`         | The client moved the player with its keys or turned it with its mouse while a screen was     |
+|                     | open, or did something in its inventory screen when it cannot have opened it (see "Screens") |
 | `Reach`             | The client acted on an entity or a block farther away than the player or its weapon reaches  |
 |                     | (see "Attacks and interactions" and "Blocks and items")                                      |
 | `Hitbox`            | The client acted on an entity or a block its crosshair did not point at: one behind a block  |
@@ -696,6 +736,96 @@ proxy held the client's packets for 25 seconds and then sent them at once, nor i
 traced them, whose ticks got 455 to 577 ms ahead at most. One extra tick end injected every 250 ms, a client about 20%
 fast, failed `Timer` from 137 ticks (6.9 seconds) on, 50 times in 15 seconds, and once more right after it stopped.
 1500 tick ends injected at once failed it 1502 times.
+
+### Screens
+
+A vanilla client lets go of every key and of the mouse as a screen opens (`Gui.setScreen` calls `KeyMapping.releaseAll`
+and `MouseHandler.releaseMouse`; `ToggleKeyMapping.release` lets go of a toggled sprint or sneak as well), and while the
+screen is open no key or mouse button reaches a key mapping (`KeyboardHandler.keyPress` hands the keys to the screen,
+`MouseHandler.onButton` sets key mappings only without a screen) and the mouse turns nobody
+(`MouseHandler.handleAccumulatedMovement` turns the player only while it grabs the mouse). A tick with a screen open
+therefore reports no keys (`KeyboardInput.tick`, `LocalPlayer.tick`) and the rotation of the tick before. The
+one exception is the jump an auto-jump adds in the tick after it triggered (`LocalPlayer.aiStep`), which can fall into
+the first tick of a screen: an auto-jump triggers only while the player moves (`LocalPlayer.canAutoJump`). The cheats
+called inventory walk keep the keys and the mouse working with a screen open, so that the player can sort its inventory
+or empty a chest on the move; their ticks fail `Inventory`.
+
+ClauAC knows of two kinds of open screens:
+
+- A container screen opens with the server's packet (`ClientboundOpenScreenPacket`, `MenuScreens.create`, and
+  `ClientboundMountScreenOpenPacket` for a horse or a nautilus), which the sandbox applies at the pong behind it, so
+  that it knows the first tick that ran with the screen open. The screen stays open until the client closes it, which
+  every container screen does with a packet (`LocalPlayer.closeContainer`, from `AbstractContainerScreen.onClose` and
+  `tick`, the anvil, beacon and lectern screens and `LocalPlayer.handlePortalTransitionEffect`), until the server
+  closes it (`LocalPlayer.clientSideCloseContainer`) or until the player joins a level again, whose loading screen
+  replaces it.
+- The player's own inventory screen opens without a packet, in the key handling of a tick (`Minecraft.handleKeybinds`,
+  which runs only without a screen, before the player's tick). Only what the client does in it shows that it is open: a
+  click in the player's inventory menu (`AbstractContainerScreen.slotClicked` is the only sender of container clicks),
+  a recipe placed from the recipe book (`RecipeBookComponent`) and an item picked from a bundle (`BundleMouseActions`,
+  part of every container screen). From then on until the client closes it, the screen is open, and it was open in the
+  tick before at the latest.
+
+A tick fails `Inventory`:
+
+- when it reports keys while a screen was open since it began, but for a lone jump in the first such tick;
+- when its movement turns the player while a screen was open since the tick before; the movement packet the client
+  answers a teleport with, or a teleport of its removed vehicle (see "What the 26.2 client does differently"), fails
+  the same way when it turns the player while a screen was open since the client's last tick;
+- when the client clicks, places a recipe or picks an item of a bundle in its inventory screen right after a tick that
+  reported keys (a lone jump aside), since the key handling that opened the screen let go of them before that tick's
+  player moved, or with no tick since its last screen closed, since that screen opens only in a tick's key handling.
+
+The server turns the player without the mouse (`ClientboundPlayerLookAtPacket`, which the sandbox applies as
+`ClientPacketListener.handleLookAt` does, a teleport and `ClientboundPlayerRotationPacket`), and so does a new player
+after a login or a respawn; a tick after one of them is not checked for turns, and neither is a tick of a riding player,
+whose vehicle turns it after each report of its rotation (see "What the 26.2 client does differently"). With `setback`
+on, a tick that fails `Inventory` is set back like one that fails `Simulation` (see "Setbacks"). The clicks themselves
+go on to the server: they are neither movement nor one of the actions held for their tick, and a vanilla client clicks
+in an open screen as well.
+
+Limits:
+
+- A client that keeps its inventory screen open without doing anything in it shows nothing; the check finds it from its
+  first click on. In creative mode the inventory screen sends no clicks, only the items it sets
+  (`CreativeModeInventoryScreen.slotClicked`), and an item picked from a bundle is all that shows it.
+- A client that lets go of its keys for the tick before each click in its inventory screen and closes the screen right
+  after the click passes: a vanilla player as fast can open the screen in that tick's key handling, click and close
+  it before the next tick.
+- Screens the client opens on its own (the chat, the pause menu, the advancements and the like) are never known.
+- The server's book, a sign's text, a dialog, a resource pack prompt and the death, credits and demo screens may replace
+  the open screen: a book or a sign's text closes to no screen without a packet, while a dialog or a resource pack
+  prompt brings back the screen it replaced (`ClientCommonPacketListenerImpl.clearDialog`, the prompt's parent screen).
+  After one of them the sandbox does not know whether a screen is open until one opens or closes again, or until the
+  client does something in its inventory screen.
+
+In game, with a chest beside the course, a vanilla 26.2 client walked against the chest until its screen opened and
+moved the mouse over the screen; opened its inventory with the inventory key while walking and clicked in it three
+times; had its chest screen closed by the server; was turned by the server three ways while the chest was open
+(`rotate ... facing`, `rotate`, `tp ... facing`); got a dialog over the chest's screen and closed both, and another one
+the server cleared (`dialog clear`); placed a sign and left its text screen; read a written book; opened the inventory
+of the horse it rode while the horse walked; declined a resource pack the server pushed over the chest's screen
+(`Player#addResourcePack`, from a plugin of the tests); placed a recipe from the recipe book of its inventory; opened
+the inventory of a chest boat it steered while the boat turned, and stayed in that screen while the server dismounted
+it; and died with the chest open, waited on its death screen and respawned with its button. Where it walked or rode into
+a screen, it held the movement key until after that screen had closed. All 2508 simulated ticks of these steps matched,
+and none failed `Inventory`, among them the tick in which the dead player's own tick removed it, which sent the player's
+movement (see "What the 26.2 client does differently"); the 46 after it, until the respawned client had loaded the
+level, were not simulated. A proxy between the client and the server then imitated the cheat:
+
+- It kept the chest's screen from the client (it dropped the server's `open_screen` packet), so that the client walked
+  on against the chest and turned, as a client whose keys and mouse a cheat keeps working does. 44 ticks failed
+  `Inventory`: 42 for the movement key, 2 for a turn in the movement packet the client answered a setback with. With the
+  player standing, its first turn failed `Inventory` in its movement and the next one in its answer to the setback.
+- A click the proxy made in the player's inventory while the player walked failed `Inventory` as a click right after a
+  tick with the movement key, and so did the 19 ticks with the key held until the proxy closed the inventory a second
+  later. A click and a close behind every tenth tick end while the player walked failed at each of the 4 clicks, and a
+  click right behind a close, with no tick in between, failed once.
+- A click of the proxy while the player stood, closed a second later, matched in all 46 ticks: a vanilla client can do
+  that.
+
+The 19 setbacks kept the player where the server had it while the screen was open, and Paper's own movement checks saw
+nothing.
 
 ### Attacks and interactions
 

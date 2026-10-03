@@ -38,7 +38,10 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.HashedPatchMap;
 import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.common.ClientboundClearDialogPacket;
 import net.minecraft.network.protocol.common.ClientboundPingPacket;
+import net.minecraft.network.protocol.common.ClientboundResourcePackPushPacket;
+import net.minecraft.network.protocol.common.ClientboundShowDialogPacket;
 import net.minecraft.network.protocol.common.ClientboundUpdateTagsPacket;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundAnimatePacket;
@@ -69,10 +72,14 @@ import net.minecraft.network.protocol.game.ClientboundMountScreenOpenPacket;
 import net.minecraft.network.protocol.game.ClientboundMoveEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundMoveMinecartPacket;
 import net.minecraft.network.protocol.game.ClientboundMoveVehiclePacket;
+import net.minecraft.network.protocol.game.ClientboundOpenBookPacket;
 import net.minecraft.network.protocol.game.ClientboundOpenScreenPacket;
+import net.minecraft.network.protocol.game.ClientboundOpenSignEditorPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerAbilitiesPacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerCombatKillPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerLookAtPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ClientboundPlayerRotationPacket;
 import net.minecraft.network.protocol.game.ClientboundProjectilePowerPacket;
@@ -294,6 +301,12 @@ final class PlayConnection implements ClientContext {
     private final List<Map<BlockPos, SandboxLevel.BlockSnapshot>> worldUndo = new ArrayList<>();
     // - The client tick being simulated -
     private long currentClientTick;
+    // - The client tick that ended last, simulated or not, and the keys it reported when it ran the player (null -
+    // - when it did not); between two ticks, what the client did on a screen came after it -
+    private long lastEndedTick;
+    private @Nullable Input lastTickKeys;
+    // - The client's screens, which let go of its keys and mouse while open -
+    private final ScreenTracker screens = new ScreenTracker();
     private int ticksSinceVelocityEstimate = VELOCITY_ESTIMATE_TICKS;
     // - The difference and the outcome of the tick whose resync estimated the velocity last -
     private double estimatedAfterOffset;
@@ -372,8 +385,20 @@ final class PlayConnection implements ClientContext {
         this.tickPackets.predictedRidingJump = OptionalInt.of(jumpPower);
     }
 
-    // - Handles a clientbound play packet the client has provably processed -
+    // - Handles a clientbound play packet the client has provably processed, and notes when it turned or replaced the -
+    // - player, which the mouse then did not (see checkScreenInput) -
     void handle(Packet<?> packet, byte[] encodedPacket) {
+        SandboxPlayer playerBefore = this.player;
+        float yRotBefore = playerBefore != null ? playerBefore.getYRot() : 0.0F;
+        float xRotBefore = playerBefore != null ? playerBefore.getXRot() : 0.0F;
+        this.handlePacket(packet, encodedPacket);
+        SandboxPlayer playerAfter = this.player;
+        if (playerAfter != playerBefore || playerAfter != null && (playerAfter.getYRot() != yRotBefore || playerAfter.getXRot() != xRotBefore)) {
+            this.tickPackets.turnedByServer = true;
+        }
+    }
+
+    private void handlePacket(Packet<?> packet, byte[] encodedPacket) {
         switch (packet) {
             case ClientboundLoginPacket login -> this.handleLogin(login);
             case ClientboundRespawnPacket respawn -> this.handleRespawn(respawn);
@@ -512,9 +537,31 @@ final class PlayConnection implements ClientContext {
             case ClientboundContainerSetDataPacket data -> ContainerHandlers.handleContainerSetData(data, player);
             case ClientboundCooldownPacket cooldown -> ContainerHandlers.handleItemCooldown(cooldown, player);
             case ClientboundMerchantOffersPacket offers -> ContainerHandlers.handleMerchantOffers(offers, player);
-            case ClientboundOpenScreenPacket openScreen -> ContainerHandlers.handleOpenScreen(openScreen, player);
-            case ClientboundMountScreenOpenPacket mountScreen -> ContainerHandlers.handleMountScreenOpen(mountScreen, level, player);
-            case ClientboundContainerClosePacket close -> ContainerHandlers.handleContainerClose(close, player);
+            case ClientboundOpenScreenPacket openScreen -> {
+                ContainerHandlers.handleOpenScreen(openScreen, player);
+                this.screens.containerScreenOpened(this.nextTick());
+            }
+            case ClientboundMountScreenOpenPacket mountScreen -> {
+                if (ContainerHandlers.handleMountScreenOpen(mountScreen, level, player)) {
+                    this.screens.containerScreenOpened(this.nextTick());
+                }
+            }
+            case ClientboundContainerClosePacket close -> {
+                ContainerHandlers.handleContainerClose(close, player);
+                this.screens.closed(this.nextTick());
+            }
+            case ClientboundPlayerLookAtPacket lookAt -> handleLookAt(lookAt, level, player);
+            // - ClientPacketListener.handleOpenBook and handleOpenSignEditor (LocalPlayer.openTextEdit), and -
+            // - ClientCommonPacketListenerImpl.handleShowDialog, handleClearDialog and handleResourcePackPush: screens -
+            // - that change nothing the sandbox follows but the client's screens -
+            case ClientboundOpenBookPacket _, ClientboundOpenSignEditorPacket _, ClientboundShowDialogPacket _, ClientboundClearDialogPacket _,
+                 ClientboundResourcePackPushPacket _ -> this.screens.screenOutOfSight();
+            // - ClientPacketListener.handlePlayerCombatKill shows the death screen when the client's own player died -
+            case ClientboundPlayerCombatKillPacket combatKill -> {
+                if (combatKill.playerId() == player.getId()) {
+                    this.screens.screenOutOfSight();
+                }
+            }
             default -> throw new IllegalArgumentException("No handler for " + packet.type());
         }
     }
@@ -604,6 +651,8 @@ final class PlayConnection implements ClientContext {
         loginPlayer.setLastDeathLocation(spawnInfo.lastDeathLocation());
         loginPlayer.setPortalCooldown(spawnInfo.portalCooldown());
         this.gameMode.setLocalMode(spawnInfo.gameType(), loginPlayer);
+        // - The level loading screen (startWaitingForNewLevel) replaced any screen and closes once the level is ready -
+        this.screens.closed(this.nextTick());
     }
 
     private void handleRespawn(ClientboundRespawnPacket packet) {
@@ -628,6 +677,8 @@ final class PlayConnection implements ClientContext {
         if (oldPlayer.hasContainerOpen()) {
             ContainerHandlers.closeScreen(oldPlayer, false);
         }
+        // - The level loading screen (startWaitingForNewLevel) replaces any screen and closes once the level is ready -
+        this.screens.closed(this.nextTick());
         boolean keepEntityData = packet.shouldKeep(ClientboundRespawnPacket.KEEP_ENTITY_DATA);
         SandboxPlayer newPlayer = keepEntityData
                 ? this.createPlayer(respawnLevel, this.lastSent.input, oldPlayer.isSprinting())
@@ -786,8 +837,11 @@ final class PlayConnection implements ClientContext {
         boolean zDiffers = current.getZ() != z;
         if (xDiffers || yDiffers || zDiffers || current.getYRot() != yRot || current.getXRot() != xRot) {
             // - The rotation is the client's input and may have turned since its last tick; the sandbox takes it over -
-            // - like the tick's own rotation. A relative coordinate that differs shows the player was elsewhere than -
-            // - the sandbox thought, with a velocity the sandbox cannot know either -
+            // - like the tick's own rotation, unless a screen was open since that tick, which keeps the mouse from -
+            // - turning the player. A relative coordinate that differs shows the player was elsewhere than the sandbox -
+            // - thought, with a velocity the sandbox cannot know either -
+            this.screens.checkTurn(this.nextTick(), current.getYRot(), current.getXRot(), yRot, xRot, "its answer to " + answered)
+                    .ifPresent(detail -> this.tickPackets.reject(Check.INVENTORY, detail));
             if (!xRelative && xDiffers || !yRelative && yDiffers || !zRelative && zDiffers) {
                 this.tickPackets.reject(Check.SIMULATION, String.format(Locale.ROOT,
                         "differs in: the position the client answered %s with, %.6f %.6f %.6f, where it puts the player at %.6f %.6f %.6f",
@@ -865,7 +919,23 @@ final class PlayConnection implements ClientContext {
             level.setRainLevel(paramFloat);
         } else if (event == ClientboundGameEventPacket.THUNDER_LEVEL_CHANGE) {
             level.setThunderLevel(paramFloat);
+        } else if (event == ClientboundGameEventPacket.WIN_GAME || event == ClientboundGameEventPacket.DEMO_EVENT && paramFloat == 0.0F) {
+            // - The credits (WinScreen) and the demo's intro screen (openDemoIntroScreen) -
+            this.screens.screenOutOfSight();
         }
+    }
+
+    // - ClientPacketListener.handleLookAt -
+    private static void handleLookAt(ClientboundPlayerLookAtPacket packet, SandboxLevel level, SandboxPlayer player) {
+        Vec3 position = packet.getPosition(level);
+        if (position != null) {
+            player.lookAt(packet.getFromAnchor(), position);
+        }
+    }
+
+    // - The first client tick that runs after what the sandbox handles between two ticks -
+    private long nextTick() {
+        return this.lastEndedTick + 1L;
     }
 
     private static void handleInitializeBorder(ClientboundInitializeBorderPacket packet, SandboxLevel level) {
@@ -973,11 +1043,21 @@ final class PlayConnection implements ClientContext {
     // - Menu interactions happen on screens, between the client's ticks, so they apply right away -
     void onContainerClick(ServerboundContainerClickPacket packet) {
         SandboxPlayer clicking = this.requirePlayer(packet);
+        if (packet.containerId() == clicking.containerMenu.containerId) {
+            this.screenShown("clicked in its inventory screen");
+        }
         List<String> differences = SandboxGameMode.handleContainerInput(packet, clicking, this.hashGenerator);
         if (!differences.isEmpty()) {
             this.tickPackets.notes.add("container click differs: " + String.join(", ", differences));
             this.markInventoryUnknown(packet.containerId());
         }
+    }
+
+    // - The client did something in its open menu that only an open container screen does, which is the player's -
+    // - inventory screen while the sandbox has no other menu open; see ScreenTracker.screenShown -
+    private void screenShown(String action) {
+        this.screens.screenShown(action, this.lastEndedTick, this.lastTickKeys)
+                .ifPresent(detail -> this.tickPackets.reject(Check.INVENTORY, detail));
     }
 
     // - LocalPlayer.closeContainer: the client closes its screen; menu 0 is the player's own inventory screen -
@@ -987,10 +1067,20 @@ final class PlayConnection implements ClientContext {
             this.tickPackets.notes.add("the client closed menu " + containerId + " while the sandbox has " + closing.containerMenu.containerId + " open");
         }
         ContainerHandlers.closeScreen(closing, containerId == InventoryMenu.CONTAINER_ID);
+        this.screens.closed(this.nextTick());
         if (this.unknownInventoryMenu.isPresent()) {
             // - The server now sends the player's own inventory when asked -
             this.unknownInventoryMenu = OptionalInt.empty();
             this.markInventoryUnknown(InventoryMenu.CONTAINER_ID);
+        }
+    }
+
+    // - RecipeBookComponent places a recipe from the recipe book of the open screen -
+    // - (MultiPlayerGameMode.handlePlaceRecipe); the server fills the slots and sends them -
+    void onPlaceRecipe(int containerId) {
+        SandboxPlayer placing = this.requirePlayerForAction();
+        if (containerId == placing.containerMenu.containerId) {
+            this.screenShown("placed a recipe from its inventory screen");
         }
     }
 
@@ -1023,6 +1113,7 @@ final class PlayConnection implements ClientContext {
 
     void onSelectBundleItem(int slotId, int selectedItemIndex) {
         SandboxPlayer selecting = this.requirePlayerForAction();
+        this.screenShown("picked an item of a bundle in its inventory screen");
         if (!SandboxGameMode.handleSelectBundleItem(selecting, slotId, selectedItemIndex)) {
             this.tickPackets.notes.add("bundle selection in slot " + slotId + " does not match one bundle");
             this.markInventoryUnknown(selecting.containerMenu.containerId);
@@ -1041,6 +1132,8 @@ final class PlayConnection implements ClientContext {
     // - held back for one tick. A failure of the simulation makes the tick MISMATCHED instead of ending the -
     // - simulation, so that no packet a client sends can switch it off -
     List<ClientTickReport> tick(long clientTick, boolean repositionPending) {
+        this.lastEndedTick = clientTick;
+        this.lastTickKeys = null;
         this.tickStart = this.currentStart(repositionPending);
         this.movementCompared = false;
         List<ClientTickReport> reports = new ArrayList<>(2);
@@ -1082,6 +1175,8 @@ final class PlayConnection implements ClientContext {
     // - faster cannot make the simulation fall behind: the client's reported state is taken over, and neither the -
     // - player nor the level with its entities ticks. A report held back from the previous tick goes first -
     List<ClientTickReport> skipTick(long clientTick, Flag rejection, boolean repositionPending) {
+        this.lastEndedTick = clientTick;
+        this.lastTickKeys = null;
         this.tickStart = this.currentStart(repositionPending);
         List<ClientTickReport> reports = new ArrayList<>(2);
         ClientTickReport held = this.takeHeldReport("the next tick, which had to report the hotbar switch this tick assumed, came too soon to be simulated");
@@ -1143,6 +1238,9 @@ final class PlayConnection implements ClientContext {
         // - reports it right after the player's own tick, before a vehicle turns a riding player (Entity.rideTick -
         // - positions the rider after its tick), so nothing turned it before the report -
         ServerboundMovePlayerPacket movePacket = this.tickPackets.movePacket;
+        float yRotBeforeTick = tickPlayer.getYRot();
+        float xRotBeforeTick = tickPlayer.getXRot();
+        boolean ridingBeforeTick = tickPlayer.isPassenger();
         if (movePacket != null && movePacket.hasRotation()) {
             tickPlayer.setYRot(movePacket.getYRot(tickPlayer.getYRot()));
             tickPlayer.setXRot(movePacket.getXRot(tickPlayer.getXRot()));
@@ -1157,6 +1255,8 @@ final class PlayConnection implements ClientContext {
             notes.add(this.clientLoaded ? "player removed" : "client has not loaded the level");
             return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
         }
+        this.checkScreenInput(clientTick, reportedKeys, movePacket, ridingBeforeTick, yRotBeforeTick, xRotBeforeTick);
+        this.lastTickKeys = reportedKeys;
         InferredHotbarSwitch inferredSwitch = this.inferHotbarSwitch(tickLevel, tickPlayer);
         // - LivingEntity.updatingUsingItem, at the start of the player's tick, stops the use once the used hand holds -
         // - another item -
@@ -1309,6 +1409,19 @@ final class PlayConnection implements ClientContext {
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
                 Double.NaN, null, this.tickStart, verdict.flags(), notes
         );
+    }
+
+    // - The keys and the rotation of a tick in which a screen of the client was open (see ScreenTracker). from is the -
+    // - rotation the player had before the tick. The server may have turned the player since the tick before, and a -
+    // - riding player's vehicle turns it after each report of its rotation (Entity.rideTick positions the rider after -
+    // - its tick), which the next report holds; the mouse is only looked for without either -
+    private void checkScreenInput(long clientTick, Input reportedKeys, @Nullable ServerboundMovePlayerPacket movePacket, boolean riding,
+                                  float fromYRot, float fromXRot) {
+        this.screens.checkKeys(clientTick, reportedKeys).ifPresent(detail -> this.tickPackets.reject(Check.INVENTORY, detail));
+        if (movePacket != null && movePacket.hasRotation() && !riding && !this.tickPackets.turnedByServer) {
+            this.screens.checkTurn(clientTick, fromYRot, fromXRot, movePacket.getYRot(fromYRot), movePacket.getXRot(fromXRot), "its movement")
+                    .ifPresent(detail -> this.tickPackets.reject(Check.INVENTORY, detail));
+        }
     }
 
     // - ClientLevel.tickEntities reaching the local player while it rides nothing (see SandboxLevel.setLocalPlayerTick). -

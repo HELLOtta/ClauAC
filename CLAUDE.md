@@ -141,10 +141,34 @@ Findings from running the official 26.3 and 26.2 clients in a cloud container wi
   only when the client counts the attack as a hit (`Entity.hurtOrSimulate` calls `hurtClient` there): a boat does
   (`VehicleEntity.hurtClient`), a living entity never (`Entity.hurtClient`, which `LivingEntity` keeps), so a sprint
   attack on a mob or another player leaves the client's speed alone.
+- **Testing the Inventory check:** the proxy's `drop-clientbound minecraft:open_screen` keeps a container screen from
+  the client while the server and the sandbox, which see the packet and the pong behind it, take it as open: the client
+  then walks and turns on as with a cheat that keeps the keys and the mouse working on a screen. `click <menu> <slot>`
+  and `close <menu>` send a container click and a close the client never made (menu 0 is the player's inventory); a
+  click right after a tick with keys has to fail, one right after a tick without keys is what a vanilla client does as
+  well. A dialog of the server over a container screen goes back to that screen when it closes
+  (`DialogScreen.onClose`), so Escape has to be pressed twice to get back into the game. Stopping the proxy disconnects
+  its client, after which console commands on the player fail ("No entity was found"): clean up the world and read the
+  player's status before stopping the proxy. No vanilla or Paper command pushes a resource pack in the play phase; the
+  probe plugin's `/testpack <player> <url>` does (`probe/build.sh --install`). The client asks about a pushed pack only
+  while the server's entry in its `servers.dat` has no answer yet, and quick play adds that entry and keeps the answer
+  (`ServerList.saveSingleServer`), so delete the file before joining to see the prompt again. The server keeps whether
+  the player's recipe book is open, over screens and joins, and an open book moves the inventory screen to the right,
+  where clicks meant for its slots land on the book: a test that opened the book made the next run's slot clicks
+  miss. The death screen's buttons take clicks only 20 ticks after it opened.
+- **Editing test scripts:** bash reads a script while it runs it, so an edit to a running script breaks that run (a run
+  of `tick_rate_test.sh` failed with a syntax error at a line the edit had moved). Edit a script only between runs.
 - **Pipelines under `pipefail`:** `producer | grep -q` fails whenever grep stops reading before the producer has written
   everything, since the producer then dies of SIGPIPE. A check of the client's command line
   (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input
   whole first, e.g. `grep -q -- "$pattern" <<< "$(tr '\0' '\n' < /proc/<pid>/cmdline)"`.
+- **Control FIFOs:** a reader that opens a FIFO, reads until its writers have closed it and then closes it loses what a
+  writer writes in the moment between that end and the close, since the kernel drops what a pipe holds once its last
+  reader is gone, and a writer that writes again after the close dies of SIGPIPE. The test proxy read its control lines
+  that way, and a `close 0` written right after another line never reached it, so that the steps after it ran with the
+  player's inventory open and failed `Inventory`. A second reader that stays open without reading keeps such lines.
+  bash's `printf` writes every line it formats on its own (`printf '%s\n' a b` makes two writes), so a reader that has
+  to take the lines of one redirection together reads until their writer has closed the FIFO.
 - **Server tick rates above 20:** the client still ticks 20 times a second (`Minecraft.getTickTargetMillis`). The 26.3
   client moves the living entities it shows towards the server's positions that much faster
   (`ClientLevel.getRelativeTickSpeed`); 26.2 has no such method, and its `InterpolationHandler.interpolate` goes one
