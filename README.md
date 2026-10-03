@@ -383,6 +383,12 @@ of these ticks was `UNVERIFIED`: the shifted ones failed `Simulation`, the inter
 server's position of the player stayed where it was. A single charged attack on the unknown entity id with its swing
 failed `Hitbox` alone, and the movement of its tick matched as simulated.
 
+Such a click also shows that the player's inventory screen is open (see "Screens"), so that with the `Inventory` check
+every tick in which the walking player kept its keys after the first click fails `Inventory` as well, until the client
+closes that screen. Left open, it made every tick of the test's later steps fail `Inventory`, which would also hide a
+tick the sandbox was unsure of behind `MISMATCHED`; the test therefore has the proxy close the inventory once the
+clicks stop, as a cheat whose later ticks are to pass would.
+
 The test of the two situations reported the positions 2 blocks higher in the same way and left the client's answers to
 the corrections alone. On every pass of the player sprinting under a boat, the proxy reported a switch from a stick to a
 feather right behind a tick end and, five ticks later, an attack on the boat with its swing and an item use, whose
@@ -541,6 +547,19 @@ setbacks, held and late, the disablers and the creative inventory passed as befo
 did not change in either setback test, all 50 shifted answers of the held one failed `Simulation`, and the test of the
 disablers left none of the 1094 ticks of its connection `UNVERIFIED`.
 
+The final runs with the `Inventory` check (see "Screens") and the tick that removes a dead player taken as not
+simulated matched as well. The thirteen courses matched in all of their 20 098 simulated ticks and in all 20 121 of
+another run in which every tick of the player on foot ran a second time from its snapshot and ended the same, and the
+test of the tick rates matched in all of its 756. Over the five connections above, the courses and the block and combat
+tests matched in all of their 37 601 simulated ticks but the 46 with the cheats of those tests, which ClauAC refused as
+over a direct connection. Over a direct connection, ClauAC refused every cheat of the combat, block and `NoSwing` tests,
+and the tests of `Timer`, the tick budget, alerts, setbacks, held and late, the disablers, the two situations and the
+creative inventory passed as before: the server's position of the player did not change in either setback test, all 41
+shifted answers of the held one failed `Simulation`, and the test of the disablers left none of the 879 ticks of its
+connection `UNVERIFIED`. The vanilla client's uncertain starts of breaking matched in all 2029 ticks of their check and
+its sprint attacks in all 4975. No tick of these runs failed `Inventory` but those of the imitated cheats of the test of
+the screens and of the clicks in the test of the disablers.
+
 ## Responses
 
 Every `MISMATCHED` tick names the checks it failed, each with what exactly failed; a tick can fail several at once.
@@ -663,23 +682,28 @@ Limits:
 In game, with a chest beside the course, a vanilla client walked against the chest until its screen opened and moved
 the mouse over the screen; opened its inventory with the inventory key while walking and clicked in it three times; had
 its chest screen closed by the server; was turned by the server three ways while the chest was open
-(`rotate ... facing`, `rotate`, `tp ... facing`); got a dialog over the chest's screen and closed both; placed a sign
-and left its text screen; read a written book; and opened the inventory of the horse it rode while the horse walked. It
-held the movement key every time a screen opened and closed. All 1383 ticks of these steps matched, and none failed
-`Inventory`. A proxy between the client and the server then imitated the cheat:
+(`rotate ... facing`, `rotate`, `tp ... facing`); got a dialog over the chest's screen and closed both, and another one
+the server cleared (`dialog clear`); placed a sign and left its text screen; read a written book; opened the inventory
+of the horse it rode while the horse walked; declined a resource pack the server pushed over the chest's screen
+(`Player#addResourcePack`, from a plugin of the tests); placed a recipe from the recipe book of its inventory; opened
+the inventory of a chest boat it steered while the boat turned, and stayed in that screen while the server dismounted
+it; and died with the chest open, waited on its death screen and respawned with its button. Where it walked or rode
+into a screen, it held the movement key until after that screen had closed. All 2547 simulated ticks of these steps
+matched, and none failed `Inventory`; the 51 while the player was dead were not simulated. A proxy between the client
+and the server then imitated the cheat:
 
 - It kept the chest's screen from the client (it dropped the server's `open_screen` packet), so that the client walked
-  on against the chest and turned, as a client whose keys and mouse a cheat keeps working does. 49 ticks failed
-  `Inventory`: 46 for the movement key, 3 for a turn in the client's answer to a setback. With the player standing, its
-  first turn failed `Inventory` in its movement and the next 3 in the answers to the setbacks.
+  on against the chest and turned, as a client whose keys and mouse a cheat keeps working does. 45 ticks failed
+  `Inventory`: 43 for the movement key, 2 for a turn in the client's answer to a setback. With the player standing, its
+  first turn failed `Inventory` in its movement and the next 2 in the answers to the setbacks.
 - A click the proxy made in the player's inventory while the player walked failed `Inventory` as a click right after a
-  tick with the movement key, and so did the 18 ticks with the key held until the proxy closed the inventory a second
+  tick with the movement key, and so did the 20 ticks with the key held until the proxy closed the inventory a second
   later. A click and a close behind every tenth tick end while the player walked failed at each of the 4 clicks, and a
   click right behind a close, with no tick in between, failed once.
-- A click of the proxy while the player stood, closed a second later, matched in all 43 ticks: a vanilla client can do
+- A click of the proxy while the player stood, closed a second later, matched in all 48 ticks: a vanilla client can do
   that.
 
-The 34 setbacks kept the player where the server had it while the screen was open, and Paper's own movement checks saw
+The 21 setbacks kept the player where the server had it while the screen was open, and Paper's own movement checks saw
 nothing.
 
 ### Attacks and interactions
