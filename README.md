@@ -467,7 +467,11 @@ alternative that the switch stopped the item use a tick before the client report
 sprint attack right after a hotbar switch matched through the attack strength that switch left, and an attack on an
 entity id the sandbox did not know, injected into the connection, matched without slowing the player down; such an
 attack fails `Hitbox` now (see "Disablers"). While the player was dead the sandbox, like the client, did not move it
-(`NOT_SIMULATED`), and matching resumed after the respawn.
+(`NOT_SIMULATED`), and matching resumed after the respawn. The client's own tick removes its dead player 20 ticks after
+the death (`LocalPlayer.tickDeath`), and that tick sends nothing, since `Minecraft.tick` lets only a player still in the
+level send its changes (`LocalPlayer.sendChanges`). The sandbox compared that tick with what the player would have sent
+all the same, which failed `Simulation` when the tick fell on the player's position reminder, as in a death of the
+inventory test (see "Screens"); it takes that tick as not simulated now.
 
 At a server tick rate of 40 (`tick rate 40`), the client still ends 20 ticks a second (`Minecraft.getTickTargetMillis`)
 but moves the living entities it shows twice as fast towards the positions the server sends them

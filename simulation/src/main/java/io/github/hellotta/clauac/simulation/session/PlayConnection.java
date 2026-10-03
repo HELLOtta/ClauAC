@@ -1231,6 +1231,12 @@ final class PlayConnection implements ClientContext {
         List<String> uncertainties = new ArrayList<>(this.tickPackets.uncertainties);
         List<String> notes = new ArrayList<>(this.tickPackets.notes);
         this.judgeAlternatives(uncertainties, notes);
+        // - Minecraft.tick has the player send its changes (LocalPlayer.sendChanges) only while it is in the level: a -
+        // - player its own tick removed (LocalPlayer.tickDeath, 20 ticks after it died) sends nothing for this tick -
+        if (tickPlayer.isRemoved()) {
+            notes.add("the player's tick removed it");
+            return this.notSimulated(clientTick, tickPlayer, reportedSprinting, notes);
+        }
         ClientTickReport report;
         ItemStack heldUsedItem = ItemStack.EMPTY;
         ItemStack heldStoppedItem = ItemStack.EMPTY;

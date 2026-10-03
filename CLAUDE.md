@@ -148,7 +148,13 @@ Findings from running the official 26.3 client in a cloud container without a GP
   well. A dialog of the server over a container screen goes back to that screen when it closes
   (`DialogScreen.onClose`), so Escape has to be pressed twice to get back into the game. Stopping the proxy disconnects
   its client, after which console commands on the player fail ("No entity was found"): clean up the world and read the
-  player's status before stopping the proxy.
+  player's status before stopping the proxy. No vanilla or Paper command pushes a resource pack in the play phase; the
+  probe plugin's `/testpack <player> <url>` does (`probe/build.sh --install`). The client asks about a pushed pack only
+  while the server's entry in its `servers.dat` has no answer yet, and quick play adds that entry and keeps the answer
+  (`ServerList.saveSingleServer`), so delete the file before joining to see the prompt again. The server keeps whether
+  the player's recipe book is open, over screens and joins, and an open book moves the inventory screen to the right,
+  where clicks meant for its slots land on the book: a test that opened the book made the next run's slot clicks
+  miss. The death screen's buttons take clicks only 20 ticks after it opened.
 - **Editing test scripts:** bash reads a script while it runs it, so an edit to a running script breaks that run (a run
   of `tick_rate_test.sh` failed with a syntax error at a line the edit had moved). Edit a script only between runs.
 - **Pipelines under `pipefail`:** `producer | grep -q` fails whenever grep stops reading before the producer has written
