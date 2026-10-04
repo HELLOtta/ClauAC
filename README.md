@@ -574,6 +574,31 @@ and its breaking, placing and attacking while it turned its view in all 4685 (se
 runs failed `Inventory` but those of the imitated cheats of the test of the screens and of the clicks in the test of the
 disablers.
 
+The final runs with `setbacks.type` (see "Setbacks"), whose default puts the player where the simulation moved it,
+matched as well. The thirteen courses matched in all of their 19 968 simulated ticks and in all 20 188 of another run in
+which every tick of the player on foot ran a second time from its snapshot and ended the same, and the test of the tick
+rates matched in all of its 743. Over the five connections above, the courses and the block and combat tests matched in
+all of their 37 987 simulated ticks but the 46 with the cheats of those tests, which ClauAC refused as over a direct
+connection. Over a direct connection, ClauAC refused every cheat of the combat, block and `NoSwing` tests, and the tests
+of `Timer`, the tick budget, alerts, the two situations and the creative inventory passed as before. The tests of the
+setbacks, held and late, ran with each type: with `predicted` the server's position of the player followed the walk over
+the floor and the boat's followed its steering, with `server` they stayed where they were, and no sample showed a
+shifted position; all 47 and 49 shifted answers of the held runs failed `Simulation`. The test of the Fly hover passed
+with both types: with `predicted` the held height came down to the floor within a second and a half, with `server` the
+server kept the player at 109.89 throughout. The test of the disablers left none of the 878 ticks of its connection
+`UNVERIFIED`; its clicks, whose ticks fail `Inventory`, went back where the server had the player, the steps of its
+other cheats to where the simulation had moved it, and no sample showed a shifted height. The vanilla client's uncertain
+starts of breaking matched in all 2021 ticks of their check, its sprint attacks in all 4962, and its breaking, placing
+and attacking while it turned its view in all 5037. No tick of these runs failed `Inventory` but those of the imitated
+cheats of the test of the screens and of the clicks in the test of the disablers, and no player was kicked.
+
+In the final runs before these, those with the sandbox's player looking along its own yaw, the probe of the view's turns
+broke a block of the floor behind its wall through a hole in it, and the walking player of the test of the screens fell
+through it in ten of that test's steps, which matched or failed `Inventory` all the same; the probe now fills the floor
+again before every step and at its end, and the steps of these runs kept to the floor. Their run of the courses with
+repeated ticks ran on a build that already had `setbacks.type`: the restart of the server for it built the plugin from
+the working tree, where those changes already were.
+
 ## Responses
 
 Every `MISMATCHED` tick names the checks it failed, each with what exactly failed; a tick can fail several at once.
@@ -675,8 +700,9 @@ The server turns the player without the mouse (`ClientboundPlayerLookAtPacket`, 
 `ClientPacketListener.handleLookAt` does, a teleport and `ClientboundPlayerRotationPacket`), and so does a new player
 after a login or a respawn; a tick after one of them is not checked for turns, and neither is a tick of a riding player,
 whose vehicle turns it during the tick. With `setback` on, a tick that fails `Inventory` is set back like one that fails
-`Simulation` (see "Setbacks"). The clicks themselves go on to the server: they are neither movement nor one of the
-actions held for their tick, and a vanilla client clicks in an open screen as well.
+`Simulation`, but always back where the server has the player (see "Setbacks"): the simulation moved the player with
+the keys and turns the cheat kept working. The clicks themselves go on to the server: they are neither movement nor
+one of the actions held for their tick, and a vanilla client clicks in an open screen as well.
 
 Limits:
 
@@ -963,10 +989,22 @@ and late, passed as before.
 ### Setbacks
 
 A tick that fails a check whose `setback` is on (every check but `SimulationFailure` by default) is set back: its
-movement never reaches the server, and the client is put back where the server has the player. The checks of the
-actions (`Reach`, `Hitbox`, `Interaction`, `FastBreak`, `NoSwing`) move nobody: their `setback` keeps the action that
-failed from the server instead (see "Attacks and interactions", "Blocks and items" and "Swings").
+movement never reaches the server, and the client is put where `setbacks.type` says. The checks of the actions (`Reach`,
+`Hitbox`, `Interaction`, `FastBreak`, `NoSwing`) move nobody: their `setback` keeps the action that failed from the
+server instead (see "Attacks and interactions", "Blocks and items" and "Swings").
 
+- `predicted`, the default, puts the player where the simulation moved it in the failed tick: where a vanilla client
+  with the same keys and rotation would have ended that tick, with the velocity it would have had then. The server gets
+  that as the tick's movement, in the place of the client's own, so that a cheat that stops its fall or keeps its height
+  is moved on as a vanilla client moves (a Fly that hovers falls), and one that moves farther or elsewhere gets no
+  further than a vanilla client. `server` puts the player back where the server has it, which the failed tick's movement
+  never reached: the player stays where its last tick that passed left it, in the air as well.
+- Whatever the type, a setback goes back where the server has the player when where the simulation moved it is no
+  vanilla outcome or would undo what the server did: when the tick failed a check that puts the client's inputs
+  themselves in doubt (`BadPackets`, `TickRate`, `Timer`, `Pings`, `Inventory` or `SimulationFailure`), since the
+  simulation moved the player with those inputs as well; when a teleport, respawn or configuration of the server was on
+  its way to the client while the tick ran; and when the server put the player somewhere itself after the tick ended (a
+  teleport, Paper's own corrections of a movement that moved wrongly included, or a respawn).
 - The server applies the client's movement only once the simulation has judged its tick. From a tick's first movement
   packet on (a position, rotation or ground update of the player, or a vehicle position), or from its first action (an
   attack, an interaction with an entity, a block action, an item use or a hotbar slot), ClauAC keeps the client's
@@ -975,13 +1013,24 @@ failed from the server instead (see "Attacks and interactions", "Blocks and item
   held, and waits behind what is held otherwise, so that the server gets everything in its order. The packets go on
   from PacketEvents' decoder, past every packet listener, as if they arrived just then.
 - The movement packets of a failed tick are thrown away, and so are those of every tick after it until the client has
-  taken a correction: a teleport to where the server has the player, which keeps the client's own rotation and gives
-  it the velocity it had when the failed tick began (none when the server has the player elsewhere by now). When the
-  player steers a vehicle, the correction puts the vehicle where the server has it, as the server does after a vehicle
-  moved wrongly, and stops it: that packet carries no velocity, and the client's and the simulation's would differ
-  otherwise. The correction goes out in one of ClauAC's own bundles, so that the pong to the ping behind it shows when
-  the client has taken it; the client's answer to ClauAC's teleport goes no further than the simulation. The server
-  is not involved at all: it never saw the movement that was thrown away.
+  taken a correction: a teleport that keeps the client's own rotation, to where the simulation moved the player with the
+  velocity it ended the tick with, or back to where the server has the player with the velocity it had when the failed
+  tick began (none when the server has the player elsewhere by now). A setback to where the simulation moved the player
+  gives the server that movement right before the failed tick's end, as the client sends its own
+  (`LocalPlayer.sendPosition`: the position, and whether the player ended the tick on the ground and against a wall),
+  and the server applies it like any other, its own checks included; a setback back to where the server has the player
+  leaves the server out, as it never saw the movement that was thrown away. The server takes one position per client
+  tick and disconnects a client that sends another before its tick end
+  (`ServerGamePacketListenerImpl.handleMovePlayer`). When the failed tick's end packet went on before the verdict, as it
+  does when nothing of the tick was held, that movement goes into the client tick the server is in by then, whose own
+  positions are thrown away, and it waits for the next client tick when that one has a position already. When the player
+  steers a vehicle, the correction puts the vehicle where the simulation moved it, with the simulation's rotation, or
+  back where the server has it, as the server itself does after a vehicle moved wrongly; a setback to where the
+  simulation moved it gives the server the vehicle's move as the client sends it (`LocalPlayer.sendChanges`). That
+  correction carries no velocity, so another packet gives the vehicle the simulation's velocity, or none where the
+  server has it: the client's and the simulation's would differ otherwise. The correction goes out in one of ClauAC's
+  own bundles, so that the pong to the ping behind it shows when the client has taken it; the client's answer to
+  ClauAC's teleport goes no further than the simulation.
 - The client answers a teleport with its acceptance, which carries its resulting position
   (`ClientPacketListener.handleMovePlayer`), and a movement cheat that changes the positions the client sends changes
   that one too. A coordinate the teleport sets outright is the teleport's on every client
@@ -997,21 +1046,25 @@ failed from the server instead (see "Attacks and interactions", "Blocks and item
 - When the simulation falls behind, the packets go on unjudged once the oldest has waited `setbacks.maximum-hold-millis`
   (a second by default), or once more than 2048 packets or 4 MiB are held. The packets of a connection that started
   while the vanilla runtime was starting are never held, since the simulation does not see all of them. The server
-  then applies movement that may turn out to fail. Such a setback teleports the player back to where the failed tick
-  began, on the server (`Player#teleport`, cause `UNKNOWN`), unless the server put the player somewhere itself after
-  that tick began (a teleport or a respawn), which the setback would undo, or such a setback of an earlier tick
-  teleported the player back after this tick ended (see above). A plugin can cancel that teleport; the log says so
-  then. Vehicle movement that reached the server this way stays: the vehicle is only put back where the server has it.
+  then applies movement that may turn out to fail. Such a setback teleports the player on the server
+  (`Player#teleport`, cause `UNKNOWN`) to where the simulation moved it in the failed tick, or back to where that tick
+  began, as `setbacks.type` says, unless the server put the player somewhere itself after that tick began (a teleport
+  or a respawn), which the setback would undo, or such a setback of an earlier tick teleported the player after this
+  tick ended (see above). A plugin can cancel that teleport; the log says so then. Vehicle movement that reached the
+  server this way stays, whatever the type: the vehicle is only put back where the server has it.
 - A dead or sleeping player is not set back, and neither is a rider that did not steer its vehicle, whose position the
   server decides.
 
-Every setback is logged. `/clauac status` adds a line per connection with the packets held so far and for how long,
-the movement packets and the actions kept from the server, the block predictions taken back, how often packets went
-on unjudged, and the setbacks by kind.
+Every setback is logged, with where it puts the player. `/clauac status` adds a line per connection with the packets
+held so far and for how long, the movement packets and the actions kept from the server, the block predictions taken
+back, how often packets went on unjudged, and the setbacks by kind: corrections to where the simulation moved the
+player, with the movement packets the server got in place of the client's, corrections back to where the server had
+it, teleports on the server, and setbacks left out.
 
-Setbacks were tried in game with a proxy between the client and the server that shifted the positions in the
-client's movement packets for three seconds while the player moved on, as a movement cheat would, and with the
-server's own position of the player sampled with `data get entity` in the meantime:
+Setbacks back to where the server has the player, the only kind before `setbacks.type`, were tried in game with a
+proxy between the client and the server that shifted the positions in the client's movement packets for three seconds
+while the player moved on, as a movement cheat would, and with the server's own position of the player sampled with
+`data get entity` in the meantime:
 
 - Walking east with positions reported 2 blocks higher, the ticks with a shifted position failed `Simulation` and the
   client was put back again and again: for the whole three seconds of walking it got no further than 0.12 to 0.87
@@ -1039,6 +1092,55 @@ server's own position of the player sampled with `data get entity` in the meanti
   of the tick before, shifted 4 blocks ahead. That moved the server's position of the player from 98.5 to 102.6 in one
   of two runs. Such ticks are left out now (see above), and in three runs the server's position stayed where it was;
   7, 3 and 2 setbacks were left out as ticks that ended before a teleport of the server went out.
+
+With `setbacks.type`, the same test ran with each type; the boat now steers east for half a second only before its
+positions are shifted, since it had reached the pool's bank by then and stood there whatever the setbacks did. With
+`predicted`, the server's position of the player followed the walk over the floor as a vanilla client walks: from 107.33
+to 112.27 blocks east, at a height of 100.0, while positions were reported 2 blocks higher, and from 98.50 to 102.99
+while they were reported 4 blocks ahead; the boat went from 133.96 to 140.90 while it was reported 3 blocks ahead. Both
+moved more slowly than the client: each correction takes the client back to where the failed tick ended, and the ticks
+it played before it took the correction never reach the server. No sample showed a shifted position. All 56 shifted
+answers to the corrections failed `Simulation`, and 26 answers of the boat failed `Vehicle`. The 85 setbacks were 58
+teleports and 27 vehicle corrections to where the simulation had moved the player, with as many movement packets in
+place of the client's, and Paper's movement checks saw nothing. With `server`, the server's position stayed at 108.17,
+at 98.50 and, for the boat, at 134.21 while the positions were shifted, as before; the 86 setbacks were 60 teleports and
+26 vehicle corrections back to where the server had it.
+
+With `setbacks.maximum-hold-millis` at 1 and the answers left alone, the packets went on unjudged 105 and 95 times. With
+`predicted`, the server's position followed the walk again, from 107.22 to 110.08 and from 98.50 to 101.26 blocks east,
+and never showed a shifted one: of the 58 setbacks, 35 were teleports on the server to where the simulation had moved
+the player, 22 corrections to there where the verdict came first after all, and one went back to where the server had
+the player, which a teleport of the server had moved since that tick began. With `server`, the server's position stayed
+at 107.34 and 98.50; the 59 setbacks were 33 teleports on the server back to where the failed tick began and 26
+corrections back to where the server had the player, and one was left out as a tick that ended before a teleport of the
+server went out.
+
+A player reported that a Fly cheat turned on in the air kept it hovering there. A proxy between the client and the
+server imitated two kinds: it sent the client alone an abilities packet that lets it fly, so that the vanilla client
+flew with the vanilla flight physics while the server and the sandbox took it for a player that cannot, and it put the
+height the client had last reported into all of its positions, as a cheat that cancels its fall does. No tick of a held
+height matches, so with `server` no movement reached the server, which kept the player at the height it had when the
+cheat began, 109.89, in all 16 samples of the hover, taken half a second apart, and in all 8 while it flew forward,
+which did not move it either; the server never kicked the player for floating. With `predicted`, the server got the fall
+of every failed tick, and its position came down from 109.31 to the floor within a second and stayed there; flying
+forward with the height still held moved the player over the floor as a vanilla client walks, from 112.50 to 120.01
+blocks east. The hover of the abilities came down with both types, in half a second with `predicted` and in a second and
+a half with `server`: each correction of `server` gives the client the velocity it had when its tick began, and the
+first tick after it moves a flying player as far as a falling one, since `Player.travel` damps the velocity of a flying
+player only after the move, so that this tick matches and takes the server's position one tick of the fall further down.
+Once on the floor, the vanilla client stops flying (`LocalPlayer.aiStep`), and its walk matched.
+
+The first build with `predicted` sent the server the simulation's movement right away when the failed tick's end packet
+had gone on before the verdict, and when the correction came back quickly, the client's own position of the next tick
+reached the server in the same client tick: after 7 seconds of a held height, the server disconnected the player
+("Invalid move player packet received"). Since that movement takes the position of the client tick it goes into (see
+above), the same test ran through, and no other test ended with a kick.
+
+A `config.yml` of an earlier version, without `setbacks.type` and without `alerts.format`, read without a warning and
+gave setbacks to where the simulation moved the player and alerts in the default format. Text values had been read with
+`getString(path, "")`, which ignores the defaults (`MemorySection.get(String, Object)`), so that an `alerts.format`
+missing from the file gave empty alerts; they now take the default as true and false and numbers do. The value `bogus`
+for `setbacks.type` was ignored with a warning, and setbacks were to where the simulation moved the player.
 
 ### Alerts
 
@@ -1076,6 +1178,8 @@ reads it again while the server runs.
 | `alerts.interval-millis`       | `1000`      | At most one alert per player and check within this many milliseconds       |
 | `alerts.format`                | (see above) | The alert in MiniMessage, with `%player%`, `%check%`, `%detail%`, `%tick%` |
 |                                |             | (the client tick) and `%count%` filled in                                  |
+| `setbacks.type`                | `predicted` | Where a setback puts the player: `predicted` where the simulation moved it |
+|                                |             | in the failed tick, `server` back where the server has it (see "Setbacks") |
 | `setbacks.maximum-hold-millis` | `1000`      | How long the client's packets wait for their tick's verdict at most        |
 | `checks.<name>.alert`          | `true`      | Whether failing the check of that name (see the table above) alerts        |
 | `checks.<name>.setback`        | `true`      | Whether failing it sets the player back; `false` for `SimulationFailure`,  |

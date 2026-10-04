@@ -108,7 +108,10 @@ Findings from running the official 26.3 client in a cloud container without a GP
   current client tick, run `clauac status` on the console, which prints a line with the outcomes of every connection
   and, for a simulated one, a second line with what its simulation costs.
 - **Rebuilding:** `runServer` loads the plugin jar straight from `build/libs`. Building while the server runs replaces
-  the jar under it and later fails with `NoClassDefFoundError`, so stop the server before building.
+  the jar under it and later fails with `NoClassDefFoundError`, so stop the server before building. `runServer` builds
+  that jar from the working tree first, and so does every start of the server through Gradle, the restart of a
+  validation part with a system property included: a validation of a commit runs with nothing else in the working tree,
+  or its later parts test other code (one such restart put uncommitted changes into the last part of a validation).
 - **System properties:** the container already sets `JAVA_TOOL_OPTIONS` for its HTTPS proxy, so add ClauAC's
   properties to it instead of replacing it, e.g.
   `JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Dclauac.verifyRepeatedTicks=true" ./gradlew runServer`.
@@ -122,7 +125,10 @@ Findings from running the official 26.3 client in a cloud container without a GP
   keyboard with `xdotool windowfocus`.
 - **Test world:** blocks placed by earlier tests stay in the world and get in the way of later courses (a leftover
   furnace swallowed the clicks meant for a chest). Clear them before a recording, for example with
-  `fill <from> <to> minecraft:air replace <block>`, which leaves the course itself alone.
+  `fill <from> <to> minecraft:air replace <block>`, which leaves the course itself alone. Tests that break blocks can
+  break the floor as well: through the holes the flick probe broke in its wall, the crosshair reached the floor behind
+  it, and the players of the next tests fell through the block it broke there.
+  `fill <from> <to> minecraft:stone replace minecraft:air` over the floor reports how many of its blocks were missing.
 - **config.yml of the dev server:** `saveDefaultConfig` never overwrites `run/plugins/ClauAC/config.yml`, so after a
   new setting was added the file lacks it and the setting takes its default. Delete the file before starting the
   server to get the current one with its comments.
@@ -135,7 +141,25 @@ Findings from running the official 26.3 client in a cloud container without a GP
   its resulting position after the teleport's id and which such a proxy has to shift as well to imitate the cheat.
   With `setbacks.maximum-hold-millis` at 1, shifted answers reach the server unjudged; with the 26.2 client, whose
   answer is a movement packet, they kept the player floating over the floor, and the server kicked it after 80 ticks
-  (`ServerGamePacketListenerImpl.tick`), so the late test leaves the answers alone.
+  (`ServerGamePacketListenerImpl.tick`), so the late test leaves the answers alone. A vanilla 26.3 server takes one
+  movement packet with a position per client tick and disconnects a client that sends another before its tick end
+  (`ServerGamePacketListenerImpl.handleMovePlayer`, `receivedPositionThisTick`, which `handleClientTickEnd` resets), and
+  a packet ClauAC sends the server in the client's stead counts as well: a setback to where the simulation moved the
+  player once got the player kicked with "Invalid move player packet received".
+- **Testing Fly cheats:** the proxy's `inject-clientbound <hex>` sends the client alone a clientbound play packet, which
+  neither the server nor the sandbox sees. An abilities packet (`minecraft:player_abilities`: a byte of flags, flying 2
+  and may fly 4, then the flying and the walking speed as floats, 0.05 and 0.1 by default,
+  `ClientboundPlayerAbilitiesPacket.write`) lets the vanilla client fly with the vanilla flight physics, as a cheat that
+  sets its own abilities does, while the server and the sandbox take it for a player that cannot fly; `hold-y on` puts
+  the height the client reported last into every position it sends, as a cheat that cancels its fall does. With setbacks
+  back to where the server has the player (`setbacks.type: server`), no tick of a held height matches and no movement
+  reaches the server, whose position stays where the last tick that passed left it, in the air, for as long as the cheat
+  holds the height; the server never kicks the player for floating. A hover of the abilities comes down even so: each
+  correction gives the client the velocity it had when its tick began, and the first tick after it moves a flying player
+  as far as a falling one, since `Player.travel` damps a flying player's velocity only after the move; that tick
+  matches, and its movement takes the server's position one tick of the fall further down. With setbacks to where the
+  simulation moved the player (`predicted`, the default), the server gets the fall of every failed tick, and a held
+  height came down to the floor within a second; `fly_hover_test.sh` checks both.
 - **Testing disablers:** a cheat that leaves the sandbox unsure of what the client did, so that the tick's movement goes
   unchecked, has to be tested the way a cheat uses it. The proxy's `after-tick-end` sends its packet behind every tick
   end, where it leads the next tick's key handling, from a second before the shifted positions start, and the answers

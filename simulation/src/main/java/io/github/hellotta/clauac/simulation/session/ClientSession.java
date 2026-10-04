@@ -522,6 +522,7 @@ public final class ClientSession implements PlayerSimulation {
         return new ClientTickReport(
                 this.clientTick, TickOutcome.MISMATCHED,
                 Double.NaN, Double.NaN, Double.NaN, false, false, false,
+                Double.NaN, Double.NaN, Double.NaN,
                 false, Double.NaN, Double.NaN, Double.NaN, false, false, false,
                 Double.NaN, null, ClientTickReport.Start.none(repositionPending), rejections, notes
         );

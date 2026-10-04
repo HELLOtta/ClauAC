@@ -13,6 +13,14 @@ alerts:
   format: "<dark_gray>[<aqua>ClauAC</aqua>]</dark_gray> <white>%player%</white> <gray>failed</gray> <red>%check%</red> <dark_gray>x%count%</dark_gray> <gray>%detail%</gray>"
 
 setbacks:
+  # - Where a setback puts the player. predicted: where the simulation moved it in the tick that failed, which is -
+  # - where a vanilla client with the same keys and rotation would be; the server gets that as the tick's movement, -
+  # - so that a cheat that stops its fall or cuts its movement short is moved on as a vanilla client moves (a Fly -
+  # - that hovers falls). server: back where the server has the player, which the failed tick's movement never -
+  # - reached, so that the player stays where its last tick that passed left it. A tick that failed BadPackets, -
+  # - TickRate, Timer, Pings, Inventory or SimulationFailure, which put the client's inputs themselves in doubt, -
+  # - always goes back where the server has the player -
+  type: predicted
   # - The server applies a tick's movement only once the simulation has checked that tick, so that a setback never -
   # - has to undo anything on the server. The client's packets wait for that from the tick's first movement packet -
   # - on, at most this many milliseconds; when the simulation falls further behind, they go on unchecked, and a -
@@ -20,9 +28,9 @@ setbacks:
   maximum-hold-millis: 1000
 
 # - What ClauAC does when a client tick fails a check, per check. alert: whether players with alerts on hear of it. -
-# - setback: for a check of the movement, whether the tick's movement is thrown away and the client put back where -
-# - the server has the player; for a check of the actions (Reach, Hitbox, Interaction, FastBreak, NoSwing), whether -
-# - the action that failed it is kept from the server, and the client takes back the blocks it changed with it -
+# - setback: for a check of the movement, whether the tick's movement is thrown away and the client put back as -
+# - setbacks.type says; for a check of the actions (Reach, Hitbox, Interaction, FastBreak, NoSwing), whether the -
+# - action that failed it is kept from the server, and the client takes back the blocks it changed with it -
 checks:
   # - The player did not move the way the vanilla client moves it -
   Simulation:

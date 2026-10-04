@@ -16,6 +16,11 @@ public record ClientTickReport(
         boolean predictedOnGround,
         boolean predictedHorizontalCollision,
         boolean predictedSprinting,
+        // - The player's velocity when the tick ended, as the simulation moved it, which the vanilla client's next -
+        // - tick starts from (Entity.getDeltaMovement); NaN when the tick was not simulated -
+        double predictedVelocityX,
+        double predictedVelocityY,
+        double predictedVelocityZ,
         // - false when the client sent no position this tick (it only does so after moving more than 2.0E-4 -
         // - blocks or every 20 ticks, and never while riding); the reported fields then repeat the last reported -
         // - position -
@@ -69,6 +74,10 @@ public record ClientTickReport(
             float predictedYRot,
             float predictedXRot,
             boolean predictedOnGround,
+            // - The vehicle's velocity when the tick ended, as the simulation moved it (Entity.getDeltaMovement) -
+            double predictedVelocityX,
+            double predictedVelocityY,
+            double predictedVelocityZ,
             // - false when the client sent no vehicle position this tick; the reported fields are then NaN and false -
             boolean positionReported,
             double reportedX,
@@ -80,6 +89,12 @@ public record ClientTickReport(
             // - Distance between the predicted and the reported position; NaN when none was reported -
             double offset
     ) {
+
+        // - Whether the simulation's end of the vehicle is known: its position, rotation and velocity -
+        private boolean predictionKnown() {
+            return allFinite(this.predictedX, this.predictedY, this.predictedZ, this.predictedYRot, this.predictedXRot,
+                    this.predictedVelocityX, this.predictedVelocityY, this.predictedVelocityZ);
+        }
     }
 
     public ClientTickReport {
@@ -88,6 +103,30 @@ public record ClientTickReport(
         if (flags.isEmpty() == (outcome == TickOutcome.MISMATCHED)) {
             throw new IllegalArgumentException("a " + outcome + " tick with the flags " + flags);
         }
+    }
+
+    // - Whether the simulation moved the player in this tick as a vanilla client moves it with the same inputs, so -
+    // - that the end of the tick is somewhere a vanilla client could be: the tick was simulated, where it ended is -
+    // - known (position and velocity, and those of the vehicle the player steered), and it failed no check that puts -
+    // - the inputs themselves in doubt (Check.doubtsInputs). A setback can then put the player there instead of back -
+    // - where the tick began -
+    public boolean predictionUsable() {
+        if (this.flags.stream().anyMatch(flag -> flag.check().doubtsInputs())) {
+            return false;
+        }
+        if (!allFinite(this.predictedX, this.predictedY, this.predictedZ, this.predictedVelocityX, this.predictedVelocityY, this.predictedVelocityZ)) {
+            return false;
+        }
+        return this.vehicle == null || this.vehicle.predictionKnown();
+    }
+
+    private static boolean allFinite(double... values) {
+        for (double value : values) {
+            if (!Double.isFinite(value)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // - The same tick with a further note -
@@ -115,6 +154,7 @@ public record ClientTickReport(
         return new ClientTickReport(
                 this.clientTick, newOutcome,
                 this.predictedX, this.predictedY, this.predictedZ, this.predictedOnGround, this.predictedHorizontalCollision, this.predictedSprinting,
+                this.predictedVelocityX, this.predictedVelocityY, this.predictedVelocityZ,
                 this.positionReported, this.reportedX, this.reportedY, this.reportedZ, this.reportedOnGround, this.reportedHorizontalCollision, this.reportedSprinting,
                 this.offset, this.vehicle, this.start, newFlags, newNotes
         );

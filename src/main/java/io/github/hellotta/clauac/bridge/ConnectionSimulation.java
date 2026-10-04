@@ -9,8 +9,11 @@ import com.github.retrooper.packetevents.protocol.packettype.PacketType;
 import com.github.retrooper.packetevents.protocol.packettype.PacketTypeCommon;
 import com.github.retrooper.packetevents.protocol.player.User;
 import com.github.retrooper.packetevents.protocol.teleport.RelativeFlag;
+import com.github.retrooper.packetevents.protocol.world.Location;
 import com.github.retrooper.packetevents.util.Vector3d;
 import com.github.retrooper.packetevents.wrapper.PacketWrapper;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerFlying;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientVehicleMove;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerAcknowledgeBlockChanges;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerBundle;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityVelocity;
@@ -18,6 +21,7 @@ import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPi
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerPositionAndLook;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerVehicleMove;
 import io.github.hellotta.clauac.response.Responses;
+import io.github.hellotta.clauac.response.SetbackType;
 import io.github.hellotta.clauac.response.TickResponse;
 import io.github.hellotta.clauac.simulation.api.ClientTickReport;
 import io.github.hellotta.clauac.simulation.api.Flag;
@@ -59,9 +63,10 @@ import org.slf4j.Logger;
 // - The client's movement and actions reach the server only once the simulation has judged their tick (see -
 // - TickHold). An action that fails a check never reaches it, and the client takes back what it predicted of it. A -
 // - tick that is to be set back loses its movement, and so does every tick after it until the client has taken a -
-// - correction: a teleport to where the server has the player, or, when it steers a vehicle, the vehicle's position -
-// - as the server has it (see Setbacks). The correction goes out in one of the connection's own bundles, so that -
-// - the pong to the ping behind it shows when the client has taken it. -
+// - correction: a teleport, or, when it steers a vehicle, a move of the vehicle, either to where the simulation moved -
+// - it in the failed tick, which the server then gets as that tick's movement, or to where the server has it (see -
+// - setbacks.type and Setbacks). The correction goes out in one of the connection's own bundles, so that the pong to -
+// - the ping behind it shows when the client has taken it. -
 // -
 // - Everything except the getters runs on the connection's event loop, where all of its packets are handled one -
 // - after another -
@@ -166,10 +171,19 @@ final class ConnectionSimulation {
     // - (TickEnd.serverboundPackets): the client played every tick that ended before it without that teleport, which -
     // - puts it somewhere anyway -
     private long serverTeleportAt = -1L;
+    // - Where the server's latest move of the vehicle the player steers went out among the serverbound packets, as it -
+    // - corrects a vehicle that moved wrongly (ServerGamePacketListenerImpl.handleMoveVehicle) -
+    private long serverVehicleMoveAt = -1L;
+    // - Where the end packet of the tick the setback under way is for came among the serverbound packets: a teleport -
+    // - or vehicle move of the server after it has put the player where the server has it, which a correction to -
+    // - where the simulation moved it would undo -
+    private long setbackTickEnd = -1L;
     // - Written on the event loop only; volatile for /clauac status -
     private volatile long setbacksRequested;
     private volatile long positionCorrections;
+    private volatile long predictedPositionCorrections;
     private volatile long vehicleCorrections;
+    private volatile long predictedVehicleCorrections;
     private volatile long serverTeleports;
     private volatile long setbacksSkipped;
     private volatile long predictionsAcknowledged;
@@ -292,6 +306,9 @@ final class ConnectionSimulation {
                 // - The connection's own corrections are sent silently and never come here -
                 this.serverTeleportAt = this.hold.handedOver();
             }
+            if (clientboundPlay && type == PacketType.Play.Server.VEHICLE_MOVE) {
+                this.serverVehicleMoveAt = this.hold.handedOver();
+            }
             if (held) {
                 this.hold.onServerbound(type, buffer, System.nanoTime(), this.responses.settings().maximumHoldNanos());
                 if (type == PacketType.Play.Client.CONFIGURATION_ACK) {
@@ -377,11 +394,16 @@ final class ConnectionSimulation {
     // - Sends one of the connection's own packets silently and hands it to the simulation in its place on the wire -
     private void writeOwnPacket(PacketWrapper<?> packet) {
         Object buffer = ChannelHelper.pooledByteBuf(this.user.getChannel());
+        writePacket(packet, buffer);
+        this.handOver(ProtocolPhase.PLAY, PacketDirection.CLIENTBOUND, packet.getNativePacketId(), ByteBufHelper.copyBytes(buffer));
+        this.user.sendPacketSilently(buffer);
+    }
+
+    // - Writes the packet's id and payload into the buffer, as they travel inside a frame, in the server's protocol -
+    private static void writePacket(PacketWrapper<?> packet, Object buffer) {
         packet.setBuffer(buffer);
         packet.writeVarInt(packet.getNativePacketId());
         packet.write();
-        this.handOver(ProtocolPhase.PLAY, PacketDirection.CLIENTBOUND, packet.getNativePacketId(), ByteBufHelper.copyBytes(buffer));
-        this.user.sendPacketSilently(buffer);
     }
 
     // - Ends the open bundle once the event loop has written what it was already asked to, so that one bundle and -
@@ -576,7 +598,9 @@ final class ConnectionSimulation {
         }
     }
 
-    // - The client's movement stops reaching the server now, and the server thread decides how to put the client back -
+    // - The client's movement stops reaching the server now, and the server thread decides how to put the client -
+    // - back. A setback to where the simulation moved the player gives the server that as the failed tick's movement, -
+    // - in the place of the tick's own, unless the tick's movement reached the server already -
     private void startSetback(ClientTickReport report, TickEnd end, boolean late) {
         if (!report.start().hasPosition() || this.user.getEncoderState() != ConnectionState.PLAY) {
             // - Without a player in a level there is nothing to put back -
@@ -584,14 +608,56 @@ final class ConnectionSimulation {
         }
         this.setbackPhase = SetbackPhase.REQUESTED;
         int generation = ++this.setbackGeneration;
+        this.setbackTickEnd = end.serverboundPackets();
         this.correctionAnsweredAt = -1L;
         this.failedAfterCorrection = null;
         this.setbacksRequested++;
         this.hold.setDroppingMovement(true);
+        SetbackRequest.PredictedEnd predicted = this.predictedEnd(report, late);
+        if (predicted != null && !late) {
+            this.hold.substituteMovement(end.serverboundPackets(), this.substituteMovement(report, predicted));
+        }
         SetbackRequest request = new SetbackRequest(
-                generation, report.clientTick(), describeChecks(report), report.vehicle() != null, report.start(), end.arrivalNanos(), late);
+                generation, report.clientTick(), describeChecks(report), report.vehicle() != null, report.start(), end.arrivalNanos(), late, predicted);
         if (!this.setbacks.request(this, request)) {
             this.setbackSkipped(generation);
+        }
+    }
+
+    // - Where the setback puts the player while setbacks.type is predicted: where the simulation moved it in the -
+    // - failed tick, as far as that is somewhere a vanilla client could be (ClientTickReport.predictionUsable) and -
+    // - the tick began with no teleport, respawn or configuration of the server on its way to the client, which would -
+    // - have moved the player after the start the simulation went on from. Null when the setback puts the player back -
+    // - where the server has it. A vehicle whose movement reached the server unjudged stays where the server has it -
+    // - (see Setbacks), so its prediction is of no use then -
+    private SetbackRequest.@Nullable PredictedEnd predictedEnd(ClientTickReport report, boolean late) {
+        if (this.responses.settings().setbackType() != SetbackType.PREDICTED || !report.predictionUsable() || report.start().repositionPending()) {
+            return null;
+        }
+        ClientTickReport.VehicleState vehicle = report.vehicle();
+        if (vehicle == null) {
+            return SetbackRequest.PredictedEnd.ofPlayer(report);
+        }
+        return late ? null : SetbackRequest.PredictedEnd.ofVehicle(vehicle);
+    }
+
+    // - The movement packet the server gets in place of the failed tick's own: the player's position packet with the -
+    // - simulation's position, ground and collision state, which LocalPlayer.sendPosition sends, or, when the player -
+    // - steered a vehicle, the vehicle's move with the simulation's position, rotation and ground state, which -
+    // - LocalPlayer.sendChanges sends (Entity.getClientPositionAndRotation). The player's rotation stays what the -
+    // - server has, as the rotation packets of the ticks that are set back are thrown away as well -
+    private byte[] substituteMovement(ClientTickReport report, SetbackRequest.PredictedEnd predicted) {
+        Vector3d position = new Vector3d(predicted.x(), predicted.y(), predicted.z());
+        ClientTickReport.VehicleState vehicle = report.vehicle();
+        PacketWrapper<?> packet = vehicle == null
+                ? new WrapperPlayClientPlayerFlying(true, false, report.predictedOnGround(), report.predictedHorizontalCollision(), new Location(position, 0.0F, 0.0F))
+                : new WrapperPlayClientVehicleMove(position, predicted.yRot(), predicted.xRot(), vehicle.predictedOnGround());
+        Object buffer = ChannelHelper.pooledByteBuf(this.user.getChannel());
+        try {
+            writePacket(packet, buffer);
+            return ByteBufHelper.copyBytes(buffer);
+        } finally {
+            ByteBufHelper.release(buffer);
         }
     }
 
@@ -600,35 +666,65 @@ final class ConnectionSimulation {
         return report.flags().stream().map(Flag::check).distinct().map(check -> check.displayName()).collect(Collectors.joining(", "));
     }
 
-    // - From the server thread: teleports the client to where the server has the player, with this velocity and its -
-    // - own rotation -
-    void correctPosition(int generation, double x, double y, double z, double velocityX, double velocityY, double velocityZ) {
+    // - From the server thread: teleports the client to this position with this velocity and its own rotation, which -
+    // - is where the server has the player, or, when predicted, where the simulation moved it in the failed tick -
+    void correctPosition(int generation, double x, double y, double z, double velocityX, double velocityY, double velocityZ, boolean predicted) {
         this.runInEventLoop(() -> {
-            if (!this.awaitsCorrection(generation)) {
+            if (!this.awaitsCorrection(generation) || predicted && this.serverRepositioned(generation, this.serverTeleportAt)) {
                 return;
             }
             this.writeCorrection(PacketType.Play.Server.PLAYER_POSITION_AND_LOOK, new WrapperPlayServerPlayerPositionAndLook(
                     this.nextTeleportId(), new Vector3d(x, y, z), new Vector3d(velocityX, velocityY, velocityZ), 0.0F, 0.0F,
                     RelativeFlag.YAW.or(RelativeFlag.PITCH)));
             this.correctionSent();
-            this.positionCorrections++;
+            if (predicted) {
+                this.predictedPositionCorrections++;
+            } else {
+                this.positionCorrections++;
+            }
         });
     }
 
-    // - From the server thread: puts the vehicle the client steers where the server has it, as the server itself -
-    // - does after a vehicle moved wrongly (ServerGamePacketListenerImpl.handleMoveVehicle), and stops it. That -
-    // - packet only moves the vehicle; its velocity would stay what the client had and what the simulation estimated -
-    // - from the rejected movement, which differ, so both are set to none (ClientPacketListener.handleSetEntityMotion) -
-    void correctVehicle(int generation, int vehicleId, double x, double y, double z, float yRot, float xRot) {
+    // - From the server thread: puts the vehicle the client steers at this position with this rotation, which is -
+    // - where the server has it, as the server itself puts a vehicle that moved wrongly -
+    // - (ServerGamePacketListenerImpl.handleMoveVehicle), or, when predicted, where the simulation moved it in the -
+    // - failed tick. That packet only moves the vehicle; its velocity would stay what the client had and what the -
+    // - simulation estimated from the rejected movement, which differ, so both get this velocity -
+    // - (ClientPacketListener.handleSetEntityMotion): none where the server has the vehicle, the simulation's where -
+    // - it moved it -
+    void correctVehicle(
+            int generation, int vehicleId, double x, double y, double z, float yRot, float xRot, double velocityX, double velocityY, double velocityZ,
+            boolean predicted
+    ) {
         this.runInEventLoop(() -> {
-            if (!this.awaitsCorrection(generation)) {
+            if (!this.awaitsCorrection(generation)
+                    || predicted && this.serverRepositioned(generation, Math.max(this.serverVehicleMoveAt, this.serverTeleportAt))) {
                 return;
             }
             this.writeCorrection(PacketType.Play.Server.VEHICLE_MOVE, new WrapperPlayServerVehicleMove(new Vector3d(x, y, z), yRot, xRot));
-            this.writeCorrection(PacketType.Play.Server.ENTITY_VELOCITY, new WrapperPlayServerEntityVelocity(vehicleId, Vector3d.zero()));
+            this.writeCorrection(PacketType.Play.Server.ENTITY_VELOCITY, new WrapperPlayServerEntityVelocity(vehicleId, new Vector3d(velocityX, velocityY, velocityZ)));
             this.correctionSent();
-            this.vehicleCorrections++;
+            if (predicted) {
+                this.predictedVehicleCorrections++;
+            } else {
+                this.vehicleCorrections++;
+            }
         });
+    }
+
+    // - Whether the server put the player somewhere itself after the failed tick ended: a teleport of the server, or -
+    // - a move of the vehicle the player steers, went out at this place among the serverbound packets, after the -
+    // - tick's end packet. That puts the client where the server has it, Paper's own corrections of a movement that -
+    // - moved wrongly included, which fire no event (ServerGamePacketListenerImpl.internalTeleport), and a correction -
+    // - to where the simulation moved the player would undo it, so the setback is over then -
+    private boolean serverRepositioned(int generation, long serverMoveAt) {
+        if (serverMoveAt < this.setbackTickEnd) {
+            return false;
+        }
+        this.logger.info("Not setting {} back to where the simulation moved it: the server put it somewhere itself after that tick", this.user.getName());
+        this.setbacksSkipped++;
+        this.endSetback(generation);
+        return true;
     }
 
     // - From the server thread: the server teleported the player itself (see Setbacks), and ignores the client's -
@@ -729,10 +825,13 @@ final class ConnectionSimulation {
         return String.format(Locale.ROOT,
                 "%s: %d packets held now, %d held so far for %.2f ms on average and at most %.1f ms, %d movement packets and "
                         + "%d actions kept from the server, %d block predictions taken back, %d times let go unjudged; %d setbacks: "
-                        + "%d teleports, %d vehicle corrections, %d teleports on the server, %d skipped",
+                        + "%d teleports and %d vehicle corrections to where the simulation moved the player, with %d movement packets "
+                        + "in place of the client's, %d teleports and %d vehicle corrections to where the server had it, %d teleports on "
+                        + "the server, %d skipped",
                 this.user.getName(), held.heldNow(), held.releasedPackets(), averageMillis, held.longestHoldNanos() / NANOS_PER_MILLISECOND,
                 held.droppedMovement(), held.droppedActions(), this.predictionsAcknowledged, held.unjudgedReleases(), this.setbacksRequested,
-                this.positionCorrections, this.vehicleCorrections, this.serverTeleports, this.setbacksSkipped);
+                this.predictedPositionCorrections, this.predictedVehicleCorrections, held.substitutedMovement(), this.positionCorrections,
+                this.vehicleCorrections, this.serverTeleports, this.setbacksSkipped);
     }
 
     private void keepWaiting(WaitingPacket packet) {

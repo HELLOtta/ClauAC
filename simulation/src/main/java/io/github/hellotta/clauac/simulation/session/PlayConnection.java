@@ -1662,6 +1662,7 @@ final class PlayConnection implements ClientContext {
         return new ClientTickReport(
                 clientTick, TickOutcome.MISMATCHED,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
+                Double.NaN, Double.NaN, Double.NaN,
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
                 Double.NaN, null, this.tickStart, rejections, notes
         );
@@ -3106,6 +3107,7 @@ final class PlayConnection implements ClientContext {
         return new ClientTickReport(
                 clientTick, rejections.isEmpty() ? TickOutcome.NOT_SIMULATED : TickOutcome.MISMATCHED,
                 tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), tickPlayer.onGround(), tickPlayer.horizontalCollision, tickPlayer.isSprinting(),
+                Double.NaN, Double.NaN, Double.NaN,
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
                 Double.NaN, null, this.tickStart, List.copyOf(rejections), notes
         );
@@ -3167,6 +3169,7 @@ final class PlayConnection implements ClientContext {
         boolean predictedOnGround = tickPlayer.onGround();
         boolean predictedHorizontalCollision = tickPlayer.horizontalCollision;
         boolean predictedSprinting = tickPlayer.isSprinting();
+        Vec3 predictedVelocity = tickPlayer.getDeltaMovement();
 
         this.lastSent.positionReminder += this.isCameraOnPlayer() ? 1 : 0;
         ReportedState reported = this.reportedState();
@@ -3211,6 +3214,7 @@ final class PlayConnection implements ClientContext {
         return new ClientTickReport(
                 clientTick, outcome,
                 predictedX, predictedY, predictedZ, predictedOnGround, predictedHorizontalCollision, predictedSprinting,
+                predictedVelocity.x, predictedVelocity.y, predictedVelocity.z,
                 positionReported, reportedX, reportedY, reportedZ, reportedOnGround, reportedHorizontalCollision, reportedSprinting,
                 offset, null, this.tickStart, verdict.flags(), notes
         );
@@ -3324,6 +3328,9 @@ final class PlayConnection implements ClientContext {
         boolean predictedOnGround = tickPlayer.onGround();
         boolean predictedHorizontalCollision = tickPlayer.horizontalCollision;
         boolean predictedSprinting = tickPlayer.isSprinting();
+        // - A rider whose vehicle the server moves goes where the server puts it, so the simulation knows no end of its -
+        // - own for it (see ClientTickReport.predictionUsable); one that steers ends where its vehicle takes it -
+        Vec3 predictedVelocity = steering ? tickPlayer.getDeltaMovement() : new Vec3(Double.NaN, Double.NaN, Double.NaN);
         // - What the player itself sends while riding, and what it sends for its vehicle -
         List<String> playerDifferences = new ArrayList<>();
         List<String> vehicleDifferences = new ArrayList<>();
@@ -3352,10 +3359,12 @@ final class PlayConnection implements ClientContext {
             PositionAndRotation predicted = vehicle.getClientPositionAndRotation();
             Vec3 predictedPosition = predicted.position();
             boolean predictedVehicleOnGround = vehicle.onGround();
+            Vec3 predictedVehicleVelocity = vehicle.getDeltaMovement();
             if (vehicleMove == null) {
                 vehicleDifferences.add("expected a vehicle position, none was sent");
                 vehicleState = new ClientTickReport.VehicleState(
                         vehicleType, predictedPosition.x, predictedPosition.y, predictedPosition.z, predicted.yRot(), predicted.xRot(), predictedVehicleOnGround,
+                        predictedVehicleVelocity.x, predictedVehicleVelocity.y, predictedVehicleVelocity.z,
                         false, Double.NaN, Double.NaN, Double.NaN, Float.NaN, Float.NaN, false, Double.NaN
                 );
             } else {
@@ -3372,6 +3381,7 @@ final class PlayConnection implements ClientContext {
                 }
                 vehicleState = new ClientTickReport.VehicleState(
                         vehicleType, predictedPosition.x, predictedPosition.y, predictedPosition.z, predicted.yRot(), predicted.xRot(), predictedVehicleOnGround,
+                        predictedVehicleVelocity.x, predictedVehicleVelocity.y, predictedVehicleVelocity.z,
                         true, reportedPosition.x, reportedPosition.y, reportedPosition.z, reportedVehicle.yRot(), reportedVehicle.xRot(), vehicleMove.onGround(),
                         predictedPosition.distanceTo(reportedPosition)
                 );
@@ -3426,6 +3436,7 @@ final class PlayConnection implements ClientContext {
         return new ClientTickReport(
                 clientTick, verdict.outcome(),
                 tickPlayer.getX(), tickPlayer.getY(), tickPlayer.getZ(), predictedOnGround, predictedHorizontalCollision, predictedSprinting,
+                predictedVelocity.x, predictedVelocity.y, predictedVelocity.z,
                 reported.positionReported(), reported.x(), reported.y(), reported.z(), reported.onGround(), reported.horizontalCollision(), reportedSprinting,
                 Double.NaN, vehicleState, this.tickStart, verdict.flags(), notes
         );

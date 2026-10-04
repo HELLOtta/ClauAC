@@ -13,9 +13,10 @@ import org.jspecify.annotations.Nullable;
 
 // - Keeps the client's play packets from the server from a tick's first movement packet or action until the -
 // - simulation has judged that tick, so that the server only applies movement and actions ClauAC has checked. It -
-// - throws the movement of a tick away when the tick is to be set back, and each action that failed a check. The -
-// - packets go on to the server in the order the client sent them: a packet a verdict cannot throw away goes on -
-// - right away while nothing is held, and otherwise waits behind what is held. -
+// - throws the movement of a tick away when the tick is to be set back, and each action that failed a check; a set -
+// - back tick's movement can be replaced by the one the simulation gave it (see substituteMovement). The packets go -
+// - on to the server in the order the client sent them: a packet a verdict cannot throw away goes on right away -
+// - while nothing is held, and otherwise waits behind what is held. -
 // - A held packet is copied and its buffer emptied, which the vanilla decoder after PacketEvents' passes over, and -
 // - it goes on later from PacketEvents' decoder, past every packet listener, as if it came just then. -
 // -
@@ -34,6 +35,13 @@ final class TickHold {
             PacketType.Play.Client.PLAYER_ROTATION,
             PacketType.Play.Client.PLAYER_FLYING,
             PacketType.Play.Client.VEHICLE_MOVE
+    );
+    // - The movement packets with a position: the server takes one of them per client tick and disconnects a client -
+    // - that sends another before its tick end (ServerGamePacketListenerImpl.handleMovePlayer, -
+    // - receivedPositionThisTick) -
+    private static final Set<PacketTypeCommon> POSITIONS = Set.of(
+            PacketType.Play.Client.PLAYER_POSITION,
+            PacketType.Play.Client.PLAYER_POSITION_AND_ROTATION
     );
     private static final Set<PacketTypeCommon> ACTIONS = Set.of(
             PacketType.Play.Client.ATTACK,
@@ -63,6 +71,11 @@ final class TickHold {
     private record Held(@Nullable PacketTypeCommon type, byte @Nullable [] packet, @Nullable Runnable marker, long sequence, long arrivedNanos) {
     }
 
+    // - Movement the server gets in place of a set back tick's own (see substituteMovement): the place of the tick's -
+    // - end packet among the serverbound packets (TickEnd.serverboundPackets) and the packet, id and payload -
+    private record Substitute(long tickEnd, byte[] packet) {
+    }
+
     // - What refuse kept from the server: the places of the refused actions that were still held, and whether one -
     // - of them used up or changed an item -
     record Refusal(Set<Long> packets, boolean itemRefused) {
@@ -71,7 +84,7 @@ final class TickHold {
     // - What the hold did so far, for /clauac status -
     record Statistics(
             int heldNow, long oldestHeldNanos, long releasedPackets, long holdNanos, long longestHoldNanos, long droppedMovement, long droppedActions,
-            long unjudgedReleases
+            long unjudgedReleases, long substitutedMovement
     ) {
     }
 
@@ -91,6 +104,17 @@ final class TickHold {
     private long droppedMovementThrough;
     // - The actions that failed a check, by their place among the serverbound packets; each never reaches the server -
     private final Set<Long> refused = new HashSet<>();
+    // - Substitutes waiting for the packets before their place to go on, in the order of their ticks -
+    private final Deque<Substitute> substitutes = new ArrayDeque<>();
+    // - What went to the server in the client tick the server is in, the one the next tick end the server gets ends: -
+    // - whether a position did (see POSITIONS), and whether a substitute's did. The server takes one position per -
+    // - client tick, so the client's own positions of that tick are thrown away after a substitute, and a substitute -
+    // - after any position waits for the next client tick -
+    private boolean positionInServerTick;
+    private boolean substituteInServerTick;
+    // - Substitutes that were to go to the server in a client tick that had a position already; each goes on right -
+    // - behind the next tick end the server gets -
+    private final Deque<byte[]> deferredSubstitutes = new ArrayDeque<>();
     // - Written on the event loop only; volatile for the server thread and /clauac status -
     private volatile long oldestHeldNanos;
     private volatile int heldNow;
@@ -100,6 +124,7 @@ final class TickHold {
     private volatile long droppedMovement;
     private volatile long droppedActions;
     private volatile long unjudgedReleases;
+    private volatile long substitutedMovement;
 
     // - Off until the connection turns out to be simulated from its start (see enable) -
     TickHold(User user) {
@@ -132,9 +157,17 @@ final class TickHold {
         }
         if (type == PacketType.Play.Client.CONFIGURATION_ACK) {
             this.releaseUnjudged();
+            // - The play phase ends here: a substitute still waiting for a client tick would reach the server in the -
+            // - configuration phase, and the next play phase starts with a client tick of its own -
+            this.forgetDeferredSubstitutes();
             return;
         }
-        if (this.held.isEmpty() && !JUDGED.contains(type)) {
+        // - A tick end that a deferred substitute waits for is held for a moment, so that the substitute goes on -
+        // - right behind it (see wentToServer) -
+        boolean substituteWaits = type == PacketType.Play.Client.CLIENT_TICK_END && !this.deferredSubstitutes.isEmpty();
+        if (this.held.isEmpty() && !JUDGED.contains(type) && !substituteWaits) {
+            // - The packet goes on to the server as it is -
+            this.wentToServer(type);
             return;
         }
         byte[] packet = ByteBufHelper.copyBytes(buffer);
@@ -188,6 +221,22 @@ final class TickHold {
         return new Refusal(Set.copyOf(kept), itemRefused);
     }
 
+    // - Sends the server this movement in place of the movement of a tick that is set back, where the client sends -
+    // - its own: right before the tick's end packet, at this place among the serverbound packets -
+    // - (TickEnd.serverboundPackets), once the packets before it went on, or right away when nothing from that place -
+    // - on is held any more, which puts it into the client tick the server is in by then. The server takes one -
+    // - position per client tick (see POSITIONS): the client's own positions in the client tick of a substitute are -
+    // - thrown away, and a substitute for a client tick that has a position already waits for the next. No verdict -
+    // - throws it away, and nothing hands it to the simulation, which only follows what the client itself sent -
+    void substituteMovement(long tickEnd, byte[] packet) {
+        Held head = this.held.peekFirst();
+        if (head == null || head.sequence() > tickEnd) {
+            this.sendSubstitute(packet);
+            return;
+        }
+        this.substitutes.addLast(new Substitute(tickEnd, packet));
+    }
+
     // - Runs the action once everything held now went on: right away when nothing is held -
     void mark(Runnable action, long now) {
         if (this.held.isEmpty()) {
@@ -206,9 +255,12 @@ final class TickHold {
         }
     }
 
-    // - The simulation stopped: whatever is held goes on, and nothing is held any more -
+    // - The simulation stopped: whatever is held goes on, and nothing is held any more. A substitute still waiting -
+    // - for a client tick goes nowhere: once nothing is held, the client's own positions reach the server unchecked, -
+    // - and it could no longer keep to the server's one position per client tick -
     void disable() {
         this.releaseUnjudged();
+        this.forgetDeferredSubstitutes();
         this.enabled = false;
     }
 
@@ -216,6 +268,8 @@ final class TickHold {
     void close() {
         this.held.clear();
         this.refused.clear();
+        this.substitutes.clear();
+        this.forgetDeferredSubstitutes();
         this.heldBytes = 0L;
         this.enabled = false;
         this.updateOldest();
@@ -228,7 +282,7 @@ final class TickHold {
 
     Statistics statistics() {
         return new Statistics(this.heldNow, this.oldestHeldNanos, this.releasedPackets, this.holdNanos, this.longestHoldNanos,
-                this.droppedMovement, this.droppedActions, this.unjudgedReleases);
+                this.droppedMovement, this.droppedActions, this.unjudgedReleases, this.substitutedMovement);
     }
 
     // - The packets at the head go on as far as the verdicts allow: everything through the last judged tick, and -
@@ -238,6 +292,10 @@ final class TickHold {
         while ((head = this.held.peekFirst()) != null
                 && (head.sequence() <= this.judgedThrough || head.type() == null || !JUDGED.contains(head.type()))) {
             this.release(this.held.removeFirst(), now);
+        }
+        if (this.held.isEmpty()) {
+            // - Nothing a substitute could still have to wait for is held: its tick's end went on with the rest -
+            this.releaseSubstitutesThrough(Long.MAX_VALUE);
         }
         this.updateOldest();
     }
@@ -254,11 +312,13 @@ final class TickHold {
             this.unjudgedThrough = Math.max(this.unjudgedThrough, entry.sequence());
             this.release(entry, now);
         }
+        this.releaseSubstitutesThrough(Long.MAX_VALUE);
         this.unjudgedReleases++;
         this.updateOldest();
     }
 
     private void release(Held entry, long now) {
+        this.releaseSubstitutesThrough(entry.sequence());
         Runnable marker = entry.marker();
         if (marker != null) {
             marker.run();
@@ -277,10 +337,65 @@ final class TickHold {
             this.droppedMovement++;
             return;
         }
+        if (this.substituteInServerTick && POSITIONS.contains(entry.type())) {
+            // - The server took a substitute's position in this client tick already -
+            this.droppedMovement++;
+            return;
+        }
         if (ACTIONS.contains(entry.type()) && this.refused.remove(entry.sequence())) {
             this.droppedActions++;
             return;
         }
+        this.sendToServer(packet);
+        if (POSITIONS.contains(entry.type())) {
+            this.positionInServerTick = true;
+        }
+        this.wentToServer(entry.type());
+    }
+
+    // - The substitutes whose tick ended with or before this place among the serverbound packets go on first -
+    private void releaseSubstitutesThrough(long sequence) {
+        Substitute next;
+        while ((next = this.substitutes.peekFirst()) != null && next.tickEnd() <= sequence) {
+            this.sendSubstitute(this.substitutes.removeFirst().packet());
+        }
+    }
+
+    // - A substitute goes on now unless the client tick the server is in has a position already -
+    private void sendSubstitute(byte[] packet) {
+        if (this.positionInServerTick) {
+            this.deferredSubstitutes.addLast(packet);
+            return;
+        }
+        this.sendToServer(packet);
+        this.substitutedMovement++;
+        this.positionInServerTick = true;
+        this.substituteInServerTick = true;
+    }
+
+    // - The server got a packet of this type. A tick end ends the client tick the server is in, and the oldest -
+    // - substitute waiting for the next one goes on right behind it -
+    private void wentToServer(@Nullable PacketTypeCommon type) {
+        if (type != PacketType.Play.Client.CLIENT_TICK_END) {
+            return;
+        }
+        this.positionInServerTick = false;
+        this.substituteInServerTick = false;
+        byte[] deferred = this.deferredSubstitutes.pollFirst();
+        if (deferred != null) {
+            this.sendSubstitute(deferred);
+        }
+    }
+
+    // - Neither a substitute nor a client tick of the server is in play any more -
+    private void forgetDeferredSubstitutes() {
+        this.deferredSubstitutes.clear();
+        this.positionInServerTick = false;
+        this.substituteInServerTick = false;
+    }
+
+    // - The packet goes on from PacketEvents' decoder, past every packet listener, as if it came just then -
+    private void sendToServer(byte[] packet) {
         Object buffer = ChannelHelper.pooledByteBuf(this.user.getChannel());
         ByteBufHelper.writeBytes(buffer, packet);
         this.user.receivePacketSilently(buffer);

@@ -11,22 +11,26 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.plugin.IllegalPluginAccessException;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
 // - Sets players back on the server thread, where the server's own position of the player can be read. A tick whose -
-// - movement never reached the server (see TickHold) only needs the client put back where the server still has the -
-// - player: the connection teleports the client there with a packet of its own, keeping the client's rotation, and -
-// - the server is not involved. When the player steers a vehicle, the connection puts the vehicle back where the -
-// - server has it. -
+// - movement never reached the server (see TickHold) only needs the client put somewhere the server agrees with: the -
+// - connection teleports the client with a packet of its own, keeping the client's rotation, either to where the -
+// - simulation moved the player in that tick (setbacks.type predicted), which the server got as the tick's movement -
+// - in place of the client's, or back to where the server still has the player. When the player steers a vehicle, -
+// - the connection puts the vehicle there in the same way. A server that put the player somewhere itself after the -
+// - tick began, which a correction to where the simulation moved it would undo, gets the player back where it has -
+// - it instead. -
 // -
 // - A tick whose movement reached the server before the simulation judged it (the simulation fell behind, or the -
 // - connection started before the vanilla runtime) moved the player on the server too; the server itself then -
-// - teleports the player back to where that tick began. Such a teleport would undo one of the server's own that -
-// - came after the tick began, so it is left out then. It is left out as well for a tick that ended before an -
-// - earlier one of these teleports: the client played that tick before it could take the teleport, which puts it -
-// - back anyway, and the simulation began the tick where the tick before it had left the player, which the -
-// - teleport undid. Vehicle movement that reached the server that way stays: the vehicle is only put back where the -
-// - server has it -
+// - teleports the player back to where that tick began, or to where the simulation moved it in that tick. Such a -
+// - teleport would undo one of the server's own that came after the tick began, so it is left out then. It is left -
+// - out as well for a tick that ended before an earlier one of these teleports: the client played that tick before -
+// - it could take the teleport, which puts it back anyway, and the simulation began the tick where the tick before -
+// - it had left the player, which the teleport undid. Vehicle movement that reached the server that way stays: the -
+// - vehicle is only put back where the server has it -
 public final class Setbacks {
 
     private final JavaPlugin plugin;
@@ -63,19 +67,38 @@ public final class Setbacks {
             return;
         }
         Entity vehicle = rootVehicle(player);
+        SetbackRequest.PredictedEnd predicted = this.usablePrediction(request, player);
         if (vehicle != player) {
             if (!request.steered()) {
                 // - The server puts a rider where its vehicle is -
                 this.skip(connection, request, name, "it rides a vehicle it did not steer in that tick");
                 return;
             }
+            if (predicted != null) {
+                this.logger.info("Setting {} back after client tick {} ({}): its vehicle goes to {}, where the simulation moved it",
+                        name, request.clientTick(), request.checks(), describe(predicted.x(), predicted.y(), predicted.z()));
+                connection.correctVehicle(request.generation(), vehicle.getEntityId(), predicted.x(), predicted.y(), predicted.z(), predicted.yRot(),
+                        predicted.xRot(), predicted.velocityX(), predicted.velocityY(), predicted.velocityZ(), true);
+                return;
+            }
             Location at = vehicle.getLocation();
             this.logger.info("Setting {} back after client tick {} ({}): its vehicle goes back to {} and stops", name, request.clientTick(), request.checks(), describe(at));
-            connection.correctVehicle(request.generation(), vehicle.getEntityId(), at.getX(), at.getY(), at.getZ(), at.getYaw(), at.getPitch());
+            connection.correctVehicle(request.generation(), vehicle.getEntityId(), at.getX(), at.getY(), at.getZ(), at.getYaw(), at.getPitch(),
+                    0.0, 0.0, 0.0, false);
             return;
         }
+        // - Where the simulation moved the vehicle the player steered in the failed tick says nothing about where the -
+        // - player itself goes now that it rides nothing -
+        SetbackRequest.PredictedEnd playerPredicted = request.steered() ? null : predicted;
         if (request.late()) {
-            this.teleportBack(connection, request, player);
+            this.teleportBack(connection, request, player, playerPredicted);
+            return;
+        }
+        if (playerPredicted != null) {
+            this.logger.info("Setting {} back after client tick {} ({}): to {}, where the simulation moved it", name, request.clientTick(), request.checks(),
+                    describe(playerPredicted.x(), playerPredicted.y(), playerPredicted.z()));
+            connection.correctPosition(request.generation(), playerPredicted.x(), playerPredicted.y(), playerPredicted.z(), playerPredicted.velocityX(),
+                    playerPredicted.velocityY(), playerPredicted.velocityZ(), true);
             return;
         }
         Location at = player.getLocation();
@@ -86,16 +109,34 @@ public final class Setbacks {
         this.logger.info("Setting {} back after client tick {} ({}): to {}{}", name, request.clientTick(), request.checks(), describe(at),
                 atStart ? "" : ", where the server has it, without its velocity");
         connection.correctPosition(request.generation(), at.getX(), at.getY(), at.getZ(),
-                atStart ? start.velocityX() : 0.0, atStart ? start.velocityY() : 0.0, atStart ? start.velocityZ() : 0.0);
+                atStart ? start.velocityX() : 0.0, atStart ? start.velocityY() : 0.0, atStart ? start.velocityZ() : 0.0, false);
     }
 
-    // - The tick's movement reached the server: the server teleports the player back to where the tick began, with -
-    // - the player's rotation on the server -
-    private void teleportBack(ConnectionSimulation connection, SetbackRequest request, Player player) {
+    // - Where the simulation moved the player in the failed tick, for a setback that is to put it there, unless the -
+    // - server put the player somewhere itself after that tick began, which the setback would undo: it then goes back -
+    // - where the server has it -
+    private SetbackRequest.@Nullable PredictedEnd usablePrediction(SetbackRequest request, Player player) {
+        SetbackRequest.PredictedEnd predicted = request.predicted();
+        if (predicted == null || this.repositionedSince(request, player)) {
+            return null;
+        }
+        return predicted;
+    }
+
+    // - Whether the server put the player somewhere itself (a teleport or a respawn) after the failed tick began: one -
+    // - was on its way to the client when the tick began, or came after the tick's end arrived -
+    private boolean repositionedSince(SetbackRequest request, Player player) {
+        Long repositioned = this.repositions.get(player.getUniqueId());
+        return request.start().repositionPending() || repositioned != null && repositioned - request.endArrivalNanos() > 0L;
+    }
+
+    // - The tick's movement reached the server: the server teleports the player back to where the tick began, or to -
+    // - where the simulation moved it in that tick when the setback is to put it there, with the player's rotation on -
+    // - the server -
+    private void teleportBack(ConnectionSimulation connection, SetbackRequest request, Player player, SetbackRequest.@Nullable PredictedEnd predicted) {
         String name = player.getName();
         ClientTickReport.Start start = request.start();
-        Long repositioned = this.repositions.get(player.getUniqueId());
-        if (start.repositionPending() || repositioned != null && repositioned - request.endArrivalNanos() > 0L) {
+        if (this.repositionedSince(request, player)) {
             this.skip(connection, request, name, "the server put it somewhere itself after that tick began");
             return;
         }
@@ -104,7 +145,9 @@ public final class Setbacks {
             this.skip(connection, request, name, "an earlier setback teleported it back after that tick ended");
             return;
         }
-        Location target = new Location(player.getWorld(), start.x(), start.y(), start.z(), player.getYaw(), player.getPitch());
+        Location target = predicted != null
+                ? new Location(player.getWorld(), predicted.x(), predicted.y(), predicted.z(), player.getYaw(), player.getPitch())
+                : new Location(player.getWorld(), start.x(), start.y(), start.z(), player.getYaw(), player.getPitch());
         boolean teleported;
         this.teleporting = true;
         try {
@@ -119,8 +162,8 @@ public final class Setbacks {
             return;
         }
         this.teleportsBack.put(player.getUniqueId(), System.nanoTime());
-        this.logger.info("Setting {} back after client tick {} ({}): the server teleported it back to {}, since the tick's movement had reached the server",
-                name, request.clientTick(), request.checks(), describe(target));
+        this.logger.info("Setting {} back after client tick {} ({}): the server teleported it {} {}, since the tick's movement had reached the server",
+                name, request.clientTick(), request.checks(), predicted != null ? "to where the simulation moved it," : "back to", describe(target));
         connection.setbackTeleported(request.generation());
     }
 
@@ -142,7 +185,11 @@ public final class Setbacks {
     }
 
     private static String describe(Location location) {
-        return String.format(Locale.ROOT, "%.4f %.4f %.4f", location.getX(), location.getY(), location.getZ());
+        return describe(location.getX(), location.getY(), location.getZ());
+    }
+
+    private static String describe(double x, double y, double z) {
+        return String.format(Locale.ROOT, "%.4f %.4f %.4f", x, y, z);
     }
 
     // - On the server thread: the server put the player somewhere itself (a teleport or a respawn) -
