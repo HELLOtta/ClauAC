@@ -560,6 +560,20 @@ connection `UNVERIFIED`. The vanilla client's uncertain starts of breaking match
 its sprint attacks in all 4975. No tick of these runs failed `Inventory` but those of the imitated cheats of the test of
 the screens and of the clicks in the test of the disablers.
 
+The final runs with the sandbox's player looking along its own yaw (see "Attacks and interactions") matched as well. The
+thirteen courses matched in all of their 19 965 simulated ticks and in all 19 984 of another run in which every tick of
+the player on foot ran a second time from its snapshot and ended the same, and the test of the tick rates matched in all
+of its 717. Over the five connections above, the courses and the block and combat tests matched in all of their 37 288
+simulated ticks but the 46 with the cheats of those tests, which ClauAC refused as over a direct connection. Over a
+direct connection, ClauAC refused every cheat of the combat, block and `NoSwing` tests, and the tests of `Timer`, the
+tick budget, alerts, setbacks, held and late, the disablers, the two situations and the creative inventory passed as
+before: the server's position of the player did not change in either setback test, all 57 shifted answers of the held
+one failed `Simulation`, and the test of the disablers left none of the 859 ticks of its connection `UNVERIFIED`. The
+vanilla client's uncertain starts of breaking matched in all 2014 ticks of their check, its sprint attacks in all 4947,
+and its breaking, placing and attacking while it turned its view in all 4685 (see "Blocks and items"). No tick of these
+runs failed `Inventory` but those of the imitated cheats of the test of the screens and of the clicks in the test of the
+disablers.
+
 ## Responses
 
 Every `MISMATCHED` tick names the checks it failed, each with what exactly failed; a tick can fail several at once.
@@ -721,10 +735,10 @@ attack and interaction against what these methods allow:
 - The client's own player looks along the yaw its mouse turned it to (`LocalPlayer.getViewYRot`), not along its
   head's yaw as every other living entity does (`LivingEntity.getViewYRot`), and so does the sandbox's player. The
   head takes up the player's yaw only during the player's tick, after the player moved (`Player.aiStep`), so a
-  crosshair along it lags a tick behind a view that turns: before the sandbox's player looked along the yaw the same
-  way, a vanilla client that broke blocks while it swept its view fast failed `Hitbox` (see "Blocks and items"). The
-  same view turns the blocks a player places facing where it looks (`Direction.orderedByNearest`), which the sandbox
-  predicts as the client does.
+  crosshair along it lags a tick behind a view that turns sideways, however slowly: before the sandbox's player looked
+  along the yaw the same way, a vanilla client that broke or placed blocks or attacked while its view turned failed
+  `Hitbox` (see "Blocks and items"). The same view turns the blocks a player places facing where it looks
+  (`Direction.orderedByNearest`), which the sandbox predicts as the client does.
 - The crosshair picks from the entities the client knows, which are the ones the sandbox knows: the sandbox applies the
   server's packets before the tick whose key handling came after them. An attack or interaction on an entity the
   sandbox does not know therefore fails `Hitbox`. The crosshair meets the parts of an ender dragon instead of the
@@ -873,16 +887,29 @@ from the server, 11 block predictions taken back and one time the packets went o
 With these checks, the nine test courses matched in all of their 14 378 ticks, and the attacks and interactions of
 "Attacks and interactions" failed and were kept from the server as before.
 
-A player reported that a vanilla client failed `Hitbox` when it broke blocks while it turned its view fast. In game,
-the vanilla client held the attack button on a wall of stone 2.5 blocks away while the mouse swept its view across the
-wall and past its ends, 60 degrees in 0.3 seconds and back, in survival mode with a diamond pickaxe and with its bare
-hand, in creative mode, up and down, and twice as fast. Sideways it failed `Hitbox` in 45 of 1181 ticks of one run and
-in 54 of 1180 of another, up and down in none. A proxy that recorded the client's rotations and block actions showed
-that each start of breaking that failed was on the block the crosshair met along the yaw the same tick reported, while
-the sandbox's crosshair met the block along the yaw of the tick before: the sandbox's player looked along its head's
-yaw, which took up the reported yaw only during the player's tick (see "Attacks and interactions"); the pitch, which
-the view follows directly, never lagged. Since the sandbox's player looks along its yaw as the client's does, all 1170
-ticks of the same test matched.
+A player reported that a vanilla client failed `Hitbox` when it broke blocks while it turned its view fast, and then
+that it did without fast turns as well. In game, the vanilla client held the attack button on a wall of stone 2.5
+blocks away while the mouse swept its view to and fro across the wall, about 60 degrees in 0.3 seconds each way, so
+that the crosshair went from block to block between the ticks and, through the holes it broke, onto nothing: in
+survival mode with a diamond pickaxe and with its bare hand, in creative mode, up and down, and twice as fast. Sideways
+it failed `Hitbox` in 45 of 1181 ticks of one run and in 54 of 1180 of another, up and down in none. A proxy that
+recorded the client's rotations and block actions showed that each start of breaking that failed was on the block the
+crosshair met along the yaw the same tick reported, while the sandbox's crosshair met the block along the yaw of the
+tick before: the sandbox's player looked along its head's yaw, which took up the reported yaw only during the player's
+tick (see "Attacks and interactions"); the pitch, which the view follows directly, never lagged. Since the sandbox's
+player looks along its yaw as the client's does, all 1170 ticks of the same test matched.
+
+The same lag held for every turn sideways, however slow, and for every action that goes by the crosshair: an item
+used on a block sends the point the crosshair met, which differs with the slightest turn, and an attack counts when
+the crosshair has just come onto the entity. The test went on with cobblestone placed with the use button held, a
+block every 4 ticks (`Minecraft.startUseItem`), sideways, up and down, and twice as fast; with clicks of the attack
+button while the view swept across an iron golem that stood where the wall had, in survival mode, where a click on
+nothing keeps the client from attacking for 10 ticks (`Minecraft.startAttack`), in creative mode, and twice as fast;
+and with each of breaking with the pickaxe and with the bare hand, placing and attacking under a slow sweep, about 20
+degrees a second. A build without the fix, the same as the plugin jar the player had, failed 137 of the 4777 ticks:
+133 `Hitbox`, and 4 `FastBreak` for finishes of breaking at 88.9 % of the progress the sandbox had counted along the
+lagging crosshair. The slow sweeps alone failed 29 placements, 12 starts and 4 turns of breaking and 2 attacks besides
+those 4; up and down, nothing failed. With the fix, all 4672 ticks matched.
 
 ### Swings
 
