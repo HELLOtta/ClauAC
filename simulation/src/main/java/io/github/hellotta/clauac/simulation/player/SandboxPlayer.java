@@ -176,6 +176,15 @@ public final class SandboxPlayer extends Player {
         return hitResult;
     }
 
+    // - LocalPlayer.getViewYRot: the client's own player looks along the yaw its mouse turned it to, where -
+    // - LivingEntity.getViewYRot follows the head's yaw, which Player.aiStep brings to that yaw only during the -
+    // - player's tick. Without it, the crosshair Minecraft.pick finds before the key handling, and every look along -
+    // - the view before aiStep (Entity.getViewVector, getLookAngle), lagged a turn of the mouse behind the client's -
+    @Override
+    public float getViewYRot(float partialTicks) {
+        return this.getYRot(partialTicks);
+    }
+
     @Override
     public boolean isLocalPlayer() {
         return true;

@@ -32,6 +32,12 @@ version on the classpath (see [`gradle/libs.versions.toml`](gradle/libs.versions
 - Ports keep the client's order of operations. Leave out only what renders, plays sounds or shows screens, and say in
   a comment what was left out. Anything the sandbox cannot reproduce must be reported (`UNVERIFIED` with a note), never
   approximated silently.
+- The sandbox's players extend the server's `Player`, so a method that only the client's classes override keeps the
+  common behaviour in the sandbox until it is ported. Compare the overrides of `LocalPlayer`, `AbstractClientPlayer`
+  and `RemotePlayer` (`javap -p` on the client jar, matched against the server's `Player`, `LivingEntity` and
+  `Entity`) with the sandbox's players whenever a port changes: `LocalPlayer.getViewYRot` looks along the player's
+  own yaw where `LivingEntity.getViewYRot` follows the head's, which takes it up only in `Player.aiStep`, and the
+  sandbox missed it until a vanilla client that broke blocks while it turned its view fast failed `Hitbox`.
 
 ## Verify by running it
 
