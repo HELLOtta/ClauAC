@@ -146,6 +146,7 @@ import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntitySelector;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.ai.attributes.Attribute;
@@ -218,7 +219,10 @@ final class PlayConnection implements ClientContext {
             Attributes.SWEEPING_DAMAGE_RATIO, Attributes.TEMPT_RANGE, Attributes.WAYPOINT_TRANSMIT_RANGE, Attributes.WAYPOINT_RECEIVE_RANGE
     );
     // - Entity.levelCallback, whose onMove files an entity in the section of the level's entity storage it moved to -
-    private static final Field LEVEL_CALLBACK = levelCallbackField();
+    private static final Field LEVEL_CALLBACK = accessibleField(Entity.class, "levelCallback");
+    // - LivingEntity.noJumpDelay, the ticks before a held jump key jumps the entity again, which only -
+    // - LivingEntity.aiStep sets -
+    private static final Field NO_JUMP_DELAY = accessibleField(LivingEntity.class, "noJumpDelay");
     // - ClientboundBlockUpdatePacket and ClientboundSectionBlocksUpdatePacket apply with these update flags -
     private static final int SERVER_BLOCK_UPDATE_FLAGS = 19;
     // - After the sandbox estimated the player's velocity from a reported movement (see correctHorizontalVelocity), -
@@ -282,6 +286,11 @@ final class PlayConnection implements ClientContext {
     private @Nullable String alternativesDisabled;
     // - What trying the tick's alternatives at the player's tick found, for the comparison after the tick -
     private @Nullable AlternativeResult alternativeResult;
+    // - Whether a correction among the plugin's own packets took the player off the ground since the client's last -
+    // - tick, where the vanilla client keeps standing (see handleOwn), and whether the tick being simulated is the -
+    // - first the client played from there, which follows that ground (see followKeptGround) -
+    private boolean groundKeptOverCorrection;
+    private boolean groundKeptThisTick;
     // - The items the player used during the tick while a boat turns it, whose yaw only the tick decides on (see -
     // - checkUseItem and checkRiderUses) -
     private final List<RiderUse> riderUses = new ArrayList<>();
@@ -401,10 +410,13 @@ final class PlayConnection implements ClientContext {
     // - PlayerSimulation.handleOwnPacket). A teleport of the player or a move of the vehicle it steers among them -
     // - corrects a setback, and the client keeps the ground state it had (ClientPacketListener.handleMovePlayer and -
     // - handleMoveVehicle change none), which the ticks it played before it took the correction left. Those ticks -
-    // - never reached the server, so the corrected player or vehicle gets the ground state of the place the correction -
-    // - puts it instead. A client that stood on the ground in them, where its ground flag was taken over rightly, had -
-    // - its next tick simulated with a jump in the air after a correction into the air, which a setback to where the -
-    // - simulation moved the player then gave the server: the player climbed in the air jump by jump -
+    // - never reached the server, so the corrected player or vehicle stays on the ground only where the correction -
+    // - puts it on something. A client that stood on the ground in them, where its ground flag was taken over -
+    // - rightly, had its next tick simulated with a jump in the air after a correction into the air, which a setback -
+    // - to where the simulation moved the player then gave the server: the player climbed in the air jump by jump. -
+    // - One in the air stays in the air over a correction onto the ground, as the client's does, and lands with its -
+    // - next move. The vanilla client still plays its first tick from a correction into the air on the ground it -
+    // - kept, which followKeptGround looks at -
     void handleOwn(Packet<?> packet, byte[] encodedPacket) {
         this.handle(packet, encodedPacket);
         SandboxPlayer current = this.player;
@@ -412,13 +424,20 @@ final class PlayConnection implements ClientContext {
             return;
         }
         if (packet instanceof ClientboundPlayerPositionPacket && !current.isPassenger()) {
-            current.setOnGround(restsOnSomething(current));
+            boolean keptGround = current.onGround();
+            current.setOnGround(groundAfterCorrection(current));
+            this.groundKeptOverCorrection |= keptGround && !current.onGround();
         } else if (packet instanceof ClientboundMoveVehiclePacket) {
             Entity vehicle = current.getRootVehicle();
             if (vehicle != current && vehicle.isLocalInstanceAuthoritative()) {
-                vehicle.setOnGround(restsOnSomething(vehicle));
+                vehicle.setOnGround(groundAfterCorrection(vehicle));
             }
         }
+    }
+
+    // - The ground state an entity a correction moved goes on with (see handleOwn) -
+    private static boolean groundAfterCorrection(Entity entity) {
+        return entity.onGround() && restsOnSomething(entity);
     }
 
     private void handlePacket(Packet<?> packet, byte[] encodedPacket) {
@@ -627,6 +646,7 @@ final class PlayConnection implements ClientContext {
         }
 
         this.clientLoaded = false;
+        this.groundKeptOverCorrection = false;
         loginPlayer.resetPos();
         loginPlayer.setId(packet.playerId());
         newLevel.addEntity(loginPlayer);
@@ -674,6 +694,7 @@ final class PlayConnection implements ClientContext {
         newPlayer.setId(oldPlayer.getId());
         this.player = newPlayer;
         this.uncertainTridentUse = null;
+        this.groundKeptOverCorrection = false;
         this.cameraEntity = newPlayer;
         if (keepEntityData) {
             List<SynchedEntityData.DataValue<?>> data = oldPlayer.getEntityData().getNonDefaultValues();
@@ -1154,6 +1175,7 @@ final class PlayConnection implements ClientContext {
     List<ClientTickReport> skipTick(long clientTick, Flag rejection, boolean repositionPending) {
         this.lastEndedTick = clientTick;
         this.lastTickKeys = null;
+        this.groundKeptOverCorrection = false;
         this.tickStart = this.currentStart(repositionPending);
         List<ClientTickReport> reports = new ArrayList<>(2);
         ClientTickReport held = this.takeHeldReport("the next tick, which had to report the hotbar switch this tick assumed, came too soon to be simulated");
@@ -1209,6 +1231,8 @@ final class PlayConnection implements ClientContext {
         }
         this.currentClientTick = clientTick;
         this.tridentUseAlternative = null;
+        this.groundKeptThisTick = this.groundKeptOverCorrection;
+        this.groundKeptOverCorrection = false;
         this.releaseHeldReport(tickPlayer, reports);
         tickLevel.tickRateManager().tick();
         // - The rotation of the whole tick, which the client's key and mouse actions already used. A riding player -
@@ -1319,8 +1343,10 @@ final class PlayConnection implements ClientContext {
     // - A tick with alternatives runs from a snapshot: when the simulated tick differs from what the client reported, -
     // - the alternatives and their combinations run from the same start, and the first that matches stays. When none -
     // - matches, the simulated tick runs again and has to come out as the first time, which shows that the snapshot -
-    // - held everything the tick changed. Blocks moving next to the player (pistons, shulker boxes) only move it -
-    // - after this point, so the tick is not judged here then; neither is it once snapshots failed on this connection -
+    // - held everything the tick changed. The first tick after a correction that took the player off the ground runs -
+    // - from a snapshot as well (see followKeptGround). Blocks moving next to the player (pistons, shulker boxes) only -
+    // - move it after this point, so the tick is not judged here then; neither is it once snapshots failed on this -
+    // - connection -
     private void tickLocalPlayer(SandboxLevel level, SandboxPlayer player) {
         this.addAttackSlowdownAlternatives(player, true);
         this.addOtherWorldAlternatives(level);
@@ -1338,7 +1364,8 @@ final class PlayConnection implements ClientContext {
         if (player.isUsingItem() && player.getUsedItemHand() == InteractionHand.MAIN_HAND) {
             alternatives.add(stoppedItemUse(player));
         }
-        if (alternatives.isEmpty() && !VERIFY_REPEATED_TICKS) {
+        boolean groundKept = this.groundKeptThisTick;
+        if (alternatives.isEmpty() && !VERIFY_REPEATED_TICKS && !groundKept) {
             level.tickNonPassenger(player);
             return;
         }
@@ -1381,6 +1408,9 @@ final class PlayConnection implements ClientContext {
                         this.disableAlternatives("a repeated tick came out differently", new StateSnapshot.SnapshotException(difference));
                     }
                 }
+                if (groundKept && alternatives.isEmpty() && !this.slotDifferences(player).isEmpty()) {
+                    this.followKeptGround(level, player, start);
+                }
                 return;
             }
             StateSnapshot simulatedEnd = this.captureState(start.roots());
@@ -1403,12 +1433,59 @@ final class PlayConnection implements ClientContext {
                         this.disableAlternatives("a repeated tick came out differently", new StateSnapshot.SnapshotException(difference)));
             } else {
                 this.alternativeResult = new AlternativeResult.NoneMatched();
+                if (groundKept) {
+                    this.followKeptGround(level, player, start);
+                }
             }
         } catch (StateSnapshot.SnapshotException problem) {
             this.disableAlternatives("the player's state could not be restored", problem);
             throw new IllegalStateException("the player's state could not be restored to try the tick's alternatives", problem);
         } finally {
             this.undoWorldBlocks(level);
+        }
+    }
+
+    // - The first tick after a correction that took the player off the ground (see handleOwn), when it differs from -
+    // - what the client reported: the vanilla client played the tick on the ground it kept. Where the tick run again -
+    // - on that ground ends at the reported position, the client did what that run did, above all jump in the air, -
+    // - which the tick still fails for. Its jump started the client's jump cooldown, which the player takes over, and -
+    // - nothing else of that run: without it, the player jumped on the ground in a later tick in which the client -
+    // - could not, and a setback of that tick gave the server a jump the client never made. The server answered it -
+    // - with a jump of its own (ServerGamePacketListenerImpl.handlePlayerPositionChange) in the tick in which the -
+    // - player's landing hurt it, which makes the server send the player its velocity (ServerEntity.sendChanges, -
+    // - Entity.syncVelocity): the client took that jump's velocity right after the correction that put it where the -
+    // - setback's jump ended, and rose higher than a jump reaches -
+    private void followKeptGround(SandboxLevel level, SandboxPlayer player, TickStart start) throws StateSnapshot.SnapshotException {
+        ReportedState reported = this.reportedState();
+        if (!reported.positionReported() || player.isDeadOrDying()) {
+            return;
+        }
+        ClientTickPackets packets = this.tickPackets;
+        boolean abilitiesSent = packets.predictedAbilitiesSent;
+        boolean fallFlyingStart = packets.predictedFallFlyingStart;
+        OptionalInt ridingJump = packets.predictedRidingJump;
+        List<EntityMotion> pushedAfterTick = new ArrayList<>();
+        for (EntityMotion motion : start.pushable()) {
+            pushedAfterTick.add(new EntityMotion(motion.entity(), motion.entity().getDeltaMovement(), motion.entity().needsSync));
+        }
+        StateSnapshot simulatedEnd = this.captureState(start.roots());
+        this.restoreTickStart(level, start, player);
+        player.setOnGround(true);
+        level.tickNonPassenger(player);
+        boolean explained = player.getX() == reported.x() && player.getY() == reported.y() && player.getZ() == reported.z();
+        int keptGroundJumpDelay = noJumpDelay(player);
+        this.restoreState(simulatedEnd);
+        notifyMoved(player);
+        packets.predictedAbilitiesSent = abilitiesSent;
+        packets.predictedFallFlyingStart = fallFlyingStart;
+        packets.predictedRidingJump = ridingJump;
+        for (EntityMotion motion : pushedAfterTick) {
+            motion.entity().setDeltaMovement(motion.deltaMovement());
+            motion.entity().needsSync = motion.needsSync();
+        }
+        if (explained) {
+            setNoJumpDelay(player, keptGroundJumpDelay);
+            packets.notes.add("the client played the tick on the ground it kept over the correction, whose jump cooldown the player took over");
         }
     }
 
@@ -1882,13 +1959,30 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    private static Field levelCallbackField() {
+    private static int noJumpDelay(SandboxPlayer player) throws StateSnapshot.SnapshotException {
         try {
-            Field field = Entity.class.getDeclaredField("levelCallback");
+            return NO_JUMP_DELAY.getInt(player);
+        } catch (IllegalAccessException exception) {
+            throw new StateSnapshot.SnapshotException("cannot reach the player's jump cooldown: " + exception);
+        }
+    }
+
+    private static void setNoJumpDelay(SandboxPlayer player, int ticks) throws StateSnapshot.SnapshotException {
+        try {
+            NO_JUMP_DELAY.setInt(player, ticks);
+        } catch (IllegalAccessException exception) {
+            throw new StateSnapshot.SnapshotException("cannot reach the player's jump cooldown: " + exception);
+        }
+    }
+
+    // - A private field of a vanilla class, made accessible -
+    private static Field accessibleField(Class<?> owner, String name) {
+        try {
+            Field field = owner.getDeclaredField(name);
             field.setAccessible(true);
             return field;
         } catch (NoSuchFieldException exception) {
-            throw new IllegalStateException("Entity.levelCallback is missing in this Minecraft version", exception);
+            throw new IllegalStateException(owner.getSimpleName() + "." + name + " is missing in this Minecraft version", exception);
         }
     }
 
