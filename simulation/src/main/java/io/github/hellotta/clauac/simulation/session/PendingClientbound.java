@@ -16,8 +16,9 @@ import org.jspecify.annotations.Nullable;
 // - its size and bytes may be read from any thread -
 final class PendingClientbound {
 
-    // - sentAt is when the packet was handed to the simulation (System.nanoTime), right before it was written -
-    record PendingPacket(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket, long sentAt) {
+    // - sentAt is when the packet was handed to the simulation (System.nanoTime), right before it was written; own -
+    // - is whether the plugin sent it in the server's stead (see PlayerSimulation.handleOwnPacket) -
+    record PendingPacket(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket, long sentAt, boolean own) {
     }
 
     private final Deque<PendingPacket> packets = new ArrayDeque<>();

@@ -122,10 +122,20 @@ public final class ClientSession implements PlayerSimulation {
     // - client's clock measure the client's ticks by -
     @Override
     public void handlePacket(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket, long handedInNanos) {
+        this.submit(phase, direction, encodedPacket, handedInNanos, false);
+    }
+
+    @Override
+    public void handleOwnPacket(byte[] encodedPacket, long handedInNanos) {
+        this.submit(ProtocolPhase.PLAY, PacketDirection.CLIENTBOUND, encodedPacket, handedInNanos, true);
+    }
+
+    // - own is whether the plugin sent the packet in the server's stead (see PlayerSimulation.handleOwnPacket) -
+    private void submit(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket, long handedInNanos, boolean own) {
         if (this.closed || this.fellBehind) {
             return;
         }
-        this.executor.execute(() -> this.process(phase, direction, encodedPacket, handedInNanos), encodedPacket.length);
+        this.executor.execute(() -> this.process(phase, direction, encodedPacket, handedInNanos, own), encodedPacket.length);
         this.checkKeepingUp();
     }
 
@@ -204,7 +214,7 @@ public final class ClientSession implements PlayerSimulation {
     // - sandbox's situation: it is rejected, which makes its tick MISMATCHED, and the simulation goes on, so that such -
     // - packets cannot switch it off. A server packet the sandbox cannot apply would make the real client fail as -
     // - well, since the sandbox runs the client's own handlers; it stops the simulation -
-    private void process(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket, long arrivedAt) {
+    private void process(ProtocolPhase phase, PacketDirection direction, byte[] encodedPacket, long arrivedAt, boolean own) {
         // - Every serverbound packet handed in counts, whether it can be decoded or not, as the plugin counts them -
         if (direction == PacketDirection.SERVERBOUND) {
             this.serverboundPackets++;
@@ -216,7 +226,7 @@ public final class ClientSession implements PlayerSimulation {
         try {
             packet = this.decoders.decode(phase, direction, encodedPacket);
             if (direction == PacketDirection.CLIENTBOUND) {
-                this.onClientbound(phase, packet, encodedPacket, arrivedAt);
+                this.onClientbound(phase, packet, encodedPacket, arrivedAt, own);
             } else {
                 this.onServerbound(phase, packet, arrivedAt);
             }
@@ -272,8 +282,8 @@ public final class ClientSession implements PlayerSimulation {
         }
     }
 
-    private void onClientbound(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket, long sentAt) {
-        this.pending.add(new PendingClientbound.PendingPacket(phase, packet, encodedPacket, sentAt));
+    private void onClientbound(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket, long sentAt, boolean own) {
+        this.pending.add(new PendingClientbound.PendingPacket(phase, packet, encodedPacket, sentAt, own));
         if (phase == ProtocolPhase.CONFIGURATION) {
             this.applyLeadingConfigurationPackets();
         }
@@ -328,6 +338,8 @@ public final class ClientSession implements PlayerSimulation {
             this.applyConfiguration(released.packet(), released.encodedPacket());
         } else if (released.packet() instanceof ClientboundStartConfigurationPacket) {
             this.startConfiguration();
+        } else if (released.own()) {
+            this.requirePlay().handleOwn(released.packet(), released.encodedPacket());
         } else {
             this.requirePlay().handle(released.packet(), released.encodedPacket());
         }

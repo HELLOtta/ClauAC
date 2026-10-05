@@ -66,7 +66,9 @@ import org.slf4j.Logger;
 // - correction: a teleport, or, when it steers a vehicle, a move of the vehicle, either to where the simulation moved -
 // - it in the failed tick, which the server then gets as that tick's movement, or to where the server has it (see -
 // - setbacks.type and Setbacks). The correction goes out in one of the connection's own bundles, so that the pong to -
-// - the ping behind it shows when the client has taken it. -
+// - the ping behind it shows when the client has taken it, and the simulation takes it as one of the connection's -
+// - own packets, which gives the corrected player the ground state of where it puts it -
+// - (PlayerSimulation.handleOwnPacket). -
 // -
 // - Everything except the getters runs on the connection's event loop, where all of its packets are handled one -
 // - after another -
@@ -117,8 +119,9 @@ final class ConnectionSimulation {
     private static final int VARINT_CONTINUE_BIT = 0x80;
     private static final double NANOS_PER_MILLISECOND = 1.0E6;
 
-    // - handedInNanos is when the packet was sent or received, which the simulation measures the client's ticks by -
-    private record WaitingPacket(ProtocolPhase phase, PacketDirection direction, int packetId, byte[] encodedPacket, long handedInNanos) {
+    // - handedInNanos is when the packet was sent or received, which the simulation measures the client's ticks by; -
+    // - own is whether the connection sent it in the server's stead (see writeOwnPacket) -
+    private record WaitingPacket(ProtocolPhase phase, PacketDirection direction, int packetId, byte[] encodedPacket, long handedInNanos, boolean own) {
     }
 
     // - A tick that is to be set back, with what its setback needs -
@@ -391,11 +394,12 @@ final class ConnectionSimulation {
         }
     }
 
-    // - Sends one of the connection's own packets silently and hands it to the simulation in its place on the wire -
+    // - Sends one of the connection's own packets silently and hands it to the simulation in its place on the wire, as -
+    // - one the client takes in the server's stead (PlayerSimulation.handleOwnPacket) -
     private void writeOwnPacket(PacketWrapper<?> packet) {
         Object buffer = ChannelHelper.pooledByteBuf(this.user.getChannel());
         writePacket(packet, buffer);
-        this.handOver(ProtocolPhase.PLAY, PacketDirection.CLIENTBOUND, packet.getNativePacketId(), ByteBufHelper.copyBytes(buffer));
+        this.handOverOwn(packet.getNativePacketId(), ByteBufHelper.copyBytes(buffer));
         this.user.sendPacketSilently(buffer);
     }
 
@@ -535,7 +539,17 @@ final class ConnectionSimulation {
                 }
                 Objects.requireNonNull(this.simulation).handlePacket(phase, direction, encodedPacket, System.nanoTime());
             }
-            case WAITING -> this.keepWaiting(new WaitingPacket(phase, direction, packetId, encodedPacket, System.nanoTime()));
+            case WAITING -> this.keepWaiting(new WaitingPacket(phase, direction, packetId, encodedPacket, System.nanoTime(), false));
+            case NOT_SIMULATED -> {
+            }
+        }
+    }
+
+    // - One of the connection's own clientbound play packets, which the client takes in the server's stead -
+    private void handOverOwn(int packetId, byte[] encodedPacket) {
+        switch (this.state) {
+            case SIMULATED -> Objects.requireNonNull(this.simulation).handleOwnPacket(encodedPacket, System.nanoTime());
+            case WAITING -> this.keepWaiting(new WaitingPacket(ProtocolPhase.PLAY, PacketDirection.CLIENTBOUND, packetId, encodedPacket, System.nanoTime(), true));
             case NOT_SIMULATED -> {
             }
         }
@@ -860,7 +874,12 @@ final class ConnectionSimulation {
         PlayerSimulation started = this.simulation;
         if (started != null) {
             for (WaitingPacket packet : this.waitingPackets) {
-                if (currentRuntime.isRelevant(packet.phase(), packet.direction(), packet.packetId())) {
+                if (!currentRuntime.isRelevant(packet.phase(), packet.direction(), packet.packetId())) {
+                    continue;
+                }
+                if (packet.own()) {
+                    started.handleOwnPacket(packet.encodedPacket(), packet.handedInNanos());
+                } else {
                     started.handlePacket(packet.phase(), packet.direction(), packet.encodedPacket(), packet.handedInNanos());
                 }
             }

@@ -202,6 +202,8 @@ final class PlayConnection implements ClientContext {
     private static final double MOVING_BLOCK_REACH = 2.0;
     // - The player pushes the entities its box touches during its tick; its movement can carry the box this far -
     private static final double PUSH_REACH = 1.0;
+    // - How far below an entity's box vanilla looks for what the entity stands on (Entity.checkSupportingBlock) -
+    private static final double SUPPORT_DEPTH = 1.0E-6;
     // - The difference in the reported position itself, which a velocity estimate can explain (see compareWithClient) -
     private static final String POSITION_DIFFERENCE = "position";
     // - Attributes that do not change how the local player moves within a tick: they count for attacks, mining, reach, -
@@ -392,6 +394,30 @@ final class PlayConnection implements ClientContext {
         SandboxPlayer playerAfter = this.player;
         if (playerAfter != playerBefore || playerAfter != null && (playerAfter.getYRot() != yRotBefore || playerAfter.getXRot() != xRotBefore)) {
             this.tickPackets.turnedByServer = true;
+        }
+    }
+
+    // - Handles a clientbound play packet the plugin sent in the server's stead (see -
+    // - PlayerSimulation.handleOwnPacket). A teleport of the player or a move of the vehicle it steers among them -
+    // - corrects a setback, and the client keeps the ground state it had (ClientPacketListener.handleMovePlayer and -
+    // - handleMoveVehicle change none), which the ticks it played before it took the correction left. Those ticks -
+    // - never reached the server, so the corrected player or vehicle gets the ground state of the place the correction -
+    // - puts it instead. A client that stood on the ground in them, where its ground flag was taken over rightly, had -
+    // - its next tick simulated with a jump in the air after a correction into the air, which a setback to where the -
+    // - simulation moved the player then gave the server: the player climbed in the air jump by jump -
+    void handleOwn(Packet<?> packet, byte[] encodedPacket) {
+        this.handle(packet, encodedPacket);
+        SandboxPlayer current = this.player;
+        if (current == null) {
+            return;
+        }
+        if (packet instanceof ClientboundPlayerPositionPacket && !current.isPassenger()) {
+            current.setOnGround(restsOnSomething(current));
+        } else if (packet instanceof ClientboundMoveVehiclePacket) {
+            Entity vehicle = current.getRootVehicle();
+            if (vehicle != current && vehicle.isLocalInstanceAuthoritative()) {
+                vehicle.setOnGround(restsOnSomething(vehicle));
+            }
         }
     }
 
@@ -3145,20 +3171,54 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - Continues from the client's state after a tick whose result differs from the client's -
+    // - Continues from the client's state after a tick whose result differs from the client's, as far as a vanilla -
+    // - client can be in it: the ground flag and the flight the client reported only where a vanilla client reports -
+    // - them (see takeOverGround and takeOverFlying) -
     private static void adoptReportedState(SandboxPlayer player, ReportedState reported, boolean reportedSprinting, ClientTickPackets packets) {
         player.setPos(reported.x(), reported.y(), reported.z());
-        player.setOnGround(reported.onGround());
+        takeOverGround(player, reported.onGround());
         player.horizontalCollision = reported.horizontalCollision();
         player.setSprinting(reportedSprinting);
-        if (packets.abilitiesReported) {
+        takeOverFlying(player, packets);
+    }
+
+    // - Takes over the ground flag the client reported for an entity at the entity's position, unless no vanilla -
+    // - client can report it there (see restsOnSomething). A cheat that reports the flag in the air, as one that -
+    // - spares itself fall damage does, would otherwise have its next tick simulated as one on the ground, with a jump -
+    // - and the ground's acceleration, which a setback to where the simulation moved the player gives the server: the -
+    // - player jumped in the air -
+    private static void takeOverGround(Entity entity, boolean reportedOnGround) {
+        entity.setOnGround(reportedOnGround && restsOnSomething(entity));
+    }
+
+    // - Whether the entity's box rests on something, as Entity.move leaves it when something below stopped its -
+    // - movement (verticalCollisionBelow), the only time it sets the ground flag: a block or an entity it collides -
+    // - with, which noCollision finds as the movement does (Entity.collideBoundingBox), this far below the box as -
+    // - vanilla looks for what an entity stands on -
+    private static boolean restsOnSomething(Entity entity) {
+        AABB box = entity.getBoundingBox();
+        return !entity.level().noCollision(entity, new AABB(box.minX, box.minY - SUPPORT_DEPTH, box.minZ, box.maxX, box.minY, box.maxZ));
+    }
+
+    // - Takes over the flying state the client reported during the tick, unless no vanilla client reports it (see -
+    // - flyingReportPossible) -
+    private static void takeOverFlying(SandboxPlayer player, ClientTickPackets packets) {
+        if (packets.abilitiesReported && flyingReportPossible(packets.reportedFlying, player)) {
             player.getAbilities().flying = packets.reportedFlying;
         }
     }
 
+    // - Whether a vanilla client reports this flying state: LocalPlayer.aiStep only starts flying where the abilities -
+    // - let the player fly, which only the server sets (ClientboundPlayerAbilitiesPacket and the game mode), and it -
+    // - reports stopping when the player lands. A cheat that lets itself fly reports its flight as well; a simulation -
+    // - that flew along would have every tick of that flight match and reach the server -
+    private static boolean flyingReportPossible(boolean flying, SandboxPlayer player) {
+        return !flying || player.getAbilities().mayfly;
+    }
+
     // - Mirrors LocalPlayer.sendPosition for the simulated player and compares the result with what the client -
     // - sent. On any difference, the sandbox takes over the client's reported state so that the next tick is -
-    // - simulated from where the client really is -
+    // - simulated from where the client really is, as far as a vanilla client can be in it (see adoptReportedState) -
     private ClientTickReport compareWithClient(
             long clientTick, SandboxPlayer tickPlayer, Vec3 positionBeforeTick, boolean reportedSprinting, List<String> uncertainties, List<String> notes
     ) {
@@ -3317,7 +3377,9 @@ final class PlayConnection implements ClientContext {
     // - position (ServerboundMoveVehiclePacket, from Entity.getClientPositionAndRotation) and the player's sprinting. -
     // - The sandbox moved the vehicle with the same vanilla code and the same keys. A vehicle the player does not steer -
     // - moves as the server says, which the sandbox follows like the client. On any difference the sandbox takes over -
-    // - what the client reported. vehiclePositionBeforeTick is null when the player changed vehicles during the tick -
+    // - what the client reported, its ground flags and flight as far as a vanilla client reports them (see -
+    // - takeOverGround and takeOverFlying). vehiclePositionBeforeTick is null when the player changed vehicles during -
+    // - the tick -
     private ClientTickReport compareRiding(
             long clientTick, SandboxPlayer tickPlayer, @Nullable Vec3 vehiclePositionBeforeTick, boolean reportedSprinting, List<String> uncertainties, List<String> notes
     ) {
@@ -3403,7 +3465,7 @@ final class PlayConnection implements ClientContext {
                     correctHorizontalVelocity(vehicle, vehiclePositionBeforeTick, reportedPosition);
                 }
                 vehicle.absSnapTo(reportedPosition.x, reportedPosition.y, reportedPosition.z, reportedVehicle.yRot(), reportedVehicle.xRot());
-                vehicle.setOnGround(vehicleMove.onGround());
+                takeOverGround(vehicle, vehicleMove.onGround());
                 // - positionRider only has to move the passengers along; a boat turns the player's head a second -
                 // - time, and its rotation, which the client reported, is taken below -
                 float yHeadRot = tickPlayer.getYHeadRot();
@@ -3411,15 +3473,13 @@ final class PlayConnection implements ClientContext {
                 tickPlayer.setYHeadRot(yHeadRot);
             }
             if (movePacket != null && movePacket.hasRotation() && !movePacket.hasPosition()) {
-                tickPlayer.setOnGround(movePacket.isOnGround());
+                takeOverGround(tickPlayer, movePacket.isOnGround());
                 tickPlayer.horizontalCollision = movePacket.horizontalCollision();
             }
             if (steering) {
                 tickPlayer.setSprinting(reportedSprinting);
             }
-            if (packets.abilitiesReported) {
-                tickPlayer.getAbilities().flying = packets.reportedFlying;
-            }
+            takeOverFlying(tickPlayer, packets);
         }
         // - The rotation the client ended its tick with, which it reported. The sandbox's lies a rounding apart after -
         // - a boat's turn (see passengerTurnOfTick), or further when the turn depends on what the client does not -
@@ -3480,10 +3540,16 @@ final class PlayConnection implements ClientContext {
         }
     }
 
-    // - ServerboundPlayerAbilitiesPacket, sent while the player ticks -
+    // - ServerboundPlayerAbilitiesPacket, sent while the player ticks. The client took in every packet of the server -
+    // - it processed before the tick, the abilities among them, so a flight they do not allow is a report no vanilla -
+    // - client sends (see flyingReportPossible) -
     void onAbilitiesReported(boolean flying) {
         this.tickPackets.abilitiesReported = true;
         this.tickPackets.reportedFlying = flying;
+        SandboxPlayer current = this.player;
+        if (current != null && !flyingReportPossible(flying, current)) {
+            this.tickPackets.reject(Check.BAD_PACKETS, "the client reported flying, which its abilities do not allow");
+        }
     }
 
     // - START_FALL_FLYING, sent while the player ticks -

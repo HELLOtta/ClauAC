@@ -86,7 +86,10 @@ Findings from running the official 26.3 client in a cloud container without a GP
   above it. Aim from the eyes with `execute anchored eyes run tp Tester <pos> facing <point>`. `rotate` turns a riding
   player without taking it off its vehicle.
 - **Key presses:** `xdotool key` releases the key within the same client tick, which the client's per-tick key polling
-  can miss (a double tap of jump to fly never registers). Hold keys with `keydown`, `sleep 0.1`, `keyup`.
+  can miss (a double tap of jump to fly never registers). Hold keys with `keydown`, `sleep 0.1`, `keyup`. Even held that
+  way, a double tap of jump started flying in one of three tries: the client takes in its keys once a frame, and with
+  frames of up to 0.27 s the release between the two presses can go unseen, or the second press come later than the 7
+  ticks it has to follow the first within (`LocalPlayer.aiStep`, `jumpTriggerTime`).
 - **Hotbar keys:** the client takes in keys once a frame and handles the number keys that came since in the order of
   their slots, not of the presses (`Minecraft.handleKeybinds`): two number keys pressed within one frame select the
   higher slot. It reports the slot at the start of the next tick (`MultiPlayerGameMode.tick` runs before
@@ -159,7 +162,23 @@ Findings from running the official 26.3 client in a cloud container without a GP
   as far as a falling one, since `Player.travel` damps a flying player's velocity only after the move; that tick
   matches, and its movement takes the server's position one tick of the fall further down. With setbacks to where the
   simulation moved the player (`predicted`, the default), the server gets the fall of every failed tick, and a held
-  height came down to the floor within a second; `fly_hover_test.sh` checks both.
+  height came down to the floor within a second; `fly_hover_test.sh` checks both. The proxy's `ground on` sets the flag
+  of being on the ground in every movement packet of the player, as a cheat that spares itself fall damage reports it in
+  the air, and `inject` of a serverbound `minecraft:player_abilities` (a byte of flags, flying 2) reports a flight, as a
+  vanilla client does when a double tap of jump starts it flying where its abilities let it. The simulation goes on from
+  what the client reported after a tick that does not match, and once took both over as they came: with the ground flag
+  in the air, it took the next tick for one on the ground, with a jump and the ground's acceleration, which setbacks to
+  where it moved the player gave the server (the player jumped in the air again and again and rose up to 3 blocks over
+  where a fall from 40 blocks began), and with the flying report it flew along, so that the whole flight matched and
+  reached the server with either setback type until Paper kicked the player for floating after 4 s (with
+  `allow-flight=false`). It takes the flag over only where the reported position rests on a block or an entity now
+  (`noCollision` 1.0E-6 below the box, as far down as `Entity.checkSupportingBlock` looks), and a flight only where the
+  abilities let the player fly, whose report fails `BadPackets` otherwise. That alone still let the player climb: in the
+  ticks before it took a correction, the client stood on the floor, where its flag was taken over rightly, and the
+  correction put it into the air with that flag, which the vanilla client keeps over a teleport, so that the next tick
+  jumped in the air. ClauAC's own packets reach the simulation through `PlayerSimulation.handleOwnPacket` now, and a
+  correction among them gives the player or the vehicle the ground state of where it puts it; `fly_fall_test.sh` checks
+  all of it.
 - **Testing disablers:** a cheat that leaves the sandbox unsure of what the client did, so that the tick's movement goes
   unchecked, has to be tested the way a cheat uses it. The proxy's `after-tick-end` sends its packet behind every tick
   end, where it leads the next tick's key handling, from a second before the shifted positions start, and the answers

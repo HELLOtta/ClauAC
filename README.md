@@ -126,7 +126,10 @@ blocks with the client's own block predictions, using items, attacks, interactio
 entity, and moves the player with the keys, rotation and sprint commands the client sent. It then mirrors
 `LocalPlayer.sendPosition` and compares: whether a position had to be sent, the exact position, `onGround`,
 horizontal collision, sprinting, flying and the start of gliding. When anything differs, the sandbox continues from the
-client's reported state, including a velocity estimated from the tick it just simulated.
+client's reported state, including a velocity estimated from the tick it just simulated. It takes over only what a
+vanilla client can report there: the ground flag where the reported position rests on a block or an entity, as only a
+move that something below stopped sets it (`Entity.move`), and a flight where the abilities let the player fly; a report
+of a flight they do not allow fails `BadPackets`.
 
 A riding player sends a rotation with its ground and collision state every tick instead, and, while it steers the
 vehicle (a boat, a saddled horse or camel, a pig or strider with its item on a stick, a happy ghast with a harness, a
@@ -1030,7 +1033,10 @@ server instead (see "Attacks and interactions", "Blocks and items" and "Swings")
   correction carries no velocity, so another packet gives the vehicle the simulation's velocity, or none where the
   server has it: the client's and the simulation's would differ otherwise. The correction goes out in one of ClauAC's
   own bundles, so that the pong to the ping behind it shows when the client has taken it; the client's answer to
-  ClauAC's teleport goes no further than the simulation.
+  ClauAC's teleport goes no further than the simulation. The client keeps over a correction, as over any teleport,
+  whether it stood on the ground in the ticks it played before it took the correction, though those never reached the
+  server: the simulation gives the corrected player or vehicle the ground state of the place the correction puts it
+  instead, whether it rests on something there, so that a correction into the air brings no jump in the air.
 - The client answers a teleport with its acceptance, which carries its resulting position
   (`ClientPacketListener.handleMovePlayer`), and a movement cheat that changes the positions the client sends changes
   that one too. A coordinate the teleport sets outright is the teleport's on every client
@@ -1051,7 +1057,8 @@ server instead (see "Attacks and interactions", "Blocks and items" and "Swings")
   began, as `setbacks.type` says, unless the server put the player somewhere itself after that tick began (a teleport
   or a respawn), which the setback would undo, or such a setback of an earlier tick teleported the player after this
   tick ended (see above). A plugin can cancel that teleport; the log says so then. Vehicle movement that reached the
-  server this way stays, whatever the type: the vehicle is only put back where the server has it.
+  server this way stays, whatever the type: the vehicle is only put back where the server has it. The ground state stays
+  the client's over such a teleport of the server, as over every other.
 - A dead or sleeping player is not set back, and neither is a rider that did not steer its vehicle, whose position the
   server decides.
 
@@ -1141,6 +1148,33 @@ gave setbacks to where the simulation moved the player and alerts in the default
 `getString(path, "")`, which ignores the defaults (`MemorySection.get(String, Object)`), so that an `alerts.format`
 missing from the file gave empty alerts; they now take the default as true and false and numbers do. The value `bogus`
 for `setbacks.type` was ignored with a warning, and setbacks were to where the simulation moved the player.
+
+A player then reported that with a Fly cheat on, the player jumped in the air while it fell from high up and covered a
+long distance. `fly_fall_test.sh` lets the client fall 40 blocks onto the course holding forward, sprint and jump:
+without a cheat; with the abilities of a flying player sent to the client alone; with those abilities and the flag of
+being on the ground set in all of its movement packets, as a cheat that spares itself fall damage does; with the flag
+alone; and with the abilities and the packet with which a vanilla client tells the server that it starts flying, after a
+double tap of jump where its abilities let it fly. After a tick that did not match, the simulation took the client's
+ground flag and flight over as they came. With `predicted`, the flag in the air had the tick after each correction
+simulated as one on the ground, with a jump and the ground's acceleration, which the setbacks gave the server: with the
+abilities and the flag, the server's position jumped 9 times in the air, was still at 139 after 19 seconds (142.4 at
+most; the fall began at 140) and had come 23 blocks east, where the fall without a cheat ended on the floor after 1.85
+seconds and 6 blocks; with the flag alone, it jumped 6 times and was at 114 after 19 seconds. The flying report had the
+simulation fly as well: but for the tick of the report, every tick of the flight matched and reached the server, 73
+blocks east and up to 165 in three and a half seconds, until Paper kicked the player for floating; with `server` it flew
+72 blocks the same way. The abilities alone came down to the floor as before, and with `server` the flag kept the player
+in the air where the server had it.
+
+The simulation now takes the ground flag over only where the reported position rests on something and a flight only
+where the abilities allow it, and a report of a flight they do not allow fails `BadPackets` (see "Following the client's
+timeline"). With that alone, the fall with the flag alone still climbed: in the ticks before it took a correction, the
+client fell onto the floor, where its flag was right, and the correction put it into the air with that flag, so that the
+tick after it jumped; the server's position climbed from the floor to 102.33, and 29 setbacks put it higher than the one
+before, where no jump from the floor reaches. A correction now gives the player or the vehicle the ground state of the
+place it puts it (see above). With both, every fall of the test ended without a rise in the air. With `predicted`, all
+five ended on the floor, 6.9, 6.6, 9.8, 5.5 and 7.1 blocks east of the start; with `server`, the server kept the player
+in the air where it had it in all 40 samples of each fall with a cheat. The flying report failed `BadPackets` in one
+tick with either type, and no tick of the flight matched until the cheat let go of it.
 
 ### Alerts
 
