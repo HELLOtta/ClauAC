@@ -177,8 +177,19 @@ Findings from running the official 26.3 client in a cloud container without a GP
   ticks before it took a correction, the client stood on the floor, where its flag was taken over rightly, and the
   correction put it into the air with that flag, which the vanilla client keeps over a teleport, so that the next tick
   jumped in the air. ClauAC's own packets reach the simulation through `PlayerSimulation.handleOwnPacket` now, and a
-  correction among them gives the player or the vehicle the ground state of where it puts it; `fly_fall_test.sh` checks
-  all of it.
+  correction among them leaves the player or the vehicle on the ground only where it puts it on something;
+  `fly_fall_test.sh` checks all of it. A landing that hurts the player makes the server send it its own velocity
+  (`ServerEntity.sendChanges` with `Entity.syncVelocity`, which `Entity.markHurt` sets), and the server's velocity of a
+  player is that of the last jump the server took from its movement
+  (`ServerGamePacketListenerImpl.handlePlayerPositionChange` calls `ServerPlayer.jumpFromGround`), a setback's movement
+  included: when the simulation jumped on the floor where the client could not, the client took that jump's velocity
+  right after the next correction and rose higher than a jump reaches, and the simulation now takes over the jump
+  cooldown of the ground the client kept (`PlayConnection.followKeptGround`). `protocol_proxy.py --trace-seconds` logs
+  every teleport with its position and velocity, the client's positions with their flags, and the velocities and damage
+  events the server sends the player; `teleport_trace_analysis.py` lines them up with a report tick by tick, and
+  `phantom_jumps.py` counts the ticks in which the simulation jumped on the floor where the client stayed on it. A
+  player that holds jump hops along the floor once it is down, where a sample of its position finds it on the floor only
+  between two hops.
 - **Testing disablers:** a cheat that leaves the sandbox unsure of what the client did, so that the tick's movement goes
   unchecked, has to be tested the way a cheat uses it. The proxy's `after-tick-end` sends its packet behind every tick
   end, where it leads the next tick's key handling, from a second before the shifted positions start, and the answers

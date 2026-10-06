@@ -602,6 +602,38 @@ again before every step and at its end, and the steps of these runs kept to the 
 repeated ticks ran on a build that already had `setbacks.type`: the restart of the server for it built the plugin from
 the working tree, where those changes already were.
 
+The final runs of the simulation that takes over only what a vanilla client can report of its ground and its flight, and
+the jump cooldown of the ground a client keeps over a correction (see "Following the client's timeline" and "Setbacks"),
+matched as well. The thirteen courses matched in all of their 19 665 simulated ticks and in all 19 589 of another run in
+which every tick of the player on foot ran a second time from its snapshot and ended the same, and the test of the tick
+rates matched in all of its 718. Over the five connections above, the courses and the block and combat tests matched in
+all of their 36 480 simulated ticks but the 46 with the cheats of those tests, which ClauAC refused as over a direct
+connection. Over a direct connection, ClauAC refused every cheat of the combat, block and `NoSwing` tests, and the tests
+of `Timer`, the tick budget, alerts, the two situations and the creative inventory passed as before. The tests of the
+setbacks, held and late, passed with each type as before: with `predicted` the server's position of the player followed
+the walk over the floor and the boat's followed its steering, with `server` they stayed where they were, and no sample
+showed a shifted position; all 74 and 73 shifted answers of the held runs failed `Simulation`. The test of the Fly hover
+passed with both types: with `predicted` the held height came down to the floor by the third of the samples taken half a
+second apart, with `server` the server kept the player at 109.31 throughout. The test of the falls with Fly cheats
+passed with both types: no fall rose in the air, the simulation never jumped on the floor where the client stayed on it,
+and the flying report failed `BadPackets` in one tick with either type; with `predicted` all five falls ended on the
+floor, with `server` the server kept the player at one height in the air in all 40 samples of each fall with a cheat.
+The test of the disablers left none of the 842 ticks of its connection `UNVERIFIED`; its clicks went back where the
+server had the player, the steps of its other cheats to where the simulation had moved it, and no sample showed a
+shifted height. The vanilla client's uncertain starts of breaking matched in all 1944 ticks of their check, its sprint
+attacks in all 4829, and its breaking, placing and attacking while it turned its view in all 4512. No tick of these runs
+failed `Inventory` but those of the imitated cheats of the test of the screens and of the clicks in the test of the
+disablers, and no player was kicked.
+
+The final runs before these, of the build that did not take over the jump cooldown yet, passed all of their parts as
+well: the thirteen courses matched in all of their 19 838 simulated ticks, the run with repeated ticks in all 19 728,
+and the five connections in all of their 36 548 but the 46 with the cheats. Runs of the test of the falls with Fly
+cheats after them showed a rise in the air, which taking over the jump cooldown closed (see "Setbacks"). In their own
+run of that test, the player held jump on after two of the falls and hopped along the floor until a sample found it on
+the floor between two hops, 13 samples and 44 blocks later in one of them, after which it ran on over the course's east
+end; the hops matched, but a run whose samples miss the floor until the player has left the course fails, so the test
+now lets go of jump once the server has the player within a jump of the floor.
+
 ## Responses
 
 Every `MISMATCHED` tick names the checks it failed, each with what exactly failed; a tick can fail several at once.
@@ -1035,8 +1067,12 @@ server instead (see "Attacks and interactions", "Blocks and items" and "Swings")
   own bundles, so that the pong to the ping behind it shows when the client has taken it; the client's answer to
   ClauAC's teleport goes no further than the simulation. The client keeps over a correction, as over any teleport,
   whether it stood on the ground in the ticks it played before it took the correction, though those never reached the
-  server: the simulation gives the corrected player or vehicle the ground state of the place the correction puts it
-  instead, whether it rests on something there, so that a correction into the air brings no jump in the air.
+  server: in the simulation, the corrected player or vehicle stays on the ground only where the correction puts it on
+  something, so that a correction into the air brings no jump in the air, and one in the air stays there, as the
+  client's does, until its next move lands it. The vanilla client still plays its first tick from a correction into the
+  air on the ground it kept, and can jump there; that tick fails, but where the tick run again on the kept ground ends
+  at the position the client reported, the simulation takes over the jump cooldown that jump started
+  (`LivingEntity.noJumpDelay`), and nothing else of that run.
 - The client answers a teleport with its acceptance, which carries its resulting position
   (`ClientPacketListener.handleMovePlayer`), and a movement cheat that changes the positions the client sends changes
   that one too. A coordinate the teleport sets outright is the teleport's on every client
@@ -1170,11 +1206,26 @@ where the abilities allow it, and a report of a flight they do not allow fails `
 timeline"). With that alone, the fall with the flag alone still climbed: in the ticks before it took a correction, the
 client fell onto the floor, where its flag was right, and the correction put it into the air with that flag, so that the
 tick after it jumped; the server's position climbed from the floor to 102.33, and 29 setbacks put it higher than the one
-before, where no jump from the floor reaches. A correction now gives the player or the vehicle the ground state of the
-place it puts it (see above). With both, every fall of the test ended without a rise in the air. With `predicted`, all
-five ended on the floor, 6.9, 6.6, 9.8, 5.5 and 7.1 blocks east of the start; with `server`, the server kept the player
-in the air where it had it in all 40 samples of each fall with a cheat. The flying report failed `BadPackets` in one
-tick with either type, and no tick of the flight matched until the cheat let go of it.
+before, where no jump from the floor reaches. A correction then gave the player or the vehicle the ground state of the
+place it put it. With both, every fall of those runs ended without a rise in the air. With `predicted`, all five ended
+on the floor, 6.9, 6.6, 9.8, 5.5 and 7.1 blocks east of the start; with `server`, the server kept the player in the air
+where it had it in all 40 samples of each fall with a cheat. The flying report failed `BadPackets` in one tick with
+either type, and no tick of the flight matched until the cheat let go of it.
+
+Later runs of the test showed one more way up. With the flag alone, a correction into the air found the client standing
+on the floor, and the client jumped on the ground it kept; the simulation refused that jump, but the jump's cooldown
+kept the client from jumping in the ticks after it landed, while the simulation, without the cooldown, jumped on the
+floor in one of them, and the setback of that tick gave the server a jump the client never made. The server took it for
+a jump of the player (`ServerGamePacketListenerImpl.handlePlayerPositionChange` calls `ServerPlayer.jumpFromGround`),
+and since the player's landing hurt it in the same server tick, the server sent the client its own velocity, that jump's
+(`ServerEntity.sendChanges` with `Entity.syncVelocity`, which `Entity.markHurt` sets), right after the correction that
+had put the player where the jump's first tick ended: the client and the setbacks rose to 101.67, 0.42 blocks higher
+than a jump from the floor reaches, in three of seven runs. A proxy's trace of the teleports and of the velocities the
+server sent the player showed that order, and the velocity's low-precision encoding (`LpVec3`) gave the client's
+movement to the last digit. The simulation now takes over the jump cooldown of the ground the client kept (see above);
+in the six runs with it that followed and in the final runs, no tick showed a jump of the simulation on the floor where
+the client stayed on it, where six of the seven runs before had shown one to three, and no setback rose in the air. The
+test checks both.
 
 ### Alerts
 
