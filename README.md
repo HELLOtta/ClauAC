@@ -615,15 +615,20 @@ the walk over the floor and the boat's followed its steering, with `server` they
 showed a shifted position; all 74 and 73 shifted answers of the held runs failed `Simulation`. The test of the Fly hover
 passed with both types: with `predicted` the held height came down to the floor by the third of the samples taken half a
 second apart, with `server` the server kept the player at 109.31 throughout. The test of the falls with Fly cheats
-passed with both types: no fall rose in the air, the simulation never jumped on the floor where the client stayed on it,
-and the flying report failed `BadPackets` in one tick with either type; with `predicted` all five falls ended on the
-floor, with `server` the server kept the player at one height in the air in all 40 samples of each fall with a cheat.
-The test of the disablers left none of the 842 ticks of its connection `UNVERIFIED`; its clicks went back where the
-server had the player, the steps of its other cheats to where the simulation had moved it, and no sample showed a
-shifted height. The vanilla client's uncertain starts of breaking matched in all 1944 ticks of their check, its sprint
-attacks in all 4829, and its breaking, placing and attacking while it turned its view in all 4512. No tick of these runs
-failed `Inventory` but those of the imitated cheats of the test of the screens and of the clicks in the test of the
-disablers, and no player was kicked.
+passed with both types: no sample of the server's position and no setback rose in the air in any fall, the simulation
+never jumped on the floor where the client stayed on it, and the flying report failed `BadPackets` in one tick with
+either type; with `predicted` all five falls ended on the floor, with `server` the server kept the player at one height
+in the air in all 40 samples of each fall with a cheat. One tick of those runs took over the jump cooldown of the ground
+a client kept, in the fall with the flag alone under `predicted`, and the recording of that fall shows the client's side
+of it: the client had landed when the correction of the tick two ticks before the landing put it back 2.16 blocks above
+the floor, and it jumped there on the ground it kept, up to 3.16 blocks above the floor; that tick and the two after it
+failed and their movement never reached the server, which got where the simulation had moved the player in the first of
+them instead, and the next correction brought the client back down to the floor. The test of the disablers left none of
+the 842 ticks of its connection `UNVERIFIED`; its clicks went back where the server had the player, the steps of its
+other cheats to where the simulation had moved it, and no sample showed a shifted height. The vanilla client's uncertain
+starts of breaking matched in all 1944 ticks of their check, its sprint attacks in all 4829, and its breaking, placing
+and attacking while it turned its view in all 4512. No tick of these runs failed `Inventory` but those of the imitated
+cheats of the test of the screens and of the clicks in the test of the disablers, and no player was kicked.
 
 The final runs before these, of the build that did not take over the jump cooldown yet, passed all of their parts as
 well: the thirteen courses matched in all of their 19 838 simulated ticks, the run with repeated ticks in all 19 728,

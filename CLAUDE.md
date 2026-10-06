@@ -189,7 +189,12 @@ Findings from running the official 26.3 client in a cloud container without a GP
   events the server sends the player; `teleport_trace_analysis.py` lines them up with a report tick by tick, and
   `phantom_jumps.py` counts the ticks in which the simulation jumped on the floor where the client stayed on it. A
   player that holds jump hops along the floor once it is down, where a sample of its position finds it on the floor only
-  between two hops.
+  between two hops. Under `predicted`, a recording can still show the client hop once after it landed: the correction of
+  a tick before the landing reached it in the tick after and put it back 2.16 blocks above the floor, where it jumped on
+  the ground it kept, up to 3.16 blocks above the floor; that tick and the two after it failed, the hold dropped their
+  movement while the setback was under way (`ConnectionSimulation.judge`), and the next correction brought the client
+  back down, while the server's position only went down. That hop is the vanilla client's answer to a correction that
+  came late, not a rise of the server.
 - **Testing disablers:** a cheat that leaves the sandbox unsure of what the client did, so that the tick's movement goes
   unchecked, has to be tested the way a cheat uses it. The proxy's `after-tick-end` sends its packet behind every tick
   end, where it leads the next tick's key handling, from a second before the shifted positions start, and the answers
