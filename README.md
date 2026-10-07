@@ -639,6 +639,32 @@ the floor between two hops, 13 samples and 44 blocks later in one of them, after
 end; the hops matched, but a run whose samples miss the floor until the player has left the course fails, so the test
 now lets go of jump once the server has the player within a jump of the floor.
 
+The final runs of the build that gives verdicts before a tick's simulation ends (see "Setbacks") passed all of their
+parts as well. The thirteen courses matched in all of their 19 623 simulated ticks and in all 19 532 of another run in
+which every tick of the player on foot ran a second time from its snapshot and ended the same, and the test of the tick
+rates matched in all of its 698. Over the five connections above, the courses and the block and combat tests matched in
+all of their 36 083 simulated ticks but the 46 with the cheats of those tests, which ClauAC refused as over a direct
+connection. Over a direct connection, ClauAC refused every cheat of the combat, block and `NoSwing` tests, and the tests
+of `Timer`, the tick budget, alerts, the two situations and the creative inventory passed as before. The tests of the
+setbacks, held and late, passed with each type: with `predicted` the server's position of the player followed the walk
+over the floor, from 107.33 to 112.31 blocks east while positions were reported 2 blocks higher and from 98.60 to 104.28
+while they were reported 4 blocks ahead, and the boat's followed its steering from 133.93 to 143.22; with `server` they
+stayed at 107.49, 98.50 and 134.28. No sample showed a shifted position, and Paper's movement checks saw nothing. The
+tests of the Fly hover and of the falls with Fly cheats passed with both types: with `predicted` the held height came
+down to the floor and all five falls ended on it, 5.7 to 7.5 blocks east of the start, and with `server` the server kept
+the player at 109.31 while the height was held; no sample of the server's position and no setback rose in the air in
+any fall, the simulation never jumped on the floor where the client stayed on it, and the flying report failed
+`BadPackets` with either type. The test of the disablers left none of the 843 ticks of its connection `UNVERIFIED`. The
+vanilla client's uncertain starts of breaking matched in all 1953 ticks of their check, its sprint attacks in all 4763,
+its breaking, placing and attacking while it turned its view in all 4503, and its crystal PvP in all 3067 ticks of
+`crystal_probe.sh`, in which ClauAC kept none of its actions from the server; over that probe's connection, the actions
+of 1096 ticks and all the packets of 15 316 of its 15 360 client ticks went on to the server early. None of the 86
+reports written during these runs contradicted a verdict given early. One tick each of two of the four runs of the
+setback test stayed `UNVERIFIED`, the first after the shifted positions ended, 1.4e-14 blocks off where the rounding of
+the velocity the simulation estimated after a correction leaves the outcome open, as in runs before. No tick failed
+`Inventory` but those of the imitated cheats of the test of the screens and of the clicks in the test of the disablers,
+and no player was kicked.
+
 ## Responses
 
 Every `MISMATCHED` tick names the checks it failed, each with what exactly failed; a tick can fail several at once.
@@ -1052,6 +1078,24 @@ server instead (see "Attacks and interactions", "Blocks and items" and "Swings")
   lets them go on in the order the client sent them. A packet that is neither goes on right away while nothing is
   held, and waits behind what is held otherwise, so that the server gets everything in its order. The packets go on
   from PacketEvents' decoder, past every packet listener, as if they arrived just then.
+- A tick's verdict can come before its simulation ends, and so can its packets. The checks of a tick's actions all run
+  during its key handling, before its movement, and an action is kept from the server only for a check of its own (see
+  "Attacks and interactions" and "Blocks and items"): once every action of the tick passed and none can fail any more,
+  the actions go on to the server right away, up to the tick's first movement packet, while the movement and everything
+  after it, the tick's end packet included, wait for the verdict. The one check of an action that runs after the tick,
+  that of an item a rider used, which waits for the turn its boat gives it, keeps the actions for the verdict. The
+  client sends its movement at the end of its player's tick (`LocalPlayer.sendPosition`) and ticks the other entities
+  and the block entities only after that (`Minecraft.tick`). Those only push the player, which changes its velocity and
+  nothing the comparison looks at, apart from a piston's moving block or an opening or closing shulker box next to the
+  player, which moves it when the block entities tick, and a shulker's lid, which moves it when that shulker ticks
+  (`Shulker.onPeekAmountChange`). A tick that matched as the player's tick left it therefore lets all of its packets go
+  right after the player's tick, without waiting for the rest of the tick, unless such a block or a shulker is near, the
+  player rides, the tick rejected anything or needed an alternative, or its report waits for the next tick to report a
+  hotbar switch. Neither happens while the report of an earlier tick is still on its way, and the hold lets packets go
+  early only once every earlier tick was judged, so that the server gets everything in its order. The tick's report
+  still comes afterwards. One that contradicted a verdict given early would be noted in the report, logged once, and end
+  the early verdicts of that connection, and a tick whose movement went on early and failed after all would be set back
+  like one whose packets went on unjudged (see below).
 - The movement packets of a failed tick are thrown away, and so are those of every tick after it until the client has
   taken a correction: a teleport that keeps the client's own rotation, to where the simulation moved the player with the
   velocity it ended the tick with, or back to where the server has the player with the velocity it had when the failed
@@ -1105,9 +1149,10 @@ server instead (see "Attacks and interactions", "Blocks and items" and "Swings")
 
 Every setback is logged, with where it puts the player. `/clauac status` adds a line per connection with the packets
 held so far and for how long, the movement packets and the actions kept from the server, the block predictions taken
-back, how often packets went on unjudged, and the setbacks by kind: corrections to where the simulation moved the
-player, with the movement packets the server got in place of the client's, corrections back to where the server had
-it, teleports on the server, and setbacks left out.
+back, how often packets went on unjudged, how many ticks let their actions and how many let all of their packets go
+early, and the setbacks by kind: corrections to where the simulation moved the player, with the movement packets the
+server got in place of the client's, corrections back to where the server had it, teleports on the server, and setbacks
+left out.
 
 Setbacks back to where the server has the player, the only kind before `setbacks.type`, were tried in game with a
 proxy between the client and the server that shifted the positions in the client's movement packets for three seconds
@@ -1231,6 +1276,29 @@ movement to the last digit. The simulation now takes over the jump cooldown of t
 in the six runs with it that followed and in the final runs, no tick showed a jump of the simulation on the floor where
 the client stayed on it, where six of the seven runs before had shown one to three, and no setback rose in the air. The
 test checks both.
+
+A player reported that the fast actions of crystal PvP, placing and breaking end crystals and using blocks with quick
+clicks, could not be done as fast under ClauAC. `crystal_probe.sh` has the vanilla client place an end crystal 2 blocks
+ahead with the use button and break it with the attack button in turns, a click every 0.05, 0.1 and 0.15 seconds, with
+and without the knockback of the explosions, and then place obsidian, blow up respawn anchors and hit a cow as fast.
+Every tick matched, and ClauAC kept none of these actions from the server: what slowed them down was the hold, which let
+a tick's actions go on only with the tick's verdict, and that came once the whole client tick had been simulated, the
+entities and block entities after the player included, and once the tick's line of the report had been written.
+`ab_latency.sh` measured through a proxy that logs the time of every packet how long the server took to show the client
+the crystal of a use and to take away the crystal of an attack, in three rounds of the steps with a click every 0.1 and
+0.15 seconds, with the client at 30 frames a second and a render distance of 6, since its software rendering takes most
+of the container's 4 processors otherwise and the answers varied with it. Without ClauAC the server answered a use after
+1.6 ms (the median; 4.0 ms at the 90th percentile) and an attack after 1.4 ms (4.1 ms); with the build before the early
+verdicts after 6.5 ms (11.8 ms) and 7.3 ms (13.1 ms), and with them after 4.8 ms (10.5 ms) and 5.2 ms (10.1 ms). Of
+that, 1.7 to 2.0 ms are the rest of the client's own tick, from the click to the tick's end packet, which the simulation
+of the tick waits for; from that packet on, the server answered after 3.0 and 2.9 ms, where it had taken 4.5 and 4.8 ms
+before. How many crystals a step placed the client's clicks decide: a use places nothing while the crystal before is
+still there for the client (`EndCrystalItem.useOn`), and with frames of up to 0.27 s, the clicks of several ticks come
+in one, where the client handles the attacks before the uses (see `CLAUDE.md`). With a click every 0.1 seconds the steps
+placed 25 to 28 crystals without ClauAC, 23 to 26 with the build before and 21 to 25 with the early verdicts, and with a
+click every 0.15 seconds 55 to 60 of their 60 in each. The runs of one build spread over 3 or 4 crystals, as far as the
+builds lie apart, and an earlier comparison of the two builds alone placed 25 and 20 with the build before and 21 and 22
+with the early verdicts.
 
 ### Alerts
 

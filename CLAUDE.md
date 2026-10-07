@@ -80,7 +80,11 @@ Findings from running the official 26.3 client in a cloud container without a GP
   peaceful alone. Chunks that load in a peaceful level drop the monsters stored in them that do not stay there, and the
   server logs a warning `Skipping Entity with id <type>` for each (`EntityType.canSpawn`).
 - **Console commands:** `~ ~ ~` in a console command means the console's position (the world spawn); run relative
-  commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`.
+  commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`. Paper's console thread
+  makes a line's command source as it reads the line (`PaperConsole` calls `DedicatedServer.createCommandSourceStack`,
+  whose level comes from `MinecraftServer.findRespawnDimension`), so a line written while the server still starts gets
+  a source without a level and fails once the server runs it ("Command exception", a `NullPointerException` in
+  `Commands.executeCommandInContext`): send console commands only after the server logged `Done`.
 - **Aiming the test player:** `tp ... facing` and `rotate ... facing` turn the player from the command source's anchor,
   which is the feet for the console (`LookAt`, `ServerPlayer.lookAt`), so a player told to face a cow's eyes looks well
   above it. Aim from the eyes with `execute anchored eyes run tp Tester <pos> facing <point>`. `rotate` turns a riding
@@ -99,6 +103,16 @@ Findings from running the official 26.3 client in a cloud container without a GP
   with the new item a tick before the server learns of it. The server keeps a player's slot, over restarts too, and
   gives it to the client when it joins, so a test finds the slot an earlier test left: one that depends on the held
   item selects its slot with its key first. A slot left that way once made a proxy's switch to it no switch.
+- **Clicking fast:** `xdotool click` (3.20160805) waits 100 ms after every click unless it is given `--delay 0`, with
+  `--repeat` or without, whatever its help says: five clicks in one command took 520 ms, and 32 ms with `--delay 0`.
+  Every start of xdotool costs about 30 ms more, and one process per click managed 62 clicks in 10 s. A test that
+  clicks every 50 ms sends a whole step from one process with xdotool's command chaining
+  (`click --delay 0 3 sleep 0.05 click --delay 0 1 ...`, `crystal_probe.sh`). The client handles in each tick every
+  attack click that came since the last tick, then every use click, then the pick, whatever order they came in
+  (`Minecraft.handleKeybinds`), and with frames of up to 0.27 s, the clicks of several ticks' time come in one tick. A
+  use does nothing while the client breaks a block (`Minecraft.startUseItem` returns while
+  `MultiPlayerGameMode.isDestroying`), and a held use button uses again only once `rightClickDelay`, which a use sets
+  to 4 and `Minecraft.tick` counts down, is 0.
 - **Typing into the chat:** the chat key opens the chat only in the client's next tick, and the keys typed until then
   act as key bindings. Commands typed right after the client joined went missing that way (with the 26.2 client, a
   press of the chat key opened nothing, and the command's `l` opened the advancements). Type only once a screenshot
@@ -243,3 +257,22 @@ Findings from running the official 26.3 client in a cloud container without a GP
   behind the entities the client has, but the server then sends each entity around it again, which
   `ClientLevel.addEntity` adds anew behind the player (it removes the one with the same id first): a cow summoned
   before the respawn pushed the player only after the player's tick.
+- **Answer times:** `protocol_proxy.py --trace-seconds` stamps every traced packet with `time.monotonic()`, which reads
+  the same clock as Java's `System.nanoTime` (CLOCK_MONOTONIC on Linux: a `System.nanoTime` read between two
+  `time.monotonic_ns` reads lay between them every time), so times the plugin takes with `System.nanoTime` line up with
+  the proxy's trace. `crystal_probe.sh --trace` traces the client's item uses, attacks and tick ends and the entities
+  the server adds and removes; `crystal_trace_analysis.py` measures how long the server took to show each crystal and
+  to take it away, and `hold_breakdown.py` splits that time into the part up to the client's tick end and the part
+  after it.
+- **Comparing builds:** `server_ctl.sh start-jar <jar>` starts the Paper of the last `start` with that plugin jar in
+  place of the one Gradle builds, and `start-plain` starts it without ClauAC. `ab_latency.sh <label>=<jar>... [rounds]`,
+  with `plain` for the server without ClauAC, runs the traced crystal steps against each in turn, turns the order by one
+  every round and pools the times of each (`ab_summary.py`). The client's software rendering takes most of the 4
+  processors, and the server's answers varied with it: with the client's own options, the build with early verdicts
+  answered crystal uses after 5.3 and 5.9 ms (medians of two steps) where the build before took 5.1 and 6.0, while with
+  `maxFps` 30 and `renderDistance` 6, which `ab_latency.sh` sets for its runs, it answered after 4.7 ms where the build
+  before took 6.1. Compare builds within one run and under the same client options only.
+- **Profiling:** `jcmd <pid> JFR.start settings=profile ...` on Paper's Java process records the simulation threads as
+  well. `jfr print` shows 5 frames of each stack unless `--stack-depth` asks for more, and the recording keeps only as
+  many as `-XX:FlightRecorderOptions=stackdepth=<n>` allows (add it to `JAVA_TOOL_OPTIONS`): with the default, 28 of
+  the 5103 samples of a crystal probe were cut off after 53 to 60 frames, and none of 13 352 with `stackdepth=512`.
