@@ -31,7 +31,8 @@ import org.slf4j.Logger;
 
 // - Records the simulation results of one connection: every client tick as a CSV line, mismatches in the server log, -
 // - and, while enabled, the latest result in the player's action bar. A failed tick also goes to the responses, and -
-// - every tick's verdict goes to the connection, which lets the tick's packets on to the server -
+// - every tick's verdict goes to the connection, which lets the tick's packets on to the server, as do the verdicts -
+// - the simulation gives before a tick's simulation ends (onActionsPassed, onTickMatched) -
 final class TickReporter implements SimulationListener {
 
     private static final String CSV_HEADER = "clientTick,outcome,predictedX,predictedY,predictedZ,predictedOnGround,predictedHorizontalCollision,"
@@ -116,6 +117,12 @@ final class TickReporter implements SimulationListener {
             if (report.outcome() == TickOutcome.MISMATCHED && report.offset() > this.largestMismatch) {
                 this.largestMismatch = report.offset();
             }
+        }
+        // - The verdict goes to the connection first, which lets the tick's packets go on with it: the record of the -
+        // - tick below changes nothing about it -
+        TickResponse response = report.outcome() == TickOutcome.MISMATCHED ? this.responses.onFailedTick(this.player, report) : TickResponse.NONE;
+        this.connection.onVerdict(report, end, response);
+        synchronized (this) {
             if (this.csv != null) {
                 try {
                     this.csv.write(csvLine(report, nearby, simulationNanos));
@@ -136,8 +143,24 @@ final class TickReporter implements SimulationListener {
         if (this.actionBarEnabled) {
             this.showInActionBar(report);
         }
-        TickResponse response = report.outcome() == TickOutcome.MISMATCHED ? this.responses.onFailedTick(this.player, report) : TickResponse.NONE;
-        this.connection.onVerdict(report, end, response);
+    }
+
+    @Override
+    public void onActionsPassed(TickEnd end, long previousEnd) {
+        if (!this.isClosed()) {
+            this.connection.onActionsPassed(end, previousEnd);
+        }
+    }
+
+    @Override
+    public void onTickMatched(TickEnd end, long previousEnd) {
+        if (!this.isClosed()) {
+            this.connection.onTickMatched(end, previousEnd);
+        }
+    }
+
+    private synchronized boolean isClosed() {
+        return this.closed;
     }
 
     private static String csvLine(ClientTickReport report, boolean entityNearby, long simulationNanos) {

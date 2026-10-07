@@ -152,6 +152,8 @@ import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.ai.attributes.Attribute;
 import net.minecraft.world.entity.ai.attributes.AttributeMap;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.ai.attributes.RangedAttribute;
+import net.minecraft.world.entity.monster.Shulker;
 import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.vehicle.boat.AbstractBoat;
@@ -201,6 +203,10 @@ final class PlayConnection implements ClientContext {
     private static final boolean VERIFY_REPEATED_TICKS = Boolean.getBoolean("clauac.verifyRepeatedTicks");
     // - A block entity this far from the player's box can still move the player when the block entities tick -
     private static final double MOVING_BLOCK_REACH = 2.0;
+    // - A shulker's lid moves what it meets while it opens and closes (Shulker.onPeekAmountChange), as far beyond the -
+    // - shulker as the shulker's scale makes its lid go (Shulker.getProgressDeltaAabb): a shulker this far from the -
+    // - player's box cannot move the player, whatever the scale attribute allows it (Attributes.SCALE) -
+    private static final double SHULKER_REACH = MOVING_BLOCK_REACH * ((RangedAttribute) Attributes.SCALE.value()).getMaxValue();
     // - The player pushes the entities its box touches during its tick; its movement can carry the box this far -
     private static final double PUSH_REACH = 1.0;
     // - How far below an entity's box vanilla looks for what the entity stands on (Entity.checkSupportingBlock) -
@@ -1131,13 +1137,13 @@ final class PlayConnection implements ClientContext {
     // - Returns the reports that are final, in the order of the client's ticks: a report may be held back for one tick. -
     // - A failure of the simulation makes the tick MISMATCHED instead of ending the simulation, so that no packet a -
     // - client sends can switch it off -
-    List<ClientTickReport> tick(long clientTick, boolean repositionPending) {
+    List<ClientTickReport> tick(long clientTick, boolean repositionPending, EarlyVerdicts early) {
         this.lastEndedTick = clientTick;
         this.lastTickKeys = null;
         this.tickStart = this.currentStart(repositionPending);
         List<ClientTickReport> reports = new ArrayList<>(2);
         try {
-            ClientTickReport report = this.simulateTick(clientTick, reports);
+            ClientTickReport report = this.simulateTick(clientTick, reports, early);
             if (report != null) {
                 reports.add(report);
             }
@@ -1220,8 +1226,11 @@ final class PlayConnection implements ClientContext {
     }
 
     // - Everything of a client tick up to the comparison. Returns the tick's report, or null when it is held back; a -
-    // - report released from the previous tick goes to reports first -
-    private @Nullable ClientTickReport simulateTick(long clientTick, List<ClientTickReport> reports) {
+    // - report released from the previous tick goes to reports first. The verdicts the tick has before the end go to -
+    // - early as soon as they are final: that the tick's actions all passed, once the key handling ran them, and that -
+    // - the tick matched, once the local player ticked (see matchedAfterPlayerTick). Neither goes while a report -
+    // - released from the previous tick still has to reach the listener -
+    private @Nullable ClientTickReport simulateTick(long clientTick, List<ClientTickReport> reports, EarlyVerdicts early) {
         Input reportedKeys = this.lastSent.input;
         boolean reportedSprinting = this.lastSent.sprinting;
         SandboxLevel tickLevel = this.level;
@@ -1234,6 +1243,7 @@ final class PlayConnection implements ClientContext {
         this.groundKeptThisTick = this.groundKeptOverCorrection;
         this.groundKeptOverCorrection = false;
         this.releaseHeldReport(tickPlayer, reports);
+        EarlyVerdicts tickEarly = reports.isEmpty() ? early : EarlyVerdicts.NONE;
         tickLevel.tickRateManager().tick();
         // - The rotation of the whole tick, which the client's key and mouse actions already used. A riding player -
         // - reports it after its vehicle turned it during the tick -
@@ -1247,6 +1257,9 @@ final class PlayConnection implements ClientContext {
         }
         tickPlayer.setReportedKeys(reportedKeys);
         this.performTickActions(tickLevel, tickPlayer);
+        if (!this.tickPackets.actions.isEmpty() && this.actionsPassedForGood()) {
+            tickEarly.actionsPassed();
+        }
         if (!this.clientLoaded || tickPlayer.isRemoved()) {
             // - The client ticks its level but not the player, and sends no movement -
             tickLevel.tickEntities();
@@ -1267,7 +1280,13 @@ final class PlayConnection implements ClientContext {
         Entity vehicleBeforeTick = tickPlayer.getRootVehicle();
         Vec3 vehiclePositionBeforeTick = vehicleBeforeTick.position();
         this.alternativeResult = null;
-        tickLevel.setLocalPlayerTick(entity -> this.tickLocalPlayer(tickLevel, tickPlayer));
+        tickLevel.setLocalPlayerTick(entity -> {
+            this.tickLocalPlayer(tickLevel, tickPlayer);
+            // - A tick whose report waits for the next tick to report a hotbar switch is decided then -
+            if (inferredSwitch == null && this.matchedAfterPlayerTick(tickLevel, tickPlayer)) {
+                tickEarly.tickMatched();
+            }
+        });
         try {
             tickLevel.tickEntities();
         } finally {
@@ -1324,6 +1343,35 @@ final class PlayConnection implements ClientContext {
             return null;
         }
         return report;
+    }
+
+    // - Whether every action of the tick passed its checks for good, right after the key handling ran them: none of -
+    // - them failed a check, and no item use waits for the turn the boat gives its rider after the tick -
+    // - (checkRiderUses), the only check of an action that runs later -
+    private boolean actionsPassedForGood() {
+        return this.riderUses.isEmpty() && this.tickPackets.rejections.stream().noneMatch(flag -> flag.check().concernsActions());
+    }
+
+    // - Whether the tick matched as the local player's tick left it, where nothing that ticks after the player can -
+    // - change that: what the comparison looks at (see slotDifferences) moves only with the player itself, apart from -
+    // - blocks moving next to it (a piston, a shulker box), which move it when the block entities tick after the -
+    // - entities, and a shulker's lid, which moves it when that shulker ticks. Everything else that ticks after the -
+    // - player only pushes it, which changes its velocity, not what the comparison looks at. The tick must reject -
+    // - nothing, also nothing an item use only shows after the tick (checkRiderUses), the player must not ride, and -
+    // - the tick must have needed no alternative: the one that matched may stop an item use, which holds the report -
+    // - back for the next tick to explain (see simulateTick) -
+    private boolean matchedAfterPlayerTick(SandboxLevel level, SandboxPlayer player) {
+        if (player.isRemoved() || player.isPassenger() || !this.riderUses.isEmpty() || !this.tickPackets.rejections.isEmpty()) {
+            return false;
+        }
+        if (this.alternativeResult != null && !(this.alternativeResult instanceof AlternativeResult.SimulatedMatched)) {
+            return false;
+        }
+        AABB box = player.getBoundingBox();
+        if (level.hasEntityMovingBlockEntityNear(box.inflate(MOVING_BLOCK_REACH)) || !level.getEntitiesOfClass(Shulker.class, box.inflate(SHULKER_REACH)).isEmpty()) {
+            return false;
+        }
+        return this.slotDifferences(player).isEmpty();
     }
 
     // - The keys and the rotation of a tick in which a screen of the client was open (see ScreenTracker). from is the -

@@ -16,7 +16,9 @@ import org.jspecify.annotations.Nullable;
 // - throws the movement of a tick away when the tick is to be set back, and each action that failed a check; a set -
 // - back tick's movement can be replaced by the one the simulation gave it (see substituteMovement). The packets go -
 // - on to the server in the order the client sent them: a packet a verdict cannot throw away goes on right away -
-// - while nothing is held, and otherwise waits behind what is held. -
+// - while nothing is held, and otherwise waits behind what is held. A verdict the simulation gives before the tick's -
+// - simulation ends lets packets go early: the tick's actions once they all passed their checks (see -
+// - releasePassedActions), the whole tick once it matched (see releaseMatched). -
 // - A held packet is copied and its buffer emptied, which the vanilla decoder after PacketEvents' passes over, and -
 // - it goes on later from PacketEvents' decoder, past every packet listener, as if it came just then. -
 // -
@@ -84,7 +86,7 @@ final class TickHold {
     // - What the hold did so far, for /clauac status -
     record Statistics(
             int heldNow, long oldestHeldNanos, long releasedPackets, long holdNanos, long longestHoldNanos, long droppedMovement, long droppedActions,
-            long unjudgedReleases, long substitutedMovement
+            long unjudgedReleases, long substitutedMovement, long earlyActionReleases, long earlyTickReleases
     ) {
     }
 
@@ -98,6 +100,9 @@ final class TickHold {
     // - Through which of them the simulation judged the client's ticks, and through which packets went on unjudged -
     private long judgedThrough;
     private long unjudgedThrough;
+    // - Through which of them the ticks matched by an early verdict (see releaseMatched), which lets their packets go -
+    // - like a verdict, ahead of the tick's report -
+    private long matchedThrough;
     private boolean droppingMovement;
     // - The movement of the client's packets through this one never reaches the server: they belong to ticks that -
     // - are set back -
@@ -125,6 +130,9 @@ final class TickHold {
     private volatile long droppedActions;
     private volatile long unjudgedReleases;
     private volatile long substitutedMovement;
+    // - The ticks whose actions, and the ticks that as a whole, went on on an early verdict -
+    private volatile long earlyActionReleases;
+    private volatile long earlyTickReleases;
 
     // - Off until the connection turns out to be simulated from its start (see enable) -
     TickHold(User user) {
@@ -182,15 +190,47 @@ final class TickHold {
         }
     }
 
-    // - Whether packets of the tick whose verdict comes next went on before it: when the hold is off, or when they -
-    // - were released unjudged. Asked before judged -
+    // - Whether packets of the tick whose verdict comes next went on before it: when the hold is off, when they were -
+    // - released unjudged, or when an early verdict that the tick matched let them go. Asked before judged -
     boolean wentOnUnjudged() {
-        return !this.enabled || this.unjudgedThrough > this.judgedThrough;
+        return !this.enabled || this.unjudgedThrough > this.judgedThrough || this.matchedThrough > this.judgedThrough;
     }
 
     // - The simulation judged the client's ticks through this serverbound packet (TickEnd.serverboundPackets) -
     void judged(long through, long now) {
         this.judgedThrough = Math.max(this.judgedThrough, through);
+        this.releaseJudged(now);
+    }
+
+    // - Every action of the tick that ends at tickEnd passed its checks, for good (see -
+    // - SimulationListener.onActionsPassed): what is held of that tick goes on up to its first movement packet, -
+    // - which waits for the tick's verdict together with everything after it, the tick's end packet included. Only -
+    // - once every tick before it was judged (previousEnd is where the tick before it ended): the packets ahead of it -
+    // - may still be thrown away otherwise. An action that only reaches the hold afterwards waits for the verdict -
+    void releasePassedActions(long previousEnd, long tickEnd, long now) {
+        if (!this.enabled || this.judgedThrough < previousEnd) {
+            return;
+        }
+        boolean released = false;
+        Held head;
+        while ((head = this.held.peekFirst()) != null && head.sequence() < tickEnd && (head.type() == null || !MOVEMENT.contains(head.type()))) {
+            this.release(this.held.removeFirst(), now);
+            released = true;
+        }
+        if (released) {
+            this.earlyActionReleases++;
+        }
+        this.updateOldest();
+    }
+
+    // - The tick that ends at tickEnd matched (see SimulationListener.onTickMatched): its packets go on as on its -
+    // - verdict, once every tick before it was judged (previousEnd is where the tick before it ended) -
+    void releaseMatched(long previousEnd, long tickEnd, long now) {
+        if (!this.enabled || this.judgedThrough < previousEnd || tickEnd <= this.matchedThrough) {
+            return;
+        }
+        this.matchedThrough = tickEnd;
+        this.earlyTickReleases++;
         this.releaseJudged(now);
     }
 
@@ -282,15 +322,17 @@ final class TickHold {
 
     Statistics statistics() {
         return new Statistics(this.heldNow, this.oldestHeldNanos, this.releasedPackets, this.holdNanos, this.longestHoldNanos,
-                this.droppedMovement, this.droppedActions, this.unjudgedReleases, this.substitutedMovement);
+                this.droppedMovement, this.droppedActions, this.unjudgedReleases, this.substitutedMovement, this.earlyActionReleases,
+                this.earlyTickReleases);
     }
 
-    // - The packets at the head go on as far as the verdicts allow: everything through the last judged tick, and -
-    // - after it whatever no verdict can throw away, up to the next packet one can -
+    // - The packets at the head go on as far as the verdicts allow: everything through the last judged or matched -
+    // - tick, and after it whatever no verdict can throw away, up to the next packet one can -
     private void releaseJudged(long now) {
+        long through = Math.max(this.judgedThrough, this.matchedThrough);
         Held head;
         while ((head = this.held.peekFirst()) != null
-                && (head.sequence() <= this.judgedThrough || head.type() == null || !JUDGED.contains(head.type()))) {
+                && (head.sequence() <= through || head.type() == null || !JUDGED.contains(head.type()))) {
             this.release(this.held.removeFirst(), now);
         }
         if (this.held.isEmpty()) {

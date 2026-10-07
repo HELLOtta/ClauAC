@@ -561,6 +561,19 @@ final class ConnectionSimulation {
         this.runInEventLoop(() -> this.judge(report, end, response));
     }
 
+    // - From the simulation thread, ahead of the tick's verdict: every action of the tick that ends at end passed its -
+    // - checks for good (SimulationListener.onActionsPassed), so they go on to the server now. The event loop runs -
+    // - this after the verdicts of the ticks before, which the simulation gave first -
+    void onActionsPassed(TickEnd end, long previousEnd) {
+        this.runInEventLoop(() -> this.hold.releasePassedActions(previousEnd, end.serverboundPackets(), System.nanoTime()));
+    }
+
+    // - From the simulation thread, ahead of the tick's verdict: the tick that ends at end matched -
+    // - (SimulationListener.onTickMatched), so its packets go on to the server now -
+    void onTickMatched(TickEnd end, long previousEnd) {
+        this.runInEventLoop(() -> this.hold.releaseMatched(previousEnd, end.serverboundPackets(), System.nanoTime()));
+    }
+
     // - The tick's packets go on to the server as far as the verdict allows, without their movement when the tick is -
     // - set back and without the actions that failed a check. A tick that fails while a setback is under way needs -
     // - no setback of its own when the client had not taken the correction yet before the tick: the correction on -
@@ -838,12 +851,14 @@ final class ConnectionSimulation {
         double averageMillis = held.releasedPackets() > 0L ? held.holdNanos() / NANOS_PER_MILLISECOND / held.releasedPackets() : 0.0;
         return String.format(Locale.ROOT,
                 "%s: %d packets held now, %d held so far for %.2f ms on average and at most %.1f ms, %d movement packets and "
-                        + "%d actions kept from the server, %d block predictions taken back, %d times let go unjudged; %d setbacks: "
+                        + "%d actions kept from the server, %d block predictions taken back, %d times let go unjudged, the actions of %d "
+                        + "ticks and %d whole ticks let go early; %d setbacks: "
                         + "%d teleports and %d vehicle corrections to where the simulation moved the player, with %d movement packets "
                         + "in place of the client's, %d teleports and %d vehicle corrections to where the server had it, %d teleports on "
                         + "the server, %d skipped",
                 this.user.getName(), held.heldNow(), held.releasedPackets(), averageMillis, held.longestHoldNanos() / NANOS_PER_MILLISECOND,
-                held.droppedMovement(), held.droppedActions(), this.predictionsAcknowledged, held.unjudgedReleases(), this.setbacksRequested,
+                held.droppedMovement(), held.droppedActions(), this.predictionsAcknowledged, held.unjudgedReleases(), held.earlyActionReleases(),
+                held.earlyTickReleases(), this.setbacksRequested,
                 this.predictedPositionCorrections, this.predictedVehicleCorrections, held.substitutedMovement(), this.positionCorrections,
                 this.vehicleCorrections, this.serverTeleports, this.setbacksSkipped);
     }

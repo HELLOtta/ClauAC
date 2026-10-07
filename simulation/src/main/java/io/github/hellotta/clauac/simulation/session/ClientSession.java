@@ -98,10 +98,17 @@ public final class ClientSession implements PlayerSimulation {
     private long clientTick;
     // - The serverbound packets handed in so far, as TickEnd counts them -
     private long serverboundPackets;
-    // - The tick whose report the play connection holds back, and that tick's time and end, which go with the report -
+    // - The tick whose report the play connection holds back, and that tick's time and end, which go with the report, -
+    // - and the verdicts that tick gave early, which its report must not contradict -
     private long heldTick = -1L;
     private long heldTickNanos;
     private @Nullable TickEnd heldTickEnd;
+    private EarlyVerdicts heldTickEarlyVerdicts = EarlyVerdicts.NONE;
+    // - Where the client's previous tick ended, as TickEnd counts (0 before the first): a verdict a tick gives early -
+    // - lets its packets go only once every tick before it was judged -
+    private long previousTickEnd;
+    // - Why this connection gives no verdicts early any more: a tick's report contradicted one (see deliver) -
+    private @Nullable String earlyVerdictsOff;
 
     public ClientSession(
             UUID profileId, String profileName, SimulationListener listener, ServerRegistryCache registryCache, Executor simulationThreads, SimulationLimits limits
@@ -182,11 +189,28 @@ public final class ClientSession implements PlayerSimulation {
         if (ending != null) {
             ClientTickReport held = ending.takeHeldReport("the play phase ended before the client reported the hotbar switch this tick assumed");
             if (held != null) {
-                this.listener.onClientTick(held, this.heldTickNanos(held), this.heldTickEnd(held));
+                this.deliver(held, this.heldTickNanos(held), this.heldTickEnd(held), this.heldTickEarlyVerdicts);
             }
         }
         this.heldTick = -1L;
         this.heldTickEnd = null;
+        this.heldTickEarlyVerdicts = EarlyVerdicts.NONE;
+    }
+
+    // - Hands a tick's report to the listener. A report that contradicts a verdict its tick gave early turns the -
+    // - early verdicts of this connection off for good: the packets that verdict let go have reached the server -
+    private void deliver(ClientTickReport report, long simulationNanos, TickEnd end, EarlyVerdicts early) {
+        ClientTickReport delivered = report;
+        String contradiction = early.contradiction(report);
+        if (contradiction != null) {
+            if (this.earlyVerdictsOff == null) {
+                this.earlyVerdictsOff = contradiction;
+                this.problemLog.log("gave client tick " + report.clientTick() + " a verdict early that its report contradicts, and gives none early any more",
+                        new EarlyVerdictContradiction(contradiction));
+            }
+            delivered = report.withNote("contradicted the verdict given early: " + contradiction);
+        }
+        this.listener.onClientTick(delivered, simulationNanos, end);
     }
 
     // - The time of the tick whose report the play connection held back -
@@ -481,6 +505,8 @@ public final class ClientSession implements PlayerSimulation {
     private void endClientTick(long arrivedAt) {
         this.clientTick++;
         TickEnd end = new TickEnd(this.serverboundPackets, arrivedAt);
+        EarlyVerdicts early = this.earlyVerdictsOff == null ? new EarlyVerdicts(this.listener, end, this.previousTickEnd) : EarlyVerdicts.NONE;
+        this.previousTickEnd = end.serverboundPackets();
         // - The server's packets that will move the player but that the client had not processed when the tick began -
         boolean repositionPending = this.pending.findFirst(PlayConnection::repositionsPlayer) != null;
         PlayConnection connection = this.play;
@@ -498,7 +524,7 @@ public final class ClientSession implements PlayerSimulation {
             return;
         }
         List<ClientTickReport> reports = inBudget
-                ? connection.tick(this.clientTick, repositionPending)
+                ? connection.tick(this.clientTick, repositionPending, early)
                 : connection.skipTick(this.clientTick, new Flag(Check.TICK_RATE, String.format(Locale.ROOT,
                         "the client ended more ticks than real time allows, one per %.1f ms and at once those of %d ms, so this tick was not simulated",
                         millisPerTick, TimeUnit.NANOSECONDS.toMillis(this.limits.maximumTickBurstNanos()))), repositionPending);
@@ -506,20 +532,22 @@ public final class ClientSession implements PlayerSimulation {
         boolean delivered = false;
         for (ClientTickReport report : reports) {
             if (report.clientTick() == this.clientTick) {
-                this.listener.onClientTick(report, tickNanos, end);
+                this.deliver(report, tickNanos, end, early);
                 delivered = true;
             } else {
-                this.listener.onClientTick(report, this.heldTickNanos(report), this.heldTickEnd(report));
+                this.deliver(report, this.heldTickNanos(report), this.heldTickEnd(report), this.heldTickEarlyVerdicts);
             }
         }
         if (delivered) {
             this.heldTick = -1L;
             this.heldTickEnd = null;
+            this.heldTickEarlyVerdicts = EarlyVerdicts.NONE;
         } else {
             // - The play connection held this tick's report back -
             this.heldTick = this.clientTick;
             this.heldTickNanos = tickNanos;
             this.heldTickEnd = end;
+            this.heldTickEarlyVerdicts = early;
         }
     }
 
@@ -538,6 +566,18 @@ public final class ClientSession implements PlayerSimulation {
                 false, Double.NaN, Double.NaN, Double.NaN, false, false, false,
                 Double.NaN, null, ClientTickReport.Start.none(repositionPending), rejections, notes
         );
+    }
+
+    // - What a report contradicted of the verdicts its tick gave early (see deliver). The message tells everything, a -
+    // - stack trace would not -
+    private static final class EarlyVerdictContradiction extends Exception {
+
+        @Serial
+        private static final long serialVersionUID = 1L;
+
+        private EarlyVerdictContradiction(String message) {
+            super(message, null, false, false);
+        }
     }
 
     // - Why the simulation stopped when it fell behind. The message tells everything, a stack trace would not; a -
