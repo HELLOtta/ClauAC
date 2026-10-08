@@ -32,6 +32,12 @@ version on the classpath (see [`gradle/libs.versions.toml`](gradle/libs.versions
 - Ports keep the client's order of operations. Leave out only what renders, plays sounds or shows screens, and say in
   a comment what was left out. Anything the sandbox cannot reproduce must be reported (`UNVERIFIED` with a note), never
   approximated silently.
+- The sandbox's players extend the server's `Player`, so a method that only the client's classes override keeps the
+  common behaviour in the sandbox until it is ported. Compare the overrides of `LocalPlayer`, `AbstractClientPlayer`
+  and `RemotePlayer` (`javap -p` on the client jar, matched against the server's `Player`, `LivingEntity` and
+  `Entity`) with the sandbox's players whenever a port changes: `LocalPlayer.getViewYRot` looks along the player's
+  own yaw where `LivingEntity.getViewYRot` follows the head's, which takes it up only in `Player.aiStep`, and the
+  sandbox missed it until a vanilla client that broke blocks while it turned its view fast failed `Hitbox`.
 
 ## Verify by running it
 
@@ -63,22 +69,210 @@ Findings from running the official 26.3 client in a cloud container without a GP
 - **Test world settings:** game rule ids are snake_case in 26.3 (`log_admin_commands`, `advance_time`,
   `drowning_damage`). Set `broadcast-console-to-ops=false` in `run/server.properties` for recordings, otherwise console
   commands fill the chat and cover the action bar. A test player left idle under water drowns, so turn
-  `drowning_damage` off on the test world.
+  `drowning_damage` off on the test world. Phantoms come for a player that has gone more than 72000 ticks without
+  sleeping whenever the sky is dark enough (`PhantomSpawner`), which a thunderstorm makes it even at a stopped noon, and
+  they killed an idle test player: turn `spawn_phantoms` off, clear the weather and turn `advance_weather` off.
+- **The nether:** resistance 255 takes the damage of an attack away, not its knockback: a piglin that attacked an idle
+  test player twice right beside the portal it had arrived through pushed it out of that portal. In a peaceful level no
+  mob takes a player for its target (`LivingEntity.canAttack`); piglins stay in a peaceful level, most other monsters
+  leave it (`EntityType.isAllowedInPeaceful`). Paper keeps a difficulty for every level, which the `difficulty` command
+  reads and sets for the level it runs in: `execute in minecraft:the_nether run difficulty peaceful` makes the nether
+  peaceful alone. Chunks that load in a peaceful level drop the monsters stored in them that do not stay there, and the
+  server logs a warning `Skipping Entity with id <type>` for each (`EntityType.canSpawn`).
 - **Console commands:** `~ ~ ~` in a console command means the console's position (the world spawn); run relative
-  commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`.
+  commands through the player, e.g. `execute as Tester at @s run summon minecraft:cow ^ ^ ^2`. Paper's console thread
+  makes a line's command source as it reads the line (`PaperConsole` calls `DedicatedServer.createCommandSourceStack`,
+  whose level comes from `MinecraftServer.findRespawnDimension`), so a line written while the server still starts gets
+  a source without a level and fails once the server runs it ("Command exception", a `NullPointerException` in
+  `Commands.executeCommandInContext`): send console commands only after the server logged `Done`.
+- **Aiming the test player:** `tp ... facing` and `rotate ... facing` turn the player from the command source's anchor,
+  which is the feet for the console (`LookAt`, `ServerPlayer.lookAt`), so a player told to face a cow's eyes looks well
+  above it. Aim from the eyes with `execute anchored eyes run tp Tester <pos> facing <point>`. `rotate` turns a riding
+  player without taking it off its vehicle.
 - **Key presses:** `xdotool key` releases the key within the same client tick, which the client's per-tick key polling
-  can miss (a double tap of jump to fly never registers). Hold keys with `keydown`, `sleep 0.1`, `keyup`.
+  can miss (a double tap of jump to fly never registers). Hold keys with `keydown`, `sleep 0.1`, `keyup`. Even held that
+  way, a double tap of jump started flying in one of three tries: the client takes in its keys once a frame, and with
+  frames of up to 0.27 s the release between the two presses can go unseen, or the second press come later than the 7
+  ticks it has to follow the first within (`LocalPlayer.aiStep`, `jumpTriggerTime`).
+- **Hotbar keys:** the client takes in keys once a frame and handles the number keys that came since in the order of
+  their slots, not of the presses (`Minecraft.handleKeybinds`): two number keys pressed within one frame select the
+  higher slot. It reports the slot at the start of the next tick (`MultiPlayerGameMode.tick` runs before
+  `handleKeybinds`) or with the first action that needs it, so an action a proxy injects right after a number key goes
+  out with the slot before. Wait a second after a number key before anything that depends on it. A start of breaking
+  does not report the slot (`MultiPlayerGameMode.startDestroyBlock`): `xdotool keydown <n> mousedown 1` starts breaking
+  with the new item a tick before the server learns of it. The server keeps a player's slot, over restarts too, and
+  gives it to the client when it joins, so a test finds the slot an earlier test left: one that depends on the held
+  item selects its slot with its key first. A slot left that way once made a proxy's switch to it no switch.
+- **Clicking fast:** `xdotool click` (3.20160805) waits 100 ms after every click unless it is given `--delay 0`, with
+  `--repeat` or without, whatever its help says: five clicks in one command took 520 ms, and 32 ms with `--delay 0`.
+  Every start of xdotool costs about 30 ms more, and one process per click managed 62 clicks in 10 s. A test that
+  clicks every 50 ms sends a whole step from one process with xdotool's command chaining
+  (`click --delay 0 3 sleep 0.05 click --delay 0 1 ...`, `crystal_probe.sh`). The client handles in each tick every
+  attack click that came since the last tick, then every use click, then the pick, whatever order they came in
+  (`Minecraft.handleKeybinds`), and with frames of up to 0.27 s, the clicks of several ticks' time come in one tick. A
+  use does nothing while the client breaks a block (`Minecraft.startUseItem` returns while
+  `MultiPlayerGameMode.isDestroying`), and a held use button uses again only once `rightClickDelay`, which a use sets
+  to 4 and `Minecraft.tick` counts down, is 0.
+- **Typing into the chat:** the chat key opens the chat only in the client's next tick, and the keys typed until then
+  act as key bindings. Commands typed right after the client joined went missing that way (with the 26.2 client, a
+  press of the chat key opened nothing, and the command's `l` opened the advancements). Type only once a screenshot
+  shows the chat's input line, a black box at half opacity along the bottom of the screen, and press the chat key
+  again when it does not show.
 - **Stopping the client:** `pkill -f <pattern>` also matches the shell that runs the command when the pattern appears
   in it, and kills that shell. Kill the client by the PID of its `net.minecraft.client.main.Main` process instead.
 - **Simulation results:** `run/plugins/ClauAC/reports/*.csv` has one line per client tick; `/clauac debug` shows the
   outcome of every tick in the action bar. The CSV is written through a buffer and lags a few seconds behind; for the
-  current client tick, run `clauac status` on the console, which prints one line per connection.
+  current client tick, run `clauac status` on the console, which prints a line with the outcomes of every connection
+  and, for a simulated one, a second line with what its simulation costs.
 - **Rebuilding:** `runServer` loads the plugin jar straight from `build/libs`. Building while the server runs replaces
-  the jar under it and later fails with `NoClassDefFoundError`, so stop the server before building.
+  the jar under it and later fails with `NoClassDefFoundError`, so stop the server before building. `runServer` builds
+  that jar from the working tree first, and so does every start of the server through Gradle, the restart of a
+  validation part with a system property included: a validation of a commit runs with nothing else in the working tree,
+  or its later parts test other code (one such restart put uncommitted changes into the last part of a validation).
+- **System properties:** the container already sets `JAVA_TOOL_OPTIONS` for its HTTPS proxy, so add ClauAC's
+  properties to it instead of replacing it, e.g.
+  `JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Dclauac.verifyRepeatedTicks=true" ./gradlew runServer`.
+- **Holding the client's packets** (a proxy imitating a stalled connection): Paper disconnects a client that sent more
+  than 500 packets per second over 7 s. The test client sends about 80 to 170 packets per second, most of them pongs
+  to ClauAC's pings, which ClauAC takes out before Paper counts them: releasing 25 s of held packets (3052) stayed
+  below the limit, together with a flood of 1500 tick ends 12 s later.
 - **A second player:** start another client with its own game directory (a copy of `options.txt` with a low
   `maxFps` and `renderDistance` keeps both clients responsive). Both windows share the Xvfb display: find them with
   `xdotool search --pid <pid>`, move the second one off screen with `xdotool windowmove`, and give the first one the
   keyboard with `xdotool windowfocus`.
 - **Test world:** blocks placed by earlier tests stay in the world and get in the way of later courses (a leftover
   furnace swallowed the clicks meant for a chest). Clear them before a recording, for example with
-  `fill <from> <to> minecraft:air replace <block>`, which leaves the course itself alone.
+  `fill <from> <to> minecraft:air replace <block>`, which leaves the course itself alone. Tests that break blocks can
+  break the floor as well: through the holes the flick probe broke in its wall, the crosshair reached the floor behind
+  it, and the players of the next tests fell through the block it broke there.
+  `fill <from> <to> minecraft:stone replace minecraft:air` over the floor reports how many of its blocks were missing.
+- **config.yml of the dev server:** `saveDefaultConfig` never overwrites `run/plugins/ClauAC/config.yml`, so after a
+  new setting was added the file lacks it and the setting takes its default. Delete the file before starting the
+  server to get the current one with its comments.
+- **Testing setbacks:** a proxy that changes the positions in the client's movement packets imitates a movement cheat
+  without a cheat client; the server's own position of the player can be sampled with `data get entity <name> Pos` on
+  the console meanwhile. Findings from that: the client answers a vehicle correction (`ClientboundMoveVehiclePacket`)
+  with a vehicle move packet right away, before the pong behind it; since the simulation continues from what a failed
+  tick reported, a tick that fails after the client took a correction needs a setback of its own, or the ticks after it
+  match and their movement reaches the server; and the client answers a teleport with its acceptance, which carries
+  its resulting position after the teleport's id and which such a proxy has to shift as well to imitate the cheat.
+  With `setbacks.maximum-hold-millis` at 1, shifted answers reach the server unjudged; with the 26.2 client, whose
+  answer is a movement packet, they kept the player floating over the floor, and the server kicked it after 80 ticks
+  (`ServerGamePacketListenerImpl.tick`), so the late test leaves the answers alone. A vanilla 26.3 server takes one
+  movement packet with a position per client tick and disconnects a client that sends another before its tick end
+  (`ServerGamePacketListenerImpl.handleMovePlayer`, `receivedPositionThisTick`, which `handleClientTickEnd` resets), and
+  a packet ClauAC sends the server in the client's stead counts as well: a setback to where the simulation moved the
+  player once got the player kicked with "Invalid move player packet received".
+- **Testing Fly cheats:** the proxy's `inject-clientbound <hex>` sends the client alone a clientbound play packet, which
+  neither the server nor the sandbox sees. An abilities packet (`minecraft:player_abilities`: a byte of flags, flying 2
+  and may fly 4, then the flying and the walking speed as floats, 0.05 and 0.1 by default,
+  `ClientboundPlayerAbilitiesPacket.write`) lets the vanilla client fly with the vanilla flight physics, as a cheat that
+  sets its own abilities does, while the server and the sandbox take it for a player that cannot fly; `hold-y on` puts
+  the height the client reported last into every position it sends, as a cheat that cancels its fall does. With setbacks
+  back to where the server has the player (`setbacks.type: server`), no tick of a held height matches and no movement
+  reaches the server, whose position stays where the last tick that passed left it, in the air, for as long as the cheat
+  holds the height; the server never kicks the player for floating. A hover of the abilities comes down even so: each
+  correction gives the client the velocity it had when its tick began, and the first tick after it moves a flying player
+  as far as a falling one, since `Player.travel` damps a flying player's velocity only after the move; that tick
+  matches, and its movement takes the server's position one tick of the fall further down. With setbacks to where the
+  simulation moved the player (`predicted`, the default), the server gets the fall of every failed tick, and a held
+  height came down to the floor within a second; `fly_hover_test.sh` checks both. The proxy's `ground on` sets the flag
+  of being on the ground in every movement packet of the player, as a cheat that spares itself fall damage reports it in
+  the air, and `inject` of a serverbound `minecraft:player_abilities` (a byte of flags, flying 2) reports a flight, as a
+  vanilla client does when a double tap of jump starts it flying where its abilities let it. The simulation goes on from
+  what the client reported after a tick that does not match, and once took both over as they came: with the ground flag
+  in the air, it took the next tick for one on the ground, with a jump and the ground's acceleration, which setbacks to
+  where it moved the player gave the server (the player jumped in the air again and again and rose up to 3 blocks over
+  where a fall from 40 blocks began), and with the flying report it flew along, so that the whole flight matched and
+  reached the server with either setback type until Paper kicked the player for floating after 4 s (with
+  `allow-flight=false`). It takes the flag over only where the reported position rests on a block or an entity now
+  (`noCollision` 1.0E-6 below the box, as far down as `Entity.checkSupportingBlock` looks), and a flight only where the
+  abilities let the player fly, whose report fails `BadPackets` otherwise. That alone still let the player climb: in the
+  ticks before it took a correction, the client stood on the floor, where its flag was taken over rightly, and the
+  correction put it into the air with that flag, which the vanilla client keeps over a teleport, so that the next tick
+  jumped in the air. ClauAC's own packets reach the simulation through `PlayerSimulation.handleOwnPacket` now, and a
+  correction among them leaves the player or the vehicle on the ground only where it puts it on something;
+  `fly_fall_test.sh` checks all of it. A landing that hurts the player makes the server send it its own velocity
+  (`ServerEntity.sendChanges` with `Entity.syncVelocity`, which `Entity.markHurt` sets), and the server's velocity of a
+  player is that of the last jump the server took from its movement
+  (`ServerGamePacketListenerImpl.handlePlayerPositionChange` calls `ServerPlayer.jumpFromGround`), a setback's movement
+  included: when the simulation jumped on the floor where the client could not, the client took that jump's velocity
+  right after the next correction and rose higher than a jump reaches, and the simulation now takes over the jump
+  cooldown of the ground the client kept (`PlayConnection.followKeptGround`). `protocol_proxy.py --trace-seconds` logs
+  every teleport with its position and velocity, the client's positions with their flags, and the velocities and damage
+  events the server sends the player; `teleport_trace_analysis.py` lines them up with a report tick by tick, and
+  `phantom_jumps.py` counts the ticks in which the simulation jumped on the floor where the client stayed on it. A
+  player that holds jump hops along the floor once it is down, where a sample of its position finds it on the floor only
+  between two hops. Under `predicted`, a recording can still show the client hop once after it landed: the correction of
+  a tick before the landing reached it in the tick after and put it back 2.16 blocks above the floor, where it jumped on
+  the ground it kept, up to 3.16 blocks above the floor; that tick and the two after it failed, the hold dropped their
+  movement while the setback was under way (`ConnectionSimulation.judge`), and the next correction brought the client
+  back down, while the server's position only went down. That hop is the vanilla client's answer to a correction that
+  came late, not a rise of the server.
+- **Testing disablers:** a cheat that leaves the sandbox unsure of what the client did, so that the tick's movement goes
+  unchecked, has to be tested the way a cheat uses it. The proxy's `after-tick-end` sends its packet behind every tick
+  end, where it leads the next tick's key handling, from a second before the shifted positions start, and the answers
+  to the corrections stay unshifted (`shift-answers off`): otherwise the first shifted tick fails before the sandbox is
+  unsure, and the check of the answers keeps the player in its setback, which hid the disabler in a first try. A
+  sprint attack slows its attacker down only when charged (`after-tick-end every N` leaves time to charge), and a
+  knockback enchantment never does on the client: `LivingEntity.getKnockback` adds it only in a `ServerLevel`. It does
+  only when the client counts the attack as a hit (`Entity.hurtOrSimulate` calls `hurtClient` there): a boat does
+  (`VehicleEntity.hurtClient`), a living entity never (`Entity.hurtClient`, which `LivingEntity` keeps), so a sprint
+  attack on a mob or another player leaves the client's speed alone.
+- **Testing the Inventory check:** the proxy's `drop-clientbound minecraft:open_screen` keeps a container screen from
+  the client while the server and the sandbox, which see the packet and the pong behind it, take it as open: the client
+  then walks and turns on as with a cheat that keeps the keys and the mouse working on a screen. `click <menu> <slot>`
+  and `close <menu>` send a container click and a close the client never made (menu 0 is the player's inventory); a
+  click right after a tick with keys has to fail, one right after a tick without keys is what a vanilla client does as
+  well. A dialog of the server over a container screen goes back to that screen when it closes
+  (`DialogScreen.onClose`), so Escape has to be pressed twice to get back into the game. Stopping the proxy disconnects
+  its client, after which console commands on the player fail ("No entity was found"): clean up the world and read the
+  player's status before stopping the proxy. No vanilla or Paper command pushes a resource pack in the play phase; the
+  probe plugin's `/testpack <player> <url>` does (`probe/build.sh --install`). The client asks about a pushed pack only
+  while the server's entry in its `servers.dat` has no answer yet, and quick play adds that entry and keeps the answer
+  (`ServerList.saveSingleServer`), so delete the file before joining to see the prompt again. The server keeps whether
+  the player's recipe book is open, over screens and joins, and an open book moves the inventory screen to the right,
+  where clicks meant for its slots land on the book: a test that opened the book made the next run's slot clicks
+  miss. The death screen's buttons take clicks only 20 ticks after it opened.
+- **Editing test scripts:** bash reads a script while it runs it, so an edit to a running script breaks that run (a run
+  of `tick_rate_test.sh` failed with a syntax error at a line the edit had moved). Edit a script only between runs.
+- **Pipelines under `pipefail`:** `producer | grep -q` fails whenever grep stops reading before the producer has written
+  everything, since the producer then dies of SIGPIPE. A check of the client's command line
+  (`tr '\0' '\n' < /proc/<pid>/cmdline | grep -q`) missed the running client in 6 of 300 tries that way. Read the input
+  whole first, e.g. `grep -q -- "$pattern" <<< "$(tr '\0' '\n' < /proc/<pid>/cmdline)"`.
+- **Control FIFOs:** a reader that opens a FIFO, reads until its writers have closed it and then closes it loses what a
+  writer writes in the moment between that end and the close, since the kernel drops what a pipe holds once its last
+  reader is gone, and a writer that writes again after the close dies of SIGPIPE. The test proxy read its control lines
+  that way, and a `close 0` written right after another line never reached it, so that the steps after it ran with the
+  player's inventory open and failed `Inventory`. A second reader that stays open without reading keeps such lines.
+  bash's `printf` writes every line it formats on its own (`printf '%s\n' a b` makes two writes), so a reader that has
+  to take the lines of one redirection together reads until their writer has closed the FIFO.
+- **Server tick rates above 20:** the client still ticks 20 times a second (`Minecraft.getTickTargetMillis`) and
+  moves the living entities it shows towards the server's positions that much faster
+  (`ClientLevel.getRelativeTickSpeed`). `tick_rate_test.sh` teleports a cow without AI through the standing player in
+  small steps, whose pushes show the difference: at `tick rate 40` a sandbox that interpolated at the normal speed
+  failed 13 to 16 ticks of it by 0.0015 to 0.0027 blocks.
+- **Entity tick order:** the client ticks its entities in the order it added them (`ClientLevel.tickEntities`,
+  `EntityTickList`), and every entity came after the local player. A respawn in the same level adds the new player
+  behind the entities the client has, but the server then sends each entity around it again, which
+  `ClientLevel.addEntity` adds anew behind the player (it removes the one with the same id first): a cow summoned
+  before the respawn pushed the player only after the player's tick.
+- **Answer times:** `protocol_proxy.py --trace-seconds` stamps every traced packet with `time.monotonic()`, which reads
+  the same clock as Java's `System.nanoTime` (CLOCK_MONOTONIC on Linux: a `System.nanoTime` read between two
+  `time.monotonic_ns` reads lay between them every time), so times the plugin takes with `System.nanoTime` line up with
+  the proxy's trace. `crystal_probe.sh --trace` traces the client's item uses, attacks and tick ends and the entities
+  the server adds and removes; `crystal_trace_analysis.py` measures how long the server took to show each crystal and
+  to take it away, and `hold_breakdown.py` splits that time into the part up to the client's tick end and the part
+  after it.
+- **Comparing builds:** `server_ctl.sh start-jar <jar>` starts the Paper of the last `start` with that plugin jar in
+  place of the one Gradle builds, and `start-plain` starts it without ClauAC. `ab_latency.sh <label>=<jar>... [rounds]`,
+  with `plain` for the server without ClauAC, runs the traced crystal steps against each in turn, turns the order by one
+  every round and pools the times of each (`ab_summary.py`). The client's software rendering takes most of the 4
+  processors, and the server's answers varied with it: with the client's own options, the build with early verdicts
+  answered crystal uses after 5.3 and 5.9 ms (medians of two steps) where the build before took 5.1 and 6.0, while with
+  `maxFps` 30 and `renderDistance` 6, which `ab_latency.sh` sets for its runs, it answered after 4.7 ms where the build
+  before took 6.1. Compare builds within one run and under the same client options only.
+- **Profiling:** `jcmd <pid> JFR.start settings=profile ...` on Paper's Java process records the simulation threads as
+  well. `jfr print` shows 5 frames of each stack unless `--stack-depth` asks for more, and the recording keeps only as
+  many as `-XX:FlightRecorderOptions=stackdepth=<n>` allows (add it to `JAVA_TOOL_OPTIONS`): with the default, 28 of
+  the 5103 samples of a crystal probe were cut off after 53 to 60 frames, and none of 13 352 with `stackdepth=512`.

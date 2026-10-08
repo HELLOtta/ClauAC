@@ -19,7 +19,9 @@ import org.slf4j.Logger;
 
 // - Port of the client-only ClientChunkCache: a ring buffer of chunks around the view center announced by the -
 // - server, which answers unloaded positions with an empty chunk exactly like the client does. The renderer's -
-// - bookkeeping of added and removed sections is left out. Lighting is disabled because no movement code reads it -
+// - bookkeeping of added and removed sections is left out. The light engine keeps no light: the only light movement -
+// - code reads is whether a position sees the sky, which SandboxLevel.canSeeSky answers from the chunks' sky light -
+// - sources -
 public final class SandboxChunkSource extends ChunkSource {
 
     private static final Logger LOGGER = LogUtils.getLogger();
