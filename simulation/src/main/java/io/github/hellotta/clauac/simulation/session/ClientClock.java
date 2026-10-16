@@ -3,12 +3,13 @@ package io.github.hellotta.clauac.simulation.session;
 // - The least real time the client's timer can have reached, checked against the arrival of its tick ends. A vanilla -
 // - client ends one tick per tick target of real time and never gets ahead of real time (see TickBudget). When the -
 // - client answers one of the server's packets (a pong, the acceptance of a teleport, a rotation, the start of a -
-// - configuration phase), it has processed that packet, so its timer has reached at least the time the server sent -
-// - it; each tick it ends after that advances its timer by the tick target. A tick end cannot arrive before the -
-// - client ended that tick, so a tick end that arrives earlier than the timer can have reached it, by more than the -
-// - ticks a vanilla client may still owe for the time before its answer (see SLACK_TICKS), was ended sooner than a -
-// - vanilla client's timer allows. A connection that stalls only makes the tick ends arrive later. Used by the -
-// - connection's tasks only, which run one at a time -
+// - configuration phase, or a keep-alive, which it answers on its network thread, see NETWORK_THREAD_LEAD_TICKS), it -
+// - has processed that packet, so its timer has reached at least the time the server sent it; each tick it ends after -
+// - that advances its timer by the tick target. A tick end cannot arrive before the client ended that tick, so a tick -
+// - end that arrives earlier than the timer can have reached it, by more than the ticks a vanilla client may still -
+// - owe for the time before its answer (see SLACK_TICKS), was ended sooner than a vanilla client's timer allows. A -
+// - connection that stalls only makes the tick ends arrive later. Used by the connection's tasks only, which run one -
+// - at a time -
 final class ClientClock {
 
     private static final double NANOS_PER_MILLISECOND = 1.0E6;
@@ -21,6 +22,16 @@ final class ClientClock {
     // - up to 10 more. The tick the leftover fraction completes may follow right away, and one more tick target of -
     // - margin -
     static final int SLACK_TICKS = 22;
+    // - How many tick targets before a keep-alive was sent the clock takes the client's answer to it for. The client -
+    // - answers a keep-alive on its network thread the moment it arrives -
+    // - (ClientCommonPacketListenerImpl.handleKeepAlive, sendWhen), not in turn with the packets its main thread -
+    // - hands that thread, which wait as tasks of the event loop until it has handled what it was reading -
+    // - (Connection.sendPacket): the tick ends of the frame that ran just before can go out behind the answer, up to -
+    // - the 10 ticks a frame runs at once (Minecraft.runTick). The keep-alives tell how far the client's timer has -
+    // - come even when it holds back its answers to the server's other packets: Paper sends one every second and -
+    // - disconnects a client that leaves one unanswered for 30 s (ServerCommonPacketListenerImpl.keepConnectionAlive, -
+    // - KEEPALIVE_LIMIT) -
+    static final int NETWORK_THREAD_LEAD_TICKS = 10;
     // - The timer advances 1% less than the tick target per tick, for a client whose clock runs faster than the -
     // - server's, as TickBudget.REFILL_RATE allows -
     private static final double TICK_SHARE = 1.0 / TickBudget.REFILL_RATE;
@@ -39,6 +50,12 @@ final class ClientClock {
             this.reachedNanos = sentNanos;
             this.reachedKnown = true;
         }
+    }
+
+    // - The client answered on its network thread a packet the server sent at this time, while its ticks take this -
+    // - many milliseconds (see NETWORK_THREAD_LEAD_TICKS) -
+    void reachedOnNetworkThread(long sentNanos, double millisPerTick) {
+        this.reached(sentNanos - (long) (NETWORK_THREAD_LEAD_TICKS * millisPerTick * NANOS_PER_MILLISECOND));
     }
 
     // - Advances the timer by a tick whose end arrived at this time and whose target was this many milliseconds. -

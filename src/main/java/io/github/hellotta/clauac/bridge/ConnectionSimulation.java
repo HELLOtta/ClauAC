@@ -323,12 +323,14 @@ final class ConnectionSimulation {
     }
 
     // - Play packets that need a ping behind them: every one the simulation needs except the ping itself, the start -
-    // - of a configuration phase (answered by its acknowledgement) and a bundle delimiter -
+    // - of a configuration phase (answered by its acknowledgement), a bundle delimiter, and a keep-alive, which the -
+    // - client answers itself and which never goes into a bundle (see beforeWrite) -
     private static boolean needsPing(PacketTypeCommon type) {
         return type != PacketType.Play.Server.PING
                 && type != PacketType.Play.Server.BUNDLE
                 && type != PacketType.Play.Server.CONFIGURATION_START
-                && type != PacketType.Play.Server.DISCONNECT;
+                && type != PacketType.Play.Server.DISCONNECT
+                && type != PacketType.Play.Server.KEEP_ALIVE;
     }
 
     // - Keeps the connection's own bundles around the packets about to be written -

@@ -15,7 +15,7 @@ import net.minecraft.network.protocol.game.GameProtocols;
 
 // - The packets ClientSession handles, as network ids of the vanilla protocols. Everything else neither changes -
 // - the world, the entities or the items the client's player moves and acts with, nor the screens that let go of -
-// - its keys and mouse, nor tells what the client did -
+// - its keys and mouse, nor tells what the client did or how far its timer has come (see ClientClock) -
 public final class RelevantPackets {
 
     private static final Set<PacketType<?>> CONFIGURATION_CLIENTBOUND = Set.of(
@@ -110,10 +110,13 @@ public final class RelevantPackets {
             CommonPacketTypes.CLIENTBOUND_CLEAR_DIALOG,
             CommonPacketTypes.CLIENTBOUND_RESOURCE_PACK_PUSH,
             CommonPacketTypes.CLIENTBOUND_UPDATE_TAGS,
-            CommonPacketTypes.CLIENTBOUND_PING
+            CommonPacketTypes.CLIENTBOUND_PING,
+            // - Its answer tells how far the client's timer has come (ClientClock.reachedOnNetworkThread) -
+            CommonPacketTypes.CLIENTBOUND_KEEP_ALIVE
     );
     private static final Set<PacketType<?>> PLAY_SERVERBOUND = Set.of(
             CommonPacketTypes.SERVERBOUND_PONG,
+            CommonPacketTypes.SERVERBOUND_KEEP_ALIVE,
             GamePacketTypes.SERVERBOUND_ACCEPT_TELEPORTATION,
             GamePacketTypes.SERVERBOUND_CONFIGURATION_ACKNOWLEDGED,
             GamePacketTypes.SERVERBOUND_PLAYER_LOADED,

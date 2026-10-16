@@ -17,16 +17,21 @@ import io.github.hellotta.clauac.simulation.registry.ServerRegistryCache;
 import io.netty.buffer.Unpooled;
 import java.io.Serial;
 import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.common.ClientboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ClientboundPingPacket;
 import net.minecraft.network.protocol.common.ClientboundUpdateTagsPacket;
+import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
 import net.minecraft.network.protocol.common.ServerboundPongPacket;
 import net.minecraft.network.protocol.configuration.ClientboundFinishConfigurationPacket;
 import net.minecraft.network.protocol.configuration.ClientboundRegistryDataPacket;
@@ -72,6 +77,12 @@ public final class ClientSession implements PlayerSimulation {
 
     private static final double NANOS_PER_SECOND = 1.0E9;
     private static final double NANOS_PER_MILLISECOND = 1.0E6;
+    // - Paper sends a keep-alive every second and disconnects a client that leaves one unanswered for 30 s, or what -
+    // - the system property paper.playerconnection.keepalive sets -
+    // - (ServerCommonPacketListenerImpl.keepConnectionAlive, KEEPALIVE_LIMIT), so a vanilla client leaves about 30 -
+    // - unanswered at most; beyond this many the oldest are forgotten, and an answer to one of those tells the -
+    // - client's clock nothing -
+    private static final int MAXIMUM_UNANSWERED_KEEP_ALIVES = 256;
 
     private final GameProfile profile;
     private final SimulationListener listener;
@@ -83,6 +94,9 @@ public final class ClientSession implements PlayerSimulation {
     private final SerialExecutor executor;
     private final ProtocolDecoders decoders = new ProtocolDecoders();
     private final PendingClientbound pending = new PendingClientbound();
+    // - The keep-alives of the play phase the client has not answered yet, by their id, with the time each was sent, -
+    // - oldest first (see onKeepAliveAnswer) -
+    private final LinkedHashMap<Long, Long> unansweredKeepAlives = new LinkedHashMap<>();
     private final ProblemLog problemLog;
     // - Notes and rejections for the next tick report that arrive while no play connection exists -
     private final List<String> pendingNotes = new ArrayList<>();
@@ -307,11 +321,46 @@ public final class ClientSession implements PlayerSimulation {
     }
 
     private void onClientbound(ProtocolPhase phase, Packet<?> packet, byte[] encodedPacket, long sentAt, boolean own) {
+        if (packet instanceof ClientboundKeepAlivePacket keepAlive) {
+            // - The client answers it on its network thread, not in turn with the packets PendingClientbound lines -
+            // - up, and the sandbox has nothing to apply for it: only its answer tells how far the client's timer has -
+            // - come -
+            this.rememberKeepAlive(keepAlive.getId(), sentAt);
+            return;
+        }
         this.pending.add(new PendingClientbound.PendingPacket(phase, packet, encodedPacket, sentAt, own));
         if (phase == ProtocolPhase.CONFIGURATION) {
             this.applyLeadingConfigurationPackets();
         }
         this.limitUnconfirmed();
+    }
+
+    private void rememberKeepAlive(long id, long sentAt) {
+        this.unansweredKeepAlives.put(id, sentAt);
+        if (this.unansweredKeepAlives.size() > MAXIMUM_UNANSWERED_KEEP_ALIVES) {
+            Iterator<Long> oldest = this.unansweredKeepAlives.keySet().iterator();
+            oldest.next();
+            oldest.remove();
+        }
+    }
+
+    // - The client answers the keep-alives on its network thread in the order they arrive, so the ones sent before -
+    // - the answered one are forgotten with it. An answer to a keep-alive the sandbox does not know, one of a -
+    // - configuration phase or one forgotten (see MAXIMUM_UNANSWERED_KEEP_ALIVES), tells nothing; Paper checks the -
+    // - answers itself (ServerCommonPacketListenerImpl.handleKeepAlive) -
+    private void onKeepAliveAnswer(long id) {
+        if (!this.unansweredKeepAlives.containsKey(id)) {
+            return;
+        }
+        Iterator<Map.Entry<Long, Long>> entries = this.unansweredKeepAlives.entrySet().iterator();
+        while (entries.hasNext()) {
+            Map.Entry<Long, Long> entry = entries.next();
+            entries.remove();
+            if (entry.getKey() == id) {
+                this.clientClock.reachedOnNetworkThread(entry.getValue(), this.clientTickMillis());
+                return;
+            }
+        }
     }
 
     // - A vanilla client answers the ping behind a bundle while it handles the bundle, so the server's packets only -
@@ -430,6 +479,7 @@ public final class ClientSession implements PlayerSimulation {
         }
 
         switch (packet) {
+            case ServerboundKeepAlivePacket answer -> this.onKeepAliveAnswer(answer.getId());
             case ServerboundPongPacket pong ->
                     this.applyThrough(pending -> pending instanceof ClientboundPingPacket ping && ping.getId() == pong.getId(), "pong " + pong.getId());
             case ServerboundAcceptTeleportationPacket accept -> {
@@ -510,7 +560,7 @@ public final class ClientSession implements PlayerSimulation {
         // - The server's packets that will move the player but that the client had not processed when the tick began -
         boolean repositionPending = this.pending.findFirst(PlayConnection::repositionsPlayer) != null;
         PlayConnection connection = this.play;
-        float millisPerTick = connection != null ? connection.clientTickMillis() : PlayConnection.DEFAULT_TICK_MILLIS;
+        float millisPerTick = this.clientTickMillis();
         boolean inBudget = this.tickBudget.take(arrivedAt, millisPerTick);
         long timerAhead = this.clientClock.tick(arrivedAt, millisPerTick);
         if (timerAhead > 0L) {
@@ -549,6 +599,12 @@ public final class ClientSession implements PlayerSimulation {
             this.heldTickEnd = end;
             this.heldTickEarlyVerdicts = early;
         }
+    }
+
+    // - How long a tick of the client takes (see PlayConnection.clientTickMillis), the default outside the play phase -
+    private float clientTickMillis() {
+        PlayConnection connection = this.play;
+        return connection != null ? connection.clientTickMillis() : PlayConnection.DEFAULT_TICK_MILLIS;
     }
 
     // - A vanilla client only ends its ticks while it is in a level; there is nothing to simulate or compare -
