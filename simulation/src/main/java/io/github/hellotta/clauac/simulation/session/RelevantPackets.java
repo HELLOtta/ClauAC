@@ -14,7 +14,8 @@ import net.minecraft.network.protocol.game.GamePacketTypes;
 import net.minecraft.network.protocol.game.GameProtocols;
 
 // - The packets ClientSession handles, as network ids of the vanilla protocols. Everything else neither changes -
-// - the world, the entities or the items the client's player moves and acts with, nor tells what the client did -
+// - the world, the entities or the items the client's player moves and acts with, nor the screens that let go of -
+// - its keys and mouse, nor tells what the client did or how far its timer has come (see ClientClock) -
 public final class RelevantPackets {
 
     private static final Set<PacketType<?>> CONFIGURATION_CLIENTBOUND = Set.of(
@@ -100,11 +101,22 @@ public final class RelevantPackets {
             GamePacketTypes.CLIENTBOUND_MOUNT_SCREEN_OPEN,
             GamePacketTypes.CLIENTBOUND_MERCHANT_OFFERS,
             GamePacketTypes.CLIENTBOUND_COOLDOWN,
+            GamePacketTypes.CLIENTBOUND_PLAYER_LOOK_AT,
+            // - Screens of the server that may replace an open screen (see ScreenTracker) -
+            GamePacketTypes.CLIENTBOUND_OPEN_BOOK,
+            GamePacketTypes.CLIENTBOUND_OPEN_SIGN_EDITOR,
+            GamePacketTypes.CLIENTBOUND_PLAYER_COMBAT_KILL,
+            CommonPacketTypes.CLIENTBOUND_SHOW_DIALOG,
+            CommonPacketTypes.CLIENTBOUND_CLEAR_DIALOG,
+            CommonPacketTypes.CLIENTBOUND_RESOURCE_PACK_PUSH,
             CommonPacketTypes.CLIENTBOUND_UPDATE_TAGS,
-            CommonPacketTypes.CLIENTBOUND_PING
+            CommonPacketTypes.CLIENTBOUND_PING,
+            // - Its answer tells how far the client's timer has come (ClientClock.reachedOnNetworkThread) -
+            CommonPacketTypes.CLIENTBOUND_KEEP_ALIVE
     );
     private static final Set<PacketType<?>> PLAY_SERVERBOUND = Set.of(
             CommonPacketTypes.SERVERBOUND_PONG,
+            CommonPacketTypes.SERVERBOUND_KEEP_ALIVE,
             GamePacketTypes.SERVERBOUND_ACCEPT_TELEPORTATION,
             GamePacketTypes.SERVERBOUND_CONFIGURATION_ACKNOWLEDGED,
             GamePacketTypes.SERVERBOUND_PLAYER_LOADED,
@@ -131,7 +143,8 @@ public final class RelevantPackets {
             GamePacketTypes.SERVERBOUND_SET_CREATIVE_MODE_SLOT,
             GamePacketTypes.SERVERBOUND_BUNDLE_ITEM_SELECTED,
             GamePacketTypes.SERVERBOUND_SELECT_TRADE,
-            GamePacketTypes.SERVERBOUND_RENAME_ITEM
+            GamePacketTypes.SERVERBOUND_RENAME_ITEM,
+            GamePacketTypes.SERVERBOUND_PLACE_RECIPE
     );
 
     private final BitSet configurationClientbound;

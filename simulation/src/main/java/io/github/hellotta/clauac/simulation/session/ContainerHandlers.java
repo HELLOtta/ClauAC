@@ -102,15 +102,20 @@ final class ContainerHandlers {
         replaceMenu(player, menu);
     }
 
-    static void handleMountScreenOpen(ClientboundMountScreenOpenPacket packet, SandboxLevel level, SandboxPlayer player) {
+    // - Returns whether a screen opened: the client opens none for an entity that is no horse or nautilus -
+    static boolean handleMountScreenOpen(ClientboundMountScreenOpenPacket packet, SandboxLevel level, SandboxPlayer player) {
         Entity entity = level.getEntity(packet.getEntityId());
         int inventoryColumns = packet.getInventoryColumns();
         SimpleContainer container = new SimpleContainer(AbstractMountInventoryMenu.getInventorySize(inventoryColumns));
         if (entity instanceof AbstractHorse horse) {
             replaceMenu(player, new HorseInventoryMenu(packet.getContainerId(), player.getInventory(), container, horse, inventoryColumns));
-        } else if (entity instanceof AbstractNautilus nautilus) {
-            replaceMenu(player, new NautilusInventoryMenu(packet.getContainerId(), player.getInventory(), container, nautilus, inventoryColumns));
+            return true;
         }
+        if (entity instanceof AbstractNautilus nautilus) {
+            replaceMenu(player, new NautilusInventoryMenu(packet.getContainerId(), player.getInventory(), container, nautilus, inventoryColumns));
+            return true;
+        }
+        return false;
     }
 
     // - The new screen replaces the open one, whose menu is then removed. A container screen was open whenever the -

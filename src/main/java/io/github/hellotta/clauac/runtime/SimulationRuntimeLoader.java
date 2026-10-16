@@ -59,8 +59,8 @@ public final class SimulationRuntimeLoader {
                     .findFirst()
                     .orElseThrow(() -> new IOException("The simulation jar provides no " + SimulationRuntimeFactory.class.getName()));
             SimulationRuntime runtime = factory.create();
-            logger.info("Vanilla {} runtime started in {} ms from {} class path entries",
-                    runtime.minecraftVersion(), (System.nanoTime() - start) / 1_000_000L, layout.classPath().size());
+            logger.info("Vanilla {} runtime started in {} ms from {} class path entries, simulating on {} threads",
+                    runtime.minecraftVersion(), (System.nanoTime() - start) / 1_000_000L, layout.classPath().size(), runtime.simulationThreads());
             return new LoadedRuntime(runtime, classLoader);
         } catch (RuntimeException | IOException | Error failure) {
             classLoader.close();

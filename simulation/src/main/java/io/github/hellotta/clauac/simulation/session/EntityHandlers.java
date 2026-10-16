@@ -31,6 +31,7 @@ import net.minecraft.network.protocol.game.ClientboundTakeItemEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundTeleportEntityPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateAttributesPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateMobEffectPacket;
+import net.minecraft.network.protocol.game.ServerboundMoveVehiclePacket;
 import net.minecraft.network.protocol.game.VecDeltaCodec;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.entity.Entity;
@@ -390,9 +391,10 @@ final class EntityHandlers {
         }
     }
 
-    // - The server corrects the vehicle the player steers; the client answers with the vehicle's position, which only -
-    // - goes to the server -
-    static void handleMoveVehicle(ClientboundMoveVehiclePacket packet, SandboxPlayer player) {
+    // - The server corrects the vehicle the player steers; the client answers right away with the vehicle's position -
+    // - (ClientPacketListener.handleMoveVehicle), which is returned for the caller to check against the client's -
+    // - answer. Null when the player steers no vehicle and the client ignores the correction -
+    static @Nullable ServerboundMoveVehiclePacket handleMoveVehicle(ClientboundMoveVehiclePacket packet, SandboxPlayer player) {
         Entity vehicle = player.getRootVehicle();
         if (vehicle != player && vehicle.isLocalInstanceAuthoritative()) {
             PositionAndRotation target = packet.movingTo();
@@ -405,7 +407,10 @@ final class EntityHandlers {
 
                 vehicle.absSnapTo(targetPos.x(), targetPos.y(), targetPos.z(), target.yRot(), target.xRot());
             }
+
+            return ServerboundMoveVehiclePacket.fromEntity(vehicle);
         }
+        return null;
     }
 
     static void handleProjectilePowerPacket(ClientboundProjectilePowerPacket packet, SandboxLevel level) {

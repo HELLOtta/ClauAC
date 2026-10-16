@@ -5,7 +5,7 @@ public enum TickOutcome {
     MATCHED,
     // - The simulated movement differs from what the client reported -
     MISMATCHED,
-    // - The client did not simulate its player this tick (not loaded yet, outside ticking chunks, dead, riding) -
+    // - The client did not simulate its player this tick (not loaded yet, outside ticking chunks, dead) -
     NOT_SIMULATED,
     // - Something outside what the simulation reproduces influenced this tick; see the report's notes -
     UNVERIFIED

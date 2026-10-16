@@ -1,12 +1,19 @@
 package io.github.hellotta.clauac.simulation.world;
 
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
+import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.SectionPos;
 import net.minecraft.core.particles.ExplosionParticleInfo;
 import net.minecraft.core.particles.ParticleOptions;
 import net.minecraft.core.registries.Registries;
@@ -31,6 +38,9 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
+import net.minecraft.world.level.block.piston.PistonMovingBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.border.WorldBorder;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -40,6 +50,7 @@ import net.minecraft.world.level.entity.LevelCallback;
 import net.minecraft.world.level.entity.LevelEntityGetter;
 import net.minecraft.world.level.entity.TransientEntitySectionManager;
 import net.minecraft.world.level.gameevent.GameEvent;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.saveddata.maps.MapId;
 import net.minecraft.world.level.saveddata.maps.MapItemSavedData;
@@ -57,6 +68,27 @@ import org.jspecify.annotations.Nullable;
 // - simulated player. What the client renders, plays or shows (particles, sounds, block breaking progress, tints, -
 // - sky) has no effect here -
 public final class SandboxLevel extends Level {
+
+    // - The client catches its sky light up with its blocks only once a frame (Minecraft.renderFrame calls -
+    // - ClientLevel.update, which runs the light engine's updates), and a frame comes at least every ten client ticks -
+    // - (Minecraft.runTick runs at most ten before it renders). The light data of a chunk and the server's updates of -
+    // - it wait in a queue, of which each frame runs a tenth, at least ten, and from 1000 on all -
+    // - (ClientLevel.pollLightUpdates). Until then the client's sky light may show a column as it was before its blocks -
+    // - changed, or a chunk that has just come without light. SKY_LIGHT_SETTLE_TICKS is how long that takes at most -
+    // - after the change or the chunk: the frames a queue just short of 1000 takes, ten ticks each. The server lights -
+    // - a change within its next ticks, so its update reaches the client well within that time -
+    private static final int MAX_TICKS_PER_FRAME = 10;
+    private static final int LIGHT_QUEUE_RUN_AT_ONCE = 1000;
+    private static final int LIGHT_QUEUE_LEAST_PER_FRAME = 10;
+    private static final int LIGHT_QUEUE_SHARE_PER_FRAME = 10;
+    public static final long SKY_LIGHT_SETTLE_TICKS = (long) framesToRunLightQueue(LIGHT_QUEUE_RUN_AT_ONCE - 1) * MAX_TICKS_PER_FRAME;
+    private static final long NEVER = Long.MIN_VALUE;
+    // - The server's tick rate up to which the client's entities interpolate at their normal speed, the 20 of -
+    // - ClientLevel.getRelativeTickSpeed -
+    private static final float NORMAL_TICK_RATE = SharedConstants.TICKS_PER_SECOND;
+    // - A block change that sets off nothing else (see putBlocks): no neighbor or shape updates, no drops, no side -
+    // - effects of block entities and no onPlace -
+    private static final int PUT_FLAGS = Block.UPDATE_SKIP_ALL_SIDEEFFECTS;
 
     private final EntityTickList tickingEntities = new EntityTickList();
     private final TransientEntitySectionManager<Entity> entityStorage = new TransientEntitySectionManager<>(Entity.class, new EntityCallbacks());
@@ -76,6 +108,19 @@ public final class SandboxLevel extends Level {
     private final int seaLevel;
     private int serverSimulationDistance;
     private @Nullable Player localPlayer;
+    // - Ticks the local player at its place among the entities instead of tickNonPassenger (see setLocalPlayerTick) -
+    private @Nullable Consumer<Entity> localPlayerTick;
+    // - Client ticks this level ran (see tick), the clock of the two maps below: when each chunk the client has -
+    // - arrived, by ChunkPos.pack, and when the lowest sky light source of each column last moved, by columnKey. -
+    // - Entries older than SKY_LIGHT_SETTLE_TICKS no longer matter and are dropped every SKY_LIGHT_SETTLE_TICKS -
+    private long ticks;
+    private final Long2LongOpenHashMap chunkArrivals = new Long2LongOpenHashMap();
+    private final Long2LongOpenHashMap skyLightSourceMoves = new Long2LongOpenHashMap();
+    // - The blocks changed since recordBlockChanges began, each with what it held before its first change; null -
+    // - while nothing is recorded -
+    private @Nullable Map<BlockPos, BlockSnapshot> recordedBlocks;
+    // - Whether the recording is a trial, whose changes are taken back afterwards (see recordBlockChanges) -
+    private boolean blockTrial;
 
     // - clockManager and scoreboard belong to the connection and outlive levels, like on the client -
     public SandboxLevel(
@@ -105,6 +150,17 @@ public final class SandboxLevel extends Level {
         this.serverSimulationDistance = serverSimulationDistance;
         // - The client adds two sky flash layers on top of the default ones; they only change sky colors -
         this.environmentAttributes = EnvironmentAttributeSystem.builder().addDefaultLayers(this).build();
+        this.chunkArrivals.defaultReturnValue(NEVER);
+        this.skyLightSourceMoves.defaultReturnValue(NEVER);
+    }
+
+    // - The frames ClientLevel.pollLightUpdates takes to run a queue of this many light updates -
+    private static int framesToRunLightQueue(int queued) {
+        int frames = 0;
+        for (int left = queued; left > 0; left -= left < LIGHT_QUEUE_RUN_AT_ONCE ? Math.max(LIGHT_QUEUE_LEAST_PER_FRAME, left / LIGHT_QUEUE_SHARE_PER_FRAME) : left) {
+            frames++;
+        }
+        return frames;
     }
 
     // - The player whose movement is simulated; the client's equivalent is Minecraft.player -
@@ -112,8 +168,19 @@ public final class SandboxLevel extends Level {
         this.localPlayer = localPlayer;
     }
 
+    // - Hands the local player's tick to the connection while the player rides nothing, so that it can run the tick -
+    // - again from a saved start before the entities after the player tick; null goes back to tickNonPassenger -
+    public void setLocalPlayerTick(@Nullable Consumer<Entity> localPlayerTick) {
+        this.localPlayerTick = localPlayerTick;
+    }
+
     // - ClientLevel.tick without the renderer's sky, particle and sound handling -
     public void tick() {
+        this.ticks++;
+        if (this.ticks % SKY_LIGHT_SETTLE_TICKS == 0L) {
+            this.chunkArrivals.values().removeIf((long arrival) -> !this.settling(arrival));
+            this.skyLightSourceMoves.values().removeIf((long move) -> !this.settling(move));
+        }
         if (this.tickRateManager().runsNormally()) {
             this.getWorldBorder().tick();
             this.tickTime();
@@ -134,9 +201,25 @@ public final class SandboxLevel extends Level {
     public void tickEntities() {
         this.tickingEntities.forEach(entity -> {
             if (!entity.isRemoved() && !entity.isPassenger() && !this.tickRateManager.isEntityFrozen(entity)) {
-                this.guardEntityTick(this::tickNonPassenger, entity);
+                Consumer<Entity> localTick = this.localPlayerTick;
+                this.guardEntityTick(entity == this.localPlayer && localTick != null ? localTick : this::tickNonPassenger, entity);
             }
         });
+    }
+
+    // - Whether a block entity next to this area moves entities when the block entities tick after the entities: a -
+    // - piston's moving block, or a shulker box whose lid is moving -
+    public boolean hasEntityMovingBlockEntityNear(AABB area) {
+        for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(area.minX, area.minY, area.minZ), BlockPos.containing(area.maxX, area.maxY, area.maxZ))) {
+            BlockEntity blockEntity = this.getBlockEntity(pos);
+            if (blockEntity instanceof PistonMovingBlockEntity
+                    || blockEntity instanceof ShulkerBoxBlockEntity shulkerBox
+                    && shulkerBox.getAnimationStatus() != ShulkerBoxBlockEntity.AnimationStatus.CLOSED
+                    && shulkerBox.getAnimationStatus() != ShulkerBoxBlockEntity.AnimationStatus.OPENED) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public boolean isTickingEntity(Entity entity) {
@@ -179,6 +262,7 @@ public final class SandboxLevel extends Level {
 
     public void onChunkLoaded(ChunkPos pos) {
         this.entityStorage.startTicking(pos);
+        this.chunkArrivals.put(pos.pack(), this.ticks);
     }
 
     // - Deprecated in vanilla, but the client still overrides it: every chunk counts as present, which for example -
@@ -216,6 +300,22 @@ public final class SandboxLevel extends Level {
         return this.getEntities().get(id);
     }
 
+    // - ServerLevel.getEntityOrPart: the entity with this id, or else the part of an ender dragon with it. The client's -
+    // - crosshair meets the parts, not the dragon (Level.getEntities adds them), so its attacks and interactions carry -
+    // - a part's id, which the server looks up this way (ServerGamePacketListenerImpl.handleAttack and handleInteract) -
+    public @Nullable Entity getEntityOrPart(int id) {
+        Entity entity = this.getEntity(id);
+        if (entity != null) {
+            return entity;
+        }
+        for (EnderDragonPart part : this.dragonParts) {
+            if (part.getId() == id) {
+                return part;
+            }
+        }
+        return null;
+    }
+
     public SandboxBlockPredictions getBlockPredictions() {
         return this.blockPredictions;
     }
@@ -224,10 +324,14 @@ public final class SandboxLevel extends Level {
         this.blockPredictions.endPredictionsUpTo(sequence, this);
     }
 
-    // - The server's block changes wait while the client predicts something else at the same position -
+    // - The server's block changes wait while the client predicts something else at the same position. Like -
+    // - ClientLevel's, they bypass the prediction bookkeeping of setBlock -
     public void setServerVerifiedBlockState(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlag) {
         if (!this.blockPredictions.updateKnownServerState(pos, blockState)) {
-            super.setBlock(pos, blockState, updateFlag, 512);
+            int sourceBefore = this.lowestSkyLightSource(pos);
+            if (super.setBlock(pos, blockState, updateFlag, 512)) {
+                this.noteSkyLightSourceMove(pos, sourceBefore);
+            }
         }
     }
 
@@ -243,8 +347,100 @@ public final class SandboxLevel extends Level {
         }
     }
 
+    // - Every block change of the level but the server's (see setServerVerifiedBlockState) goes through here, and a -
+    // - recording (see recordBlockChanges) notes what the block held before -
     @Override
     public boolean setBlock(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlags, int updateLimit) {
+        Map<BlockPos, BlockSnapshot> recorded = this.recordedBlocks;
+        if (recorded != null && !recorded.containsKey(pos)) {
+            recorded.put(pos.immutable(), this.blockSnapshot(pos));
+        }
+        if (this.blockTrial) {
+            return super.setBlock(pos, blockState, updateFlags, updateLimit);
+        }
+        int sourceBefore = this.lowestSkyLightSource(pos);
+        boolean success = this.setBlockAndRetainPrediction(pos, blockState, updateFlags, updateLimit);
+        if (success) {
+            this.noteSkyLightSourceMove(pos, sourceBefore);
+        }
+        return success;
+    }
+
+    // - A block change that moved its column's lowest sky light source (LevelChunk.setBlockState) is noted for -
+    // - skyLightMayLag -
+    private void noteSkyLightSourceMove(BlockPos pos, int sourceBefore) {
+        if (this.lowestSkyLightSource(pos) != sourceBefore) {
+            this.skyLightSourceMoves.put(columnKey(pos), this.ticks);
+        }
+    }
+
+    // - A move of the column's lowest sky light source in the client's world that the sandbox's blocks did not make -
+    // - at the time, noted as of the level tick when it happened -
+    public void noteSkyLightSourceMoved(BlockPos pos, long tick) {
+        long column = columnKey(pos);
+        this.skyLightSourceMoves.put(column, Math.max(this.skyLightSourceMoves.get(column), tick));
+    }
+
+    // - The client ticks this level ran, the clock of skyLightMayLag -
+    public long ticks() {
+        return this.ticks;
+    }
+
+    // - A block with its block entity: null for a block without one, or one whose block entity the level has not -
+    // - made yet, and for a block the server sent, whose block entity the chunk makes as it takes the block -
+    public record BlockSnapshot(BlockState state, @Nullable BlockEntity blockEntity) {
+    }
+
+    // - The block at the position with its block entity, without making a block entity the level has not made yet -
+    public BlockSnapshot blockSnapshot(BlockPos pos) {
+        BlockState state = this.getBlockState(pos);
+        BlockEntity blockEntity = state.hasBlockEntity() ? this.getChunkAt(pos).getBlockEntity(pos, LevelChunk.EntityCreationType.CHECK) : null;
+        return new BlockSnapshot(state, blockEntity);
+    }
+
+    // - Records every block change from now on (see setBlock): each changed position with what it held before its -
+    // - first change. A trial changes blocks only for a moment, to find out what they would become, and putBlocks -
+    // - then takes the changes back: they keep no prediction aside and note no sky light source move. Block entities -
+    // - that vanilla code adds or removes outside setBlock are not recorded; a break on the client does neither -
+    public void recordBlockChanges(boolean trial) {
+        if (this.recordedBlocks != null) {
+            throw new IllegalStateException("A recording of block changes runs already");
+        }
+        this.recordedBlocks = new LinkedHashMap<>();
+        this.blockTrial = trial;
+    }
+
+    // - Ends the recording and returns what it recorded -
+    public Map<BlockPos, BlockSnapshot> stopRecordingBlockChanges() {
+        Map<BlockPos, BlockSnapshot> recorded = Objects.requireNonNull(this.recordedBlocks, "No recording of block changes runs");
+        this.recordedBlocks = null;
+        this.blockTrial = false;
+        return recorded;
+    }
+
+    // - Puts blocks in place with their block entities as they are given and with nothing else a block change does -
+    // - (PUT_FLAGS): the chunk takes them as they are, with its heightmaps and sky light sources, and gives a block the -
+    // - block entity it makes (LevelChunk.setBlockState) unless another one is given, whose place it then takes. -
+    // - Returns what the positions held before, which puts them back as they were -
+    public Map<BlockPos, BlockSnapshot> putBlocks(Map<BlockPos, BlockSnapshot> blocks) {
+        Map<BlockPos, BlockSnapshot> before = new LinkedHashMap<>();
+        for (Map.Entry<BlockPos, BlockSnapshot> entry : blocks.entrySet()) {
+            BlockPos pos = entry.getKey();
+            before.put(pos, this.blockSnapshot(pos));
+            this.putBlock(pos, entry.getValue());
+        }
+        return before;
+    }
+
+    private void putBlock(BlockPos pos, BlockSnapshot block) {
+        super.setBlock(pos, block.state(), PUT_FLAGS, 0);
+        BlockEntity wanted = block.blockEntity();
+        if (wanted != null && this.getChunkAt(pos).getBlockEntity(pos, LevelChunk.EntityCreationType.CHECK) != wanted) {
+            this.setBlockEntity(wanted);
+        }
+    }
+
+    private boolean setBlockAndRetainPrediction(BlockPos pos, BlockState blockState, @Block.UpdateFlags int updateFlags, int updateLimit) {
         if (this.blockPredictions.isPredicting()) {
             BlockState oldState = this.getBlockState(pos);
             boolean success = super.setBlock(pos, blockState, updateFlags, updateLimit);
@@ -275,7 +471,7 @@ public final class SandboxLevel extends Level {
     }
 
     // - The only packet level code sends is the paddle state of a boat the local player steers; the real client sent -
-    // - its own, and the sandbox does not compare vehicles -
+    // - its own, and the paddles only animate the boat -
     @Override
     public void sendPacketToServer(Packet<?> packet) {
     }
@@ -336,6 +532,14 @@ public final class SandboxLevel extends Level {
     @Override
     public TickRateManager tickRateManager() {
         return this.tickRateManager;
+    }
+
+    // - ClientLevel.getRelativeTickSpeed: while the server ticks faster than normal, the client's entities interpolate -
+    // - that much faster towards the positions the server sends them (SteppedInterpolationHandler.doInterpolate) -
+    @Override
+    public float getRelativeTickSpeed() {
+        float tickRate = this.tickRateManager.tickrate();
+        return tickRate > NORMAL_TICK_RATE ? tickRate / NORMAL_TICK_RATE : 1.0F;
     }
 
     @Override
@@ -402,6 +606,47 @@ public final class SandboxLevel extends Level {
     @Override
     public int getSeaLevel() {
         return this.seaLevel;
+    }
+
+    // - BlockAndLightGetter.canSeeSky asks whether the sky light at the position is full (15), which decides whether -
+    // - rain falls there (Level.precipitationAt) and so whether a riptide trident works out of water. The sandbox keeps -
+    // - no light (see SandboxChunkSource), but the client's sky light engine gives 15 exactly to the positions at or -
+    // - above their column's lowest sky light source (SkyLightEngine.checkNode), which the chunk keeps up to date with -
+    // - its blocks (LevelChunk.setBlockState, ChunkSkyLightSources.update). A dimension without sky light has none -
+    // - anywhere, and a chunk the client does not have has no light -
+    @Override
+    public boolean canSeeSky(BlockPos pos) {
+        return this.dimensionType().hasSkyLight() && pos.getY() >= this.lowestSkyLightSource(pos);
+    }
+
+    // - The lowest y of the column that the sky lights fully, from the chunk's sky light sources; above every y where -
+    // - the client has no chunk -
+    public int lowestSkyLightSource(BlockPos pos) {
+        LevelChunk chunk = this.chunkSource.getChunkNow(SectionPos.blockToSectionCoord(pos.getX()), SectionPos.blockToSectionCoord(pos.getZ()));
+        return chunk != null
+                ? chunk.getSkyLightSources().getLowestSourceY(SectionPos.sectionRelative(pos.getX()), SectionPos.sectionRelative(pos.getZ()))
+                : Integer.MAX_VALUE;
+    }
+
+    // - Whether the client's sky light at this column may not show what canSeeSky finds yet: its chunk arrived, or -
+    // - its lowest sky light source moved, within SKY_LIGHT_SETTLE_TICKS -
+    public boolean skyLightMayLag(BlockPos pos) {
+        return this.settling(this.chunkArrivals.get(ChunkPos.pack(pos))) || this.settling(this.skyLightSourceMoves.get(columnKey(pos)));
+    }
+
+    private boolean settling(long since) {
+        return since != NEVER && this.ticks - since <= SKY_LIGHT_SETTLE_TICKS;
+    }
+
+    // - Level.precipitationAt without its sky light: whether rain falls at the position if the sky lights it fully -
+    public boolean rainsIfSkyLit(BlockPos pos) {
+        return this.isRaining()
+                && this.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, pos).getY() <= pos.getY()
+                && this.getBiome(pos).value().getPrecipitationAt(pos, this.getSeaLevel()) == Biome.Precipitation.RAIN;
+    }
+
+    private static long columnKey(BlockPos pos) {
+        return BlockPos.asLong(pos.getX(), 0, pos.getZ());
     }
 
     @Override

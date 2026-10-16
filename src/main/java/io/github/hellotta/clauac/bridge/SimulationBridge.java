@@ -6,50 +6,63 @@ import com.github.retrooper.packetevents.event.PacketReceiveEvent;
 import com.github.retrooper.packetevents.event.PacketSendEvent;
 import com.github.retrooper.packetevents.event.ProtocolPacketEvent;
 import com.github.retrooper.packetevents.event.UserDisconnectEvent;
-import com.github.retrooper.packetevents.netty.buffer.ByteBufHelper;
 import com.github.retrooper.packetevents.protocol.ConnectionState;
-import com.github.retrooper.packetevents.protocol.packettype.PacketType;
 import com.github.retrooper.packetevents.protocol.player.User;
+import io.github.hellotta.clauac.response.Responses;
 import io.github.hellotta.clauac.simulation.api.PacketDirection;
-import io.github.hellotta.clauac.simulation.api.PlayerSimulation;
 import io.github.hellotta.clauac.simulation.api.ProtocolPhase;
 import io.github.hellotta.clauac.simulation.api.SimulationRuntime;
-import java.io.IOException;
+import io.github.hellotta.clauac.simulation.api.SimulationStatistics;
 import java.nio.file.Path;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import java.util.UUID;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import org.bukkit.entity.Player;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
-// - Hands every relevant packet of a connection to its simulation, exactly as it travels on the wire, and follows -
-// - every relevant play packet with a ping. The client answers pings in order, which tells the simulation how far -
-// - the client has processed the server's packets when it simulates the client's next tick -
+// - Hands every relevant packet of a connection to its simulation, exactly as it travels on the wire; see -
+// - ConnectionSimulation for how the pings behind the server's packets tell the simulation how far the client has -
+// - processed them when it simulates the client's next tick, and how the client's movement waits for its verdict -
 public final class SimulationBridge implements PacketListener {
 
-    private static final DateTimeFormatter REPORT_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.ROOT);
     // - How far from the player's bounding box another entity counts as able to push or carry it -
     private static final double NEARBY_ENTITY_DISTANCE = 1.0;
 
     private final Logger logger;
     private final Path reportDirectory;
+    private final Responses responses;
+    private final Setbacks setbacks;
     private final Map<Object, ConnectionSimulation> connections = new ConcurrentHashMap<>();
+    // - What the connections that wait for the runtime to start keep, together -
+    private final AtomicLong totalWaitingBytes = new AtomicLong();
     private volatile @Nullable SimulationRuntime runtime;
+    private volatile @Nullable String runtimeFailure;
 
-    public SimulationBridge(Logger logger, Path reportDirectory) {
+    public SimulationBridge(Logger logger, Path reportDirectory, Responses responses, Setbacks setbacks) {
         this.logger = logger;
         this.reportDirectory = reportDirectory;
+        this.responses = responses;
+        this.setbacks = setbacks;
     }
 
-    // - Connections that start their configuration afterwards are simulated -
+    // - Waiting connections start on their own event loops; one created at the same moment sees the runtime with its -
+    // - next packet at the latest -
     public void setRuntime(SimulationRuntime runtime) {
         this.runtime = runtime;
+        for (ConnectionSimulation connection : this.connections.values()) {
+            connection.runInEventLoop(() -> connection.runtimeReady(runtime));
+        }
+    }
+
+    public void setRuntimeFailure(String reason) {
+        this.runtimeFailure = reason;
+        for (ConnectionSimulation connection : this.connections.values()) {
+            connection.runInEventLoop(() -> connection.runtimeFailed(reason));
+        }
     }
 
     @Override
@@ -62,31 +75,28 @@ public final class SimulationBridge implements PacketListener {
         this.observe(event, PacketDirection.SERVERBOUND);
     }
 
+    // - Called on the connection's event loop by OwnAnswerConsumer; a connection only starts with its configuration -
+    void consumeOwnPong(PacketReceiveEvent event) {
+        ConnectionSimulation connection = this.connections.get(event.getUser().getChannel());
+        if (connection != null) {
+            connection.consumeOwnPong(event);
+        }
+    }
+
+    // - Called on the connection's event loop by OwnAnswerConsumer -
+    void consumeOwnTeleportAnswer(PacketReceiveEvent event) {
+        ConnectionSimulation connection = this.connections.get(event.getUser().getChannel());
+        if (connection != null) {
+            connection.consumeOwnTeleportAnswer(event);
+        }
+    }
+
     private void observe(ProtocolPacketEvent event, PacketDirection direction) {
         ProtocolPhase phase = phaseOf(event.getConnectionState());
         if (phase == null) {
             return;
         }
-        ConnectionSimulation connection = this.connectionFor(event.getUser(), phase);
-        PlayerSimulation simulation = connection.simulation();
-        SimulationRuntime currentRuntime = this.runtime;
-        if (simulation == null || currentRuntime == null || !currentRuntime.isRelevant(phase, direction, event.getPacketId())) {
-            return;
-        }
-        // - The simulation's own pings are relevant too, but must not be followed by another one -
-        boolean needsPing = direction == PacketDirection.CLIENTBOUND && phase == ProtocolPhase.PLAY
-                && event.getPacketType() != PacketType.Play.Server.PING;
-        // - Post tasks run once the packet is final: after every listener, with the whole packet (id and payload) -
-        // - readable, or nothing readable when it was cancelled and therefore never sent or processed -
-        event.getPostTasks().add(() -> {
-            Object buffer = event.getByteBuf();
-            if (ByteBufHelper.isReadable(buffer)) {
-                simulation.handlePacket(phase, direction, ByteBufHelper.copyBytes(buffer));
-                if (needsPing) {
-                    connection.schedulePing();
-                }
-            }
-        });
+        this.connectionFor(event.getUser(), phase).observe(event, phase, direction, this.runtime, this.runtimeFailure);
     }
 
     private static @Nullable ProtocolPhase phaseOf(ConnectionState state) {
@@ -97,9 +107,7 @@ public final class SimulationBridge implements PacketListener {
         };
     }
 
-    // - Called on the connection's event loop, where all of its packets are handled one after another. A connection -
-    // - is simulated from its first configuration packet on, or not at all: the simulation has to see everything -
-    // - from the start to know the registries and the world the client has -
+    // - Called on the connection's event loop, where all of its packets are handled one after another -
     private ConnectionSimulation connectionFor(User user, ProtocolPhase phase) {
         Object channel = user.getChannel();
         ConnectionSimulation existing = this.connections.get(channel);
@@ -108,33 +116,28 @@ public final class SimulationBridge implements PacketListener {
         }
         ConnectionSimulation created = this.startConnection(user, phase);
         this.connections.put(channel, created);
-        if (created.notSimulatedReason() != null) {
+        if (created.state() == ConnectionSimulation.State.NOT_SIMULATED) {
             this.logger.warn("Not simulating {}: {}", user.getName(), created.notSimulatedReason());
+        }
+        // - The runtime may have started between creating the connection and making it visible to setRuntime -
+        SimulationRuntime currentRuntime = this.runtime;
+        if (currentRuntime != null) {
+            created.runtimeReady(currentRuntime);
         }
         return created;
     }
 
+    // - A connection is simulated from its first configuration packet on, or not at all; see ConnectionSimulation -
     private ConnectionSimulation startConnection(User user, ProtocolPhase phase) {
-        SimulationRuntime currentRuntime = this.runtime;
         if (phase != ProtocolPhase.CONFIGURATION) {
-            return ConnectionSimulation.notSimulated(user, "the connection was already playing when ClauAC started watching it");
+            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.responses, this.setbacks, this.totalWaitingBytes,
+                    "the connection was already playing when ClauAC started watching it");
         }
-        if (currentRuntime == null) {
-            return ConnectionSimulation.notSimulated(user, "the vanilla runtime was still starting when the connection began");
+        String failure = this.runtimeFailure;
+        if (failure != null) {
+            return ConnectionSimulation.notSimulated(user, this.reportDirectory, this.logger, this.responses, this.setbacks, this.totalWaitingBytes, failure);
         }
-        UUID profileId = user.getUUID();
-        String name = user.getName();
-        Path csvFile = this.reportDirectory.resolve(LocalDateTime.now().format(REPORT_TIME) + "-" + name + ".csv");
-        TickReporter reporter;
-        try {
-            reporter = new TickReporter(user, name, csvFile, this.logger);
-        } catch (IOException exception) {
-            this.logger.error("Could not create {}", csvFile, exception);
-            return ConnectionSimulation.notSimulated(user, "its report file could not be created");
-        }
-        PlayerSimulation simulation = currentRuntime.createPlayer(profileId, name, reporter);
-        this.logger.info("Simulating {} ({}), recording to {}", name, profileId, csvFile);
-        return ConnectionSimulation.simulated(user, simulation, reporter);
+        return ConnectionSimulation.begin(user, this.reportDirectory, this.logger, this.responses, this.setbacks, this.totalWaitingBytes, this.runtime);
     }
 
     @Override
@@ -150,11 +153,20 @@ public final class SimulationBridge implements PacketListener {
         TickReporter reporter = connection.reporter();
         if (reporter != null) {
             this.logger.info("Simulation summary for {}", reporter.summary());
+            SimulationStatistics statistics = connection.statistics();
+            if (statistics != null) {
+                this.logger.info("Simulation cost for {}", reporter.costSummary(statistics));
+            }
+            this.logger.info("Held packets and setbacks of {}", connection.holdSummary());
         }
     }
 
     // - Called on the server thread at the end of every server tick -
     public void onServerTickEnd(Iterable<? extends Player> onlinePlayers) {
+        long now = System.nanoTime();
+        for (ConnectionSimulation connection : this.connections.values()) {
+            connection.checkHold(now);
+        }
         for (Player player : onlinePlayers) {
             User user = PacketEvents.getAPI().getPlayerManager().getUser(player);
             if (user == null) {
@@ -163,6 +175,7 @@ public final class SimulationBridge implements PacketListener {
             ConnectionSimulation connection = this.connections.get(user.getChannel());
             TickReporter reporter = connection != null ? connection.reporter() : null;
             if (reporter != null) {
+                reporter.setPlayer(player);
                 reporter.setEntityNearby(!player.getNearbyEntities(NEARBY_ENTITY_DISTANCE, NEARBY_ENTITY_DISTANCE, NEARBY_ENTITY_DISTANCE).isEmpty());
                 if (reporter.takeInventoryResyncRequest()) {
                     this.logger.info("Resending the inventory of {}: the simulated items differ from the client's", player.getName());
@@ -184,13 +197,33 @@ public final class SimulationBridge implements PacketListener {
         return enabled;
     }
 
+    // - One line per connection, and for a simulated one a second line with what its simulation costs -
     public List<String> status() {
         List<String> lines = new ArrayList<>();
         for (ConnectionSimulation connection : this.connections.values()) {
-            TickReporter reporter = connection.reporter();
-            lines.add(reporter != null ? reporter.summary() : connection.user().getName() + ": not simulated, " + connection.notSimulatedReason());
+            String name = connection.user().getName();
+            switch (connection.state()) {
+                case SIMULATED -> {
+                    TickReporter reporter = Objects.requireNonNull(connection.reporter(), "a simulated connection has a reporter");
+                    lines.add(reporter.summary());
+                    SimulationStatistics statistics = connection.statistics();
+                    if (statistics != null) {
+                        lines.add(reporter.costSummary(statistics));
+                    }
+                    lines.add(connection.holdSummary());
+                }
+                case WAITING -> lines.add(name + ": waiting for the vanilla runtime to start");
+                case NOT_SIMULATED -> lines.add(name + ": not simulated, " + connection.notSimulatedReason());
+            }
         }
         return lines;
+    }
+
+    // - Before PacketEvents is terminated: every connection lets what it holds go on and holds nothing more -
+    public void stopHolding() {
+        for (ConnectionSimulation connection : this.connections.values()) {
+            connection.stopHolding();
+        }
     }
 
     public void closeAll() {

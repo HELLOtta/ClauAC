@@ -15,10 +15,14 @@ softdepend:
   - Geyser-Spigot
 commands:
   clauac:
-    description: Shows what the movement simulation found
-    usage: /clauac <debug|status>
-    permission: clauac.admin
+    description: Shows what the simulation found and turns alerts on or off
+    usage: /clauac <alerts|debug|reload|status>
 permissions:
   clauac.admin:
-    description: Allows /clauac
+    description: Allows /clauac debug, reload and status, and everything clauac.alerts allows
+    default: op
+    children:
+      clauac.alerts: true
+  clauac.alerts:
+    description: Allows /clauac alerts, which shows when a player fails a check
     default: op
