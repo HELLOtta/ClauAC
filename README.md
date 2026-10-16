@@ -665,6 +665,20 @@ the velocity the simulation estimated after a correction leaves the outcome open
 `Inventory` but those of the imitated cheats of the test of the screens and of the clicks in the test of the disablers,
 and no player was kicked.
 
+The final runs of the build whose `Timer` also takes the answers to Paper's keep-alives (see "Responses") passed all of
+their parts as well. The thirteen courses matched in all of their 19 996 simulated ticks and in all 20 021 of the run
+with repeated ticks, the test of the tick rates in all of its 733, and over the five connections the courses and the
+block and combat tests matched in all of their 37 628 simulated ticks but the 47 with the cheats of those tests, which
+ClauAC refused as over a direct connection. `timer_balance_test.sh` failed `Timer` 61 ticks into the doubled tick ends
+with the pongs dropped and 6 ticks into those with the pongs, and neither freeze of 8 seconds failed `Timer` or
+`TickRate`; `timer_test.sh` failed `Timer` 135 ticks into its client about 20% fast and not while the proxy held the
+connection for 25 seconds, as before. The vanilla client's uncertain starts of breaking matched in all 2001 ticks of
+their check, its sprint attacks in all 4916, its breaking, placing and attacking while it turned its view in all 4812
+and its crystal PvP in all 3231; the test of the disablers left none of the 858 ticks of its connection `UNVERIFIED`,
+and none of the 83 reports written during these runs contradicted a verdict given early. Paper's own checks logged
+what they logged in earlier runs, among them 12 warnings about a strider whose rider the server had not expected to
+steer it, all within a second while the courses ran at a ping of 1000 ms, and no player was kicked.
+
 ## Responses
 
 Every `MISMATCHED` tick names the checks it failed, each with what exactly failed; a tick can fail several at once.
@@ -702,27 +716,46 @@ Something the simulation cannot know (see "What the simulation cannot know") onl
 movement: the tick is `UNVERIFIED` instead of failing `Simulation` or `Vehicle`. The other checks fail regardless.
 
 `Timer` follows the least real time the client's timer can have reached. When the client answers one of the server's
-packets (a pong, the acceptance of a teleport, a rotation, the acknowledgement of a configuration phase), it has
-processed that packet, so its timer is at least at the time the server sent it; every tick it ends afterwards advances
-the timer by a tick target (50 ms, or the server's slower tick rate while its level runs normally), less 1% for clocks
-that run fast. A tick end cannot arrive before the client ended the tick, and a vanilla client never gets ahead of
-real time: a frame counts the ticks it owes when it starts, handles the server's packets and then runs at most 10 of
-those ticks, dropping the rest (`Minecraft.runTick`, `DeltaTracker.Timer`). The ticks right after an answer can
-therefore be owed for up to 10 tick targets before the frame started. The frame also handles every packet that arrives
-while it handles packets (`PacketProcessor.processQueuedPackets` runs until the queue is empty), which took up to
-650 ms in test joins while chunks kept arriving, and the next frame owes up to 10 more ticks for that time. With the
-tick the leftover fraction completes, the ticks after an answer can get 21 tick targets ahead of the real time since
-the server sent the answered packet. A tick end that arrives more than 22 tick targets (1.1 s) earlier than the timer
-can have reached therefore fails `Timer`, and the timer is put back to that limit, so that only a tick further ahead
-fails next. A connection that stalls only makes the tick ends arrive later, and a client that holds back its answers
-only keeps the timer from being moved up. An earlier limit of 12 tick targets, which counted only the first frame,
-failed 3 of 4 test joins through a proxy, whose ticks got 600 to 618 ms ahead while the client loaded the world.
+packets (a pong, the acceptance of a teleport, a rotation, the acknowledgement of a configuration phase, or a
+keep-alive, see below), it has processed that packet, so its timer is at least at the time the server sent it; every
+tick it ends afterwards advances the timer by a tick target (50 ms, or the server's slower tick rate while its level
+runs normally), less 1% for clocks that run fast. A tick end cannot arrive before the client ended the tick, and a
+vanilla client never gets ahead of real time: a frame counts the ticks it owes when it starts, handles the server's
+packets and then runs at most 10 of those ticks, dropping the rest (`Minecraft.runTick`, `DeltaTracker.Timer`). The
+ticks right after an answer can therefore be owed for up to 10 tick targets before the frame started. The frame also
+handles every packet that arrives while it handles packets (`PacketProcessor.processQueuedPackets` runs until the queue
+is empty), which took up to 650 ms in test joins while chunks kept arriving, and the next frame owes up to 10 more ticks
+for that time. With the tick the leftover fraction completes, the ticks after an answer can get 21 tick targets ahead of
+the real time since the server sent the answered packet. A tick end that arrives more than 22 tick targets (1.1 s)
+earlier than the timer can have reached therefore fails `Timer`, and the timer is put back to that limit, so that only a
+tick further ahead fails next. A connection that stalls only makes the tick ends arrive later. An earlier limit of 12
+tick targets, which counted only the first frame, failed 3 of 4 test joins through a proxy, whose ticks got 600 to 618
+ms ahead while the client loaded the world.
+
+A client that holds back its answers keeps the timer from being moved up, and the ticks it has not ended since its last
+answer would let it end ticks faster than real time later. A proxy that dropped the vanilla client's pongs while the
+client was frozen for 8 seconds (`SIGSTOP`, a lag spike, after which a vanilla client runs at most 10 of the ticks it
+missed and drops the rest) and then doubled its tick ends got about 100 ticks too many through in 5 seconds without one
+failing `Timer`, where the same doubling with the pongs failed it 45 ticks in. The keep-alives Paper sends every second
+close that: Paper disconnects a client that leaves one unanswered for 30 seconds (the system property
+`paper.playerconnection.keepalive`, `ServerCommonPacketListenerImpl.keepConnectionAlive`), and a vanilla client answers
+each the moment it arrives, on its network thread (`ClientCommonPacketListenerImpl.handleKeepAlive`), so the timer moves
+up with those answers as well. Such an answer can go out ahead of tick ends the client's main thread had already handed
+to its network thread, which runs them as tasks of its event loop (`Connection.sendPacket`), up to the 10 a frame runs
+at once, so it counts as an answer to a packet sent 10 tick targets before the keep-alive. A client that holds back
+every answer still keeps the timer where it was, as a connection that stalls does, but only until Paper's keep-alive
+limit. That a keep-alive's answer comes ahead of the pongs of pings sent before it tells nothing, though: a vanilla
+client's main thread answers the pings only when a frame handles the server's packets, which it can do long after its
+network thread answered a keep-alive.
 
 In game, with the player walking back and forth through a proxy, no tick failed `Timer` in normal play, nor while the
 proxy held the client's packets for 25 seconds and then sent them at once, nor in four joins through a proxy that
 traced them, whose ticks got 455 to 577 ms ahead at most. One extra tick end injected every 250 ms, a client about 20%
 fast, failed `Timer` from 137 ticks (6.9 seconds) on, 50 times in 15 seconds, and once more right after it stopped.
-1500 tick ends injected at once failed it 1502 times.
+1500 tick ends injected at once failed it 1502 times. `timer_balance_test.sh` repeats the test with the dropped pongs:
+with the keep-alives, the doubled tick ends failed `Timer` 67 ticks in, about 33 ticks too many, as the 22 tick targets
+of slack and the 10 of the keep-alive's answer allow, and the client frozen for 8 seconds, with its pongs or without,
+failed nothing.
 
 ### Screens
 

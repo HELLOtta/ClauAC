@@ -136,6 +136,19 @@ Findings from running the official 26.3 client in a cloud container without a GP
   than 500 packets per second over 7 s. The test client sends about 80 to 170 packets per second, most of them pongs
   to ClauAC's pings, which ClauAC takes out before Paper counts them: releasing 25 s of held packets (3052) stayed
   below the limit, together with a flood of 1500 tick ends 12 s later.
+- **Freezing the client** (a lag spike): `kill -STOP` and later `kill -CONT` on the PID of the client's Java process.
+  Frozen, it answers nothing; once it goes on, its network thread answers the keep-alives that came meanwhile right
+  away, and it runs at most 10 of the ticks it missed and drops the rest (`Minecraft.runTick`). Paper disconnects only a
+  client that leaves a keep-alive unanswered for 30 s (the system property `paper.playerconnection.keepalive`,
+  `ServerCommonPacketListenerImpl.keepConnectionAlive`, which sends one whenever a second has passed since the last).
+  The client answers a ping on its main thread when a frame handles the server's packets (`handlePing` calls
+  `PacketUtils.ensureRunningOnSameThread`), a keep-alive on its network thread the moment it arrives (`handleKeepAlive`
+  calls `sendWhen` without it), so the answer to a keep-alive can come ahead of the pongs of pings sent before it, and
+  ahead of tick ends the main thread had handed to the network thread (`Connection.sendPacket` runs them as tasks of its
+  event loop): that order is no sign of a cheat. `timer_balance_test.sh` drops the client's pongs
+  (`drop minecraft:pong`), freezes it, doubles its tick ends (`after-tick-end inject <tick end>`) and turns off the
+  setbacks of the checks those steps fail meanwhile, since a setback's teleport and the client's acceptance of it would
+  move Timer's point of reference up as well.
 - **A second player:** start another client with its own game directory (a copy of `options.txt` with a low
   `maxFps` and `renderDistance` keeps both clients responsive). Both windows share the Xvfb display: find them with
   `xdotool search --pid <pid>`, move the second one off screen with `xdotool windowmove`, and give the first one the
